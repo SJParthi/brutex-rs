@@ -367,6 +367,80 @@ version before the toolchain itself turned out to be the constraint.
 
 ---
 
+## D-0017 · 2026-08-01 · NSE only; the swept surface narrows from three to two
+
+**Decision.** The engine sweeps **`NSE-NIFTY` and `NSE-BANKNIFTY`**. BSE and
+MCX are not pulled. `BSE-SENSEX` is no longer swept.
+
+**Rejected — keeping `BSE-SENSEX`.** It is the shortest series by a wide
+margin: the lake holds SENSEX from **2022-09-01** against 2020-01 for the two
+NSE indices. Any three-instrument result is therefore silently capped at the
+shortest history, and a window chosen to include SENSEX throws away 2 years 8
+months of NIFTY and BANKNIFTY data without saying so. Dropping it removes the
+cap rather than working around it.
+
+**Rejected — deleting BSE data already on disk.** Append-only history applies
+to the store, not only to condition bits. Existing SENSEX bars stay; the
+engine simply will not sweep them, and `is_sweepable` says so in one place.
+
+**Why this is a narrowing and still needs an entry.** Golden rule 2 previously
+said the surface "does not widen" without a ledger entry. That was a gap: a
+*narrowing* silently changes every historical comparison just as much, because
+a result set produced over three instruments is not comparable with one
+produced over two. The rule now reads "widen OR narrow", and this entry is the
+first use of it.
+
+---
+
+## D-0018 · 2026-08-01 · Store every NSE instrument; sweep two until one earns the widening
+
+**Decision.** `pull` fetches and stores **every NSE instrument** — 12,460 cash
+and 78,163 F&O rows in the vendor's own instrument master, 90,623 in total.
+The **sweep** stays at the two indices until a two-instrument sweep produces a
+profitable result.
+
+**Rejected — sweeping all NSE equities now.** Total sweep work is linear in
+symbols: 2 → ~750 is **375× the compute**, paid before anything has been shown
+to work. `docs/06-limits.md` §4 still records that a full production sweep has
+never been run. The same discipline as D-0015: build the capability, defer the
+spend.
+
+**Rejected — storing only the two indices.** Storage is cheap and re-pulling
+is not. With every NSE instrument on disk, widening the sweep later is one
+ledger entry and **zero re-pulling**. Pulling narrowly now would make the
+widening a multi-hour vendor-bound operation instead of a config change.
+
+**What widening will require, and is not solved today.** Indices never split;
+equities do. An unadjusted 1:5 split is a **fake 80% overnight crash**, and
+every condition fires on it — `gap_down_day`, `bar_bearish`,
+`close_below_ema200`, the whole bar-shape family. There is no corporate-action
+handling anywhere in this design, and the lake survey never looked for one
+because indices do not need it.
+
+The offsetting gain, recorded so it is not forgotten: equities carry **real
+traded volume**, so VWAP bits 52–53 stop abstaining. On the index surface they
+are permanently dead by construction.
+
+**Behaviour when a corporate action is met: refuse the window, loudly.** A
+suspected split or bonus — an unexplained overnight gap beyond a threshold —
+causes the sweep to **refuse that window and name the date**, rather than
+producing a result built on a fake crash. This follows
+`docs/00-charter.md` prohibition 6: degrade loudly and name the reason, or
+refuse; never silently.
+
+**Rejected — back-adjusting prices from a corporate-action feed.** It is what
+charting vendors do and it is the eventual right answer, but none of the four
+vendors has been *verified* to supply split and bonus records. Building on an
+unverified source would put a fabricated price into the store, which is worse
+than refusing. Upgrading later invalidates no stored bar, because raw prices
+are what is stored.
+
+**Rejected — sweeping raw prices and ignoring the problem.** Cheapest, and it
+contradicts prohibition 6 outright. A spurious signal that looks real is the
+failure mode this repository is organised against.
+
+---
+
 ## How to add an entry
 
 Next free ID, today's date, the decision in one sentence, the alternative

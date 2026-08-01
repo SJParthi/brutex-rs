@@ -20,8 +20,8 @@
 //!
 //! # Storable is not sweepable
 //!
-//! `docs/00-charter.md` §1 stores futures, options and single stocks but
-//! sweeps exactly three instruments. [`InstrumentKey::is_sweepable`] is the
+//! `docs/00-charter.md` §1 stores every NSE instrument but sweeps exactly
+//! two, both on NSE. See D-0017 and D-0018. [`InstrumentKey::is_sweepable`] is the
 //! one place that distinction is decided, so widening it is a visible edit
 //! rather than a caller passing a different string.
 
@@ -247,11 +247,8 @@ impl InstrumentKey {
     /// `docs/00-charter.md` §1. India VIX is deliberately absent: it is stored
     /// and stamped onto trades, but it never enters the condition vocabulary,
     /// ranking, or run identity.
-    pub const SWEPT: [(Exchange, &'static str); 3] = [
-        (Exchange::Nse, "NIFTY"),
-        (Exchange::Nse, "BANKNIFTY"),
-        (Exchange::Bse, "SENSEX"),
-    ];
+    pub const SWEPT: [(Exchange, &'static str); 2] =
+        [(Exchange::Nse, "NIFTY"), (Exchange::Nse, "BANKNIFTY")];
 
     /// Builds a spot index key.
     ///
@@ -415,19 +412,49 @@ mod tests {
     }
 
     #[test]
-    fn exactly_three_instruments_are_sweepable() {
+    fn exactly_two_nse_instruments_are_sweepable() {
         assert!(nifty().is_sweepable());
         assert!(
             InstrumentKey::index(Exchange::Nse, "BANKNIFTY")
                 .expect("valid")
                 .is_sweepable()
         );
+        assert_eq!(InstrumentKey::SWEPT.len(), 2);
         assert!(
-            InstrumentKey::index(Exchange::Bse, "SENSEX")
-                .expect("valid")
-                .is_sweepable()
+            InstrumentKey::SWEPT
+                .iter()
+                .all(|&(ex, _)| ex == Exchange::Nse),
+            "the swept set is NSE-only; see D-0017"
         );
-        assert_eq!(InstrumentKey::SWEPT.len(), 3);
+    }
+
+    #[test]
+    fn sensex_is_storable_but_no_longer_swept() {
+        // D-0017 narrowed the engine surface from three instruments to two.
+        // SENSEX bars already on disk are not deleted -- append-only history
+        // applies to the store too -- but the engine will not sweep them.
+        let sensex = InstrumentKey::index(Exchange::Bse, "SENSEX").expect("valid");
+        assert!(!sensex.is_sweepable());
+        assert_eq!(
+            sensex.require_sweepable(),
+            Err(InstrumentError::NotSweepable)
+        );
+    }
+
+    #[test]
+    fn an_nse_equity_is_storable_and_not_swept() {
+        // D-0018: every NSE instrument is STORED, and the sweep stays at the
+        // two indices until a two-instrument sweep earns the widening. This
+        // test is what would fail if someone widened the surface silently.
+        for s in ["RELIANCE", "HINDALCO", "TCS"] {
+            let eq = InstrumentKey {
+                exchange: Exchange::Nse,
+                segment: Segment::Cash,
+                underlying: Symbol::new(s).expect("valid"),
+                kind: Kind::Equity,
+            };
+            assert!(!eq.is_sweepable(), "{s} must not be swept yet");
+        }
     }
 
     #[test]

@@ -7,13 +7,13 @@ because a prohibition survives a rewrite better than a goal does.
 
 ## 1. Scope lock
 
-**The engine sweeps exactly three instruments.**
+**The engine sweeps exactly two instruments, both on NSE.** Narrowed from
+three by D-0017: `BSE-SENSEX` is no longer swept and BSE is no longer pulled.
 
 | Symbol | Exchange | Segment |
 |---|---|---|
 | `NSE-NIFTY` | NSE | INDEX |
 | `NSE-BANKNIFTY` | NSE | INDEX |
-| `BSE-SENSEX` | BSE | INDEX |
 
 `NSE-INDIAVIX` is **reference only** — stored, stamped onto observable trades
 as `vix_at_entry` / `vix_at_exit`, and never in the condition vocabulary, the
