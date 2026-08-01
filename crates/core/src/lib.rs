@@ -14,11 +14,13 @@
 //! | Module | Owns |
 //! |---|---|
 //! | [`error`] | every error this crate can return |
+//! | [`instrument`] | the one identity every vendor resolves to |
 //! | [`price`] | paisa integers and the one float boundary |
 //! | [`symbol`] | fixed-width symbols, so hashing one is constant time |
 
 #![forbid(unsafe_code)]
 
 pub mod error;
+pub mod instrument;
 pub mod price;
 pub mod symbol;
