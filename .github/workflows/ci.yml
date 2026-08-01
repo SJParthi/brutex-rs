@@ -237,8 +237,15 @@ jobs:
           # unsafe_code = "deny" at the workspace root already fails the build.
           # This gate additionally caps how many documented exceptions exist,
           # so they cannot quietly multiply.
-          n=$(git ls-files '*.rs' | xargs -r grep -c 'allow(unsafe_code)' \
-              | awk -F: '{s+=$2} END{print s+0}')
+          # Two bugs lived here and both failed in the SAFE direction's
+          # opposite: `grep -c` exits 1 when it matches nothing, and with
+          # `set -o pipefail` that made the gate fail exactly when the
+          # repository was clean. And `grep -c` omits the `file:` prefix when
+          # given a single file, so `awk -F:` read field 2 of a bare number
+          # and counted zero — an exception in the only .rs file would have
+          # been invisible. Counting occurrences directly fixes both.
+          n=$( { git ls-files '*.rs' | xargs -r grep -oh 'allow(unsafe_code)' || true; } \
+               | wc -l | tr -d ' ')
           echo "documented unsafe exceptions: $n"
           if [ "$n" -gt 3 ]; then
             echo "More than 3 unsafe exceptions. Each needs a decision entry."
