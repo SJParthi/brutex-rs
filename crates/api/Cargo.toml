@@ -12,7 +12,14 @@ description  = "HTTP surface. Server-rendered HTML; no JavaScript anywhere."
 # engine do not exist yet, so today it depends on core alone and will gain the
 # others when they land.
 [dependencies]
-core   = { path = "../core", package = "core" }
+# A version is required alongside the path: deny.toml sets
+# wildcards = "deny", and a path dependency with no version IS a wildcard.
+# Relaxing the ban was rejected -- it protects registry crates too.
+# `package` is an explicit rename: the PACKAGE is `core` but its lib target
+# is `brutex_core` (a lib named `core` shadows the sysroot crate and breaks
+# rustdoc). This restores `use core::...` here while keeping the dependency
+# KEY as `core`, which is what gates 7 and 9 match on.
+core   = { path = "../core", package = "core", version = "0.1.0" }
 axum   = { workspace = true }
 tokio  = { workspace = true }
 
