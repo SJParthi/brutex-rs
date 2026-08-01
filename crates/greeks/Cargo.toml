@@ -2,10 +2,23 @@
 name         = "greeks"
 version      = { workspace = true }
 edition      = { workspace = true }
-rust-version = { workspace = true }
 license      = { workspace = true }
 publish      = { workspace = true }
 description  = "Black-Scholes-Merton greeks and implied volatility for European options. f64 in, f64 out. Depends on nothing."
+
+# NOT `{ workspace = true }`. The workspace pins 1.97 because other crates in
+# it need 1.97; this crate needs edition 2024 and nothing else, and its floor
+# is therefore 1.85 -- verified by building and running it on 1.85.0, 1.91.0,
+# 1.93.1 and 1.95.0.
+#
+# Inheriting the workspace pin is not a cosmetic coupling. A consumer on any
+# stable older than 1.97 -- and `tickvault`, the reason this crate is separate,
+# is one -- is refused by cargo BEFORE a line is compiled:
+#     error: rustc 1.93.1 is not supported by the following package:
+#       greeks@0.1.0 requires rustc 1.97
+# The MSRV of a shared leaf crate is a property of the crate, not of the
+# workspace that happens to host it. D-0037.
+rust-version = "1.85"
 
 # ---------------------------------------------------------------------------
 # THIS SECTION IS DELIBERATELY EMPTY AND STAYS EMPTY.
@@ -17,12 +30,19 @@ description  = "Black-Scholes-Merton greeks and implied volatility for European 
 #
 # It is also why no type from this workspace appears in the public surface:
 # every argument and every field is `f64` or a plain enum this crate owns.
-# `crates/greeks/tests/standalone.rs` is the structural proof -- it names
-# nothing but `greeks::`, and it would fail to compile if that stopped being
-# true.
+#
+# THE COMMENT IS NOT THE ENFORCEMENT. CI gate 9b reads this table and fails if
+# it is not empty, in the same shape as gate 9 for `crates/core` and gate 7 for
+# `crates/web`. `crates/greeks/tests/standalone.rs` cannot do that job: an
+# integration test only fails on items it NAMES, so a `pub use` of a workspace
+# type is invisible to it -- and a `pub use` adds no code region, so the
+# coverage gate cannot see it either. That was measured, in a copy of this
+# workspace outside the repository, by re-exporting `core`'s paisa type from
+# this crate's root: clippy, the whole test suite and coverage all stayed
+# green.
 #
 # Adding a line below requires an entry in docs/05-decisions.md naming what it
-# replaces. See D-0036.
+# replaces, and gate 9b to be amended in the same commit. See D-0037.
 # ---------------------------------------------------------------------------
 [dependencies]
 

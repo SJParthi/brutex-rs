@@ -9,6 +9,12 @@ resolver = "3"
 # The intended final graph is in docs/01-architecture.md §1, in the order the
 # crates are built:
 #   core → store → vocab → indicators → engine → pull → api → web → cli
+#
+# plus `greeks`, which is not in that chain at all: a leaf with no arrow into it
+# and none out of it, shared with the `tickvault` repository by git URL and
+# depending on nothing. It is in `members` below and it was missing from this
+# comment. CLAUDE.md §5 does not list it either; see D-0037, "One discrepancy an
+# operator has to settle".
 members = ["crates/core", "crates/greeks", "crates/store", "crates/api"]
 
 [workspace.package]

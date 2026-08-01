@@ -8,15 +8,27 @@
 //! than empirical**, which is the property rule 4 is actually protecting:
 //!
 //! ```text
-//! MAX_ITERATIONS = NEWTON_STEPS + BISECTION_STEPS = 8 + 64 = 72
+//! MAX_ITERATIONS = BRACKET_EVALUATIONS + NEWTON_STEPS + BISECTION_STEPS
+//!                  + FINAL_EVALUATION
+//!                = 2 + 8 + 64 + 1
+//!                = 75
 //! ```
 //!
-//! and 72 is not a hope. The bisection performs **exactly**
+//! and 75 is not a hope. The bisection performs **exactly**
 //! [`BISECTION_STEPS`] halvings of `[MIN_VOLATILITY, MAX_VOLATILITY]` with no
 //! early exit and no data-dependent branch: `(5 − 1e-6) / 2^64 ≈ 2.7e-19`,
 //! narrower than one unit in the last place of any volatility in that band.
 //! It cannot take longer on a hard input, because it does not look at the
 //! input to decide when to stop.
+//!
+//! **It says 75 and not 72 because three evaluations were not being counted.**
+//! The two that establish the bracket and the one at the answer are model
+//! evaluations like any other, and the first version of this crate reported a
+//! ceiling that left them out — on the one crate whose selling point is an
+//! arithmetic ceiling. The test that was supposed to police it read the field
+//! the solver reports, so it could not see the gap by construction.
+//! `greeks::solver::the_reported_cost_is_every_model_evaluation` now counts at
+//! the single function every evaluation passes through. D-0037.
 //!
 //! # Why the bracketed method is the floor and Newton is the optimisation
 //!
@@ -32,9 +44,13 @@
 //! **That table was taken on the calibration harness, whose rescuer was Brent
 //! and whose bisection exited early — not on the code in this file.** It is
 //! why the shape below was chosen; it is not a measurement of the shape below.
-//! What is measured on *this* code is a worst total of **72**, which is also
+//! What is measured on *this* code is a worst total of **75**, which is also
 //! its arithmetic ceiling, by
-//! `greeks::solver::the_iteration_count_never_exceeds_the_arithmetic_bound`.
+//! `greeks::solver::the_iteration_count_never_exceeds_the_arithmetic_bound`
+//! and by `greeks::solver::the_reported_cost_is_every_model_evaluation`.
+//! The table's numbers count search evaluations only, which is what that
+//! harness counted; add three for the bracket and the answer to compare them
+//! against the ceiling above.
 //!
 //! Newton alone reached **427 iterations** at `K/S = 1.10, T = 2h` with a
 //! fixed tolerance and **444** with stagnation detection; median 7–8, p99
@@ -74,19 +90,30 @@
 //! price must not move the answer by more than
 //! [`MAX_RELATIVE_UNCERTAINTY`] of itself.
 //!
-//! That criterion is **necessary and not sufficient**, and saying otherwise
-//! would be the dishonesty rule 6 is about. `ulp(price)/vega` is the textbook
-//! estimate and it is *optimistic*: measured against the smallest interval
-//! around the true volatility on which the computed price is still strictly
-//! ordered, it understates the real floor by two orders of magnitude at the
-//! money — `1.60e-16` estimated against `1.67e-14` measured at seven days,
-//! `1.29e-16` against `2.73e-13` at one hour. Passing this check does not
-//! prove the answer is good to `MAX_RELATIVE_UNCERTAINTY`. Failing it proves
-//! the answer is worthless. See `docs/06-limits.md` §18.
+//! **The unit in the last place is the price's, not its magnitude's.** That
+//! distinction was got wrong in the first version of this crate and it was not
+//! academic. `ulp(price)` is the textbook numerator and it is the wrong scale
+//! for a quantity that is a *difference of two much larger terms*: a one-day
+//! NIFTY call two percent in the money at five percent volatility has a price
+//! of `507.76` assembled from two terms near `25,600`, so its granularity is
+//! `ulp(51,195)` and not `ulp(507.76)` — a measured factor of **100.8**.
+//! Measured over 8,759 quotable points on the NSE ladder, the old numerator
+//! accepted 8,096 answers of which 15 were wrong by more than `1e-3` of
+//! relative volatility and 5 by more than `1e-2`, worst `5.5e-2`, every one of
+//! them reporting an `uncertainty` inside the `1e-3` bound. The numerator is
+//! now [`crate::bsm::Checked::price_scale`], which accepts 8,068 — 28 fewer —
+//! and leaves a worst accepted error of `2.2e-4`. D-0037.
+//!
+//! The criterion is still **necessary and not sufficient**, and saying
+//! otherwise would be the dishonesty rule 6 is about. It is a first-order
+//! estimate and it cannot see that the computed price is not strictly
+//! monotone in volatility. Passing this check does not prove the answer is
+//! good to `MAX_RELATIVE_UNCERTAINTY`. Failing it proves the answer is
+//! worthless. See `docs/06-limits.md` §18.
 
 // Every expression below is a float expression. An implied volatility is a
 // solved statistical parameter, not money; `CLAUDE.md` §7 keeps such values
-// at full precision. No paisa reaches this file. See D-0036.
+// at full precision. No paisa reaches this file. See D-0037.
 #![allow(clippy::float_arithmetic)]
 
 use std::f64::consts::TAU;
@@ -110,8 +137,25 @@ pub const NEWTON_STEPS: u32 = 8;
 /// performs exactly this many, every time.
 pub const BISECTION_STEPS: u32 = 64;
 
-/// The largest total number of model evaluations one solve can cost.
-pub const MAX_ITERATIONS: u32 = NEWTON_STEPS + BISECTION_STEPS;
+/// The two evaluations that establish the bracket, at
+/// [`MIN_VOLATILITY`] and [`MAX_VOLATILITY`], before the search begins.
+///
+/// They are part of the cost of a solve and they are counted. Leaving them out
+/// is how the ceiling below was understated by three for the whole life of
+/// this crate's first version — see D-0037.
+pub const BRACKET_EVALUATIONS: u32 = 2;
+
+/// The one evaluation at the answer, which produces the vega the uncertainty
+/// estimate is built from. Also part of the cost, also counted.
+pub const FINAL_EVALUATION: u32 = 1;
+
+/// The largest total number of model evaluations one solve can cost —
+/// **every** evaluation, not only the ones inside the search.
+///
+/// `2 + 8 + 64 + 1 = 75`. A refused solve costs the same, because the refusal
+/// is decided from the final evaluation.
+pub const MAX_ITERATIONS: u32 =
+    BRACKET_EVALUATIONS + NEWTON_STEPS + BISECTION_STEPS + FINAL_EVALUATION;
 
 /// A Newton step this small ends the search.
 const NEWTON_STEP_TOLERANCE: f64 = 1.0e-12;
@@ -119,6 +163,14 @@ const NEWTON_STEP_TOLERANCE: f64 = 1.0e-12;
 /// One unit in the last place of the market price may move the answer by this
 /// fraction of itself, and no more. Past it the price does not determine a
 /// volatility and [`GreeksError::Indeterminate`] is returned.
+///
+/// "One unit in the last place of the market price" means the last place the
+/// price *actually has*, which is set by the two legs it is a difference of
+/// and not by its own magnitude — see [`crate::bsm::Checked::price_scale`].
+/// Measured over an NSE envelope of 8,759 quotable points, the worst relative
+/// volatility error among the answers this bound accepts is `2.2e-4`, inside
+/// it. Under the old estimator the worst was `5.5e-2`, fifty-five times
+/// outside it, and reported as certain. D-0037.
 pub const MAX_RELATIVE_UNCERTAINTY: f64 = 1.0e-3;
 
 /// Which method produced the answer.
@@ -137,14 +189,22 @@ pub struct ImpliedVolatility {
     pub volatility: f64,
     /// Which method finished.
     pub method: Method,
-    /// Model evaluations spent, Newton and bisection together. Never above
-    /// [`MAX_ITERATIONS`].
+    /// **Every** model evaluation this solve cost: the two that establish the
+    /// bracket, the Newton steps, the bisection halvings, and the one at the
+    /// answer. Never above [`MAX_ITERATIONS`].
     pub iterations: u32,
     /// Vega at the solution, which is what makes the next field checkable.
     pub vega: f64,
     /// How much of itself the answer moves for one unit in the last place of
     /// the market price. Below [`MAX_RELATIVE_UNCERTAINTY`], or this would be
     /// an error instead.
+    ///
+    /// **This is a screen, not a bound on the error.** It is a first-order
+    /// estimate — the price's granularity divided by vega — and it cannot see
+    /// that the computed price is not strictly monotone in volatility. Read it
+    /// as *the answer is not obviously worthless*, never as *the answer is
+    /// good to this many digits*. `docs/06-limits.md` §18 carries the measured
+    /// gap between the two readings.
     pub uncertainty: f64,
 }
 
@@ -215,11 +275,29 @@ impl Contract {
             });
         }
 
-        let (volatility, method, iterations) = checked.search(price, kind);
+        let (volatility, method, searched) = checked.search(price, kind);
         let solved = checked.greeks(volatility, kind);
+        let iterations = BRACKET_EVALUATIONS + searched + FINAL_EVALUATION;
 
         // One unit in the last place of the quote, expressed as a fraction of
         // the answer it would move.
+        //
+        // The numerator is the granularity the price ACTUALLY has, which is
+        // set by the two legs it is a difference of and not by its own
+        // magnitude -- `Checked::price_scale` carries the reasoning. Using
+        // `ulp(price)` here understated the noise by the cancellation factor,
+        // measured at 100.8x on a one-day in-the-money NIFTY strike and
+        // unbounded deep out of the money, and the guard then accepted answers
+        // wrong in the second significant figure while reporting them as
+        // certain.
+        //
+        // The DIVISION COMES FIRST, and that is not a style choice. Written
+        // `scale * f64::EPSILON / vega`, a subnormal-scale quantity underflows
+        // the product to exactly `0.0` and the guard reports the strongest
+        // possible certainty at the moment it has none. `scale / vega` is at
+        // least `1/4` -- vega is `forward * n(d1) * sqrt(T)`, and `n <= 0.399`
+        // with `sqrt(T) <= 10` bounds it by `4 * forward <= 4 * scale` -- so
+        // the quotient can never underflow, whatever the two magnitudes are.
         //
         // `>` and not `!(<=)`, and the difference is only safe because of what
         // is above it. `d1` is finite for every volatility in the band once
@@ -228,7 +306,7 @@ impl Contract {
         // vega underflows to zero, and `+inf > bound` is true, so the
         // degenerate case is still refused. A NaN would slip through a `>`,
         // and there is no path to one here.
-        let uncertainty = price.abs() * f64::EPSILON / solved.vega / volatility;
+        let uncertainty = (checked.price_scale() / solved.vega) * f64::EPSILON / volatility;
         if uncertainty > MAX_RELATIVE_UNCERTAINTY {
             return Err(GreeksError::Indeterminate {
                 volatility,
@@ -335,9 +413,11 @@ impl Checked {
 )]
 mod tests {
     use super::{
-        BISECTION_STEPS, Contract, GreeksError, MAX_ITERATIONS, MAX_RELATIVE_UNCERTAINTY,
-        MAX_VOLATILITY, MIN_VOLATILITY, Method, NEWTON_STEPS, OptionKind,
+        BISECTION_STEPS, BRACKET_EVALUATIONS, Contract, FINAL_EVALUATION, GreeksError,
+        MAX_ITERATIONS, MAX_RELATIVE_UNCERTAINTY, MAX_VOLATILITY, MIN_VOLATILITY, Method,
+        NEWTON_STEPS, OptionKind,
     };
+    use crate::bsm::MODEL_EVALUATIONS;
     use crate::bsm::tests::grid;
     use std::collections::HashSet;
 
@@ -352,75 +432,120 @@ mod tests {
     }
 
     #[test]
-    fn a_price_round_trips_through_the_solver_and_back() {
-        // price -> IV -> price. Every point either round-trips or is refused
-        // for one of the two reasons this crate is allowed to refuse for; a
-        // silent third outcome fails here.
+    fn a_volatility_round_trips_through_the_solver_and_back() {
+        // **volatility -> price -> IV**, and the assertion is on the
+        // VOLATILITY. The price round trip is asserted too, and it is the
+        // weaker of the two by a distance that is the whole reason this test
+        // was rewritten: wherever the computed price is flat in `f64` -- which
+        // is precisely the regime the solver has to be trusted in -- repricing
+        // at a wrong volatility reproduces the quote EXACTLY, so a price round
+        // trip is satisfied by construction on the inputs where the answer is
+        // worst. At the point D-0037 records, the price round trip measured
+        // `0e0` while the volatility was 5.14% wrong and reported as certain.
+        //
+        // Every point either round-trips in volatility or is refused for a
+        // named reason. A silent third outcome fails here.
         let mut solved = 0_u32;
         let mut refused = 0_u32;
         let mut below_intrinsic = 0_u32;
-        let mut worst = 0.0_f64;
+        let mut indeterminate = 0_u32;
+        let mut worst_volatility = 0.0_f64;
+        let mut worst_price = 0.0_f64;
         for (contract, volatility) in grid() {
             for kind in [OptionKind::Call, OptionKind::Put] {
                 let quoted = contract.price(volatility, kind).expect("priced");
                 match contract.implied_volatility(quoted, kind) {
                     Ok(found) => {
                         solved += 1;
-                        let back = contract.price(found.volatility, kind).expect("repriced");
-                        let relative = (back - quoted).abs() / quoted.abs().max(1e-12);
-                        worst = worst.max(relative);
+                        let relative_volatility = (found.volatility / volatility - 1.0).abs();
+                        worst_volatility = worst_volatility.max(relative_volatility);
+                        // The crate's stated bound is MAX_RELATIVE_UNCERTAINTY
+                        // = 1e-3. This asserts an order of magnitude inside it,
+                        // because the measured worst is 2.3e-6 and a
+                        // regression towards the old estimator should be
+                        // visible long before it reaches the stated bound --
+                        // the old one's worst on this same grid is 1.3e-3.
                         assert!(
-                            relative <= 1e-6,
-                            "round trip {relative:e} at {contract:?} sigma {volatility} {kind:?}"
+                            relative_volatility <= 1e-4,
+                            "volatility round trip {relative_volatility:e}: solved \
+                             {} against {volatility} at {contract:?} {kind:?}, and it was \
+                             accepted with uncertainty {:e}",
+                            found.volatility,
+                            found.uncertainty
+                        );
+                        let back = contract.price(found.volatility, kind).expect("repriced");
+                        let relative_price = (back - quoted).abs() / quoted.abs().max(1e-12);
+                        worst_price = worst_price.max(relative_price);
+                        assert!(
+                            relative_price <= 1e-6,
+                            "price round trip {relative_price:e} at {contract:?} \
+                             sigma {volatility} {kind:?}"
                         );
                     }
                     // The refusals are COUNTED, not matched against a
                     // catch-all that panics. A catch-all arm no input reaches
                     // is a region no run executes, and the coverage gate
                     // reports it -- the same trap as an assertion message that
-                    // computes something. Requiring the counted kind to
+                    // computes something. Requiring the counted kinds to
                     // account for every refusal says the same thing, and every
                     // line of it runs.
                     //
-                    // ONE kind is expected here, and it is asserted as one:
-                    // deep in the money at five percent volatility the model
+                    // TWO kinds are expected, and each is asserted as itself.
+                    // Deep in the money at five percent volatility the model
                     // price IS the discounted intrinsic value in f64, so no
-                    // volatility recovers it. A refusal of any other kind
-                    // arriving from this grid breaks the equality below.
+                    // volatility recovers it. Near the money at one to five
+                    // days the price is a small residue of two terms near the
+                    // spot, so the quote does not pin a volatility down and
+                    // the answer is refused rather than returned -- which is
+                    // the repair D-0037 makes, and it is counted here so that
+                    // a change which quietly stops refusing is visible.
                     Err(error) => {
                         refused += 1;
-                        below_intrinsic += 1;
                         assert!(!error.to_string().is_empty());
                         let checked = contract.check().expect("checked");
                         let (intrinsic, _) = checked.no_arbitrage_bounds(kind);
-                        assert_eq!(
-                            error,
-                            GreeksError::PriceBelowIntrinsic {
+                        if error
+                            == (GreeksError::PriceBelowIntrinsic {
                                 price: quoted,
-                                intrinsic
-                            },
-                            "a refusal arrived from this grid that is not the arbitrage \
-                             floor, at {contract:?} sigma {volatility} {kind:?}"
-                        );
+                                intrinsic,
+                            })
+                        {
+                            below_intrinsic += 1;
+                        }
+                        if let GreeksError::Indeterminate {
+                            uncertainty, bound, ..
+                        } = error
+                        {
+                            indeterminate += 1;
+                            assert!(uncertainty > bound, "{uncertainty} against {bound}");
+                        }
                     }
                 }
             }
         }
         println!(
             "round trip: {solved} solved, {refused} refused \
-             ({below_intrinsic} of them at the arbitrage floor), \
-             worst relative {worst:e}"
+             ({below_intrinsic} at the arbitrage floor, {indeterminate} indeterminate); \
+             worst relative volatility {worst_volatility:e}, \
+             worst relative price {worst_price:e}"
         );
         assert_eq!(
-            below_intrinsic, refused,
-            "a refusal arrived from this grid that is not the arbitrage floor"
+            below_intrinsic + indeterminate,
+            refused,
+            "a refusal arrived from this grid that is neither the arbitrage floor \
+             nor indeterminacy"
         );
         // The grid deliberately contains points no solver can recover. A run
         // that suddenly solves all of them, or none, is a change worth seeing.
         assert!(solved >= 500, "only {solved} solved");
         assert!(
-            refused > 0,
-            "the grid must still contain unrecoverable points"
+            below_intrinsic > 0,
+            "the grid must still contain points at the arbitrage floor"
+        );
+        assert!(
+            indeterminate > 0,
+            "the grid must still contain quotes that do not pin a volatility down; \
+             if none does, this test has stopped policing the guard it exists for"
         );
     }
 
@@ -448,6 +573,70 @@ mod tests {
         assert!(worst <= MAX_ITERATIONS, "worst {worst}");
         assert!(newton_only > 0, "Newton never finished a single point");
         assert!(bisected > 0, "the bisection was never exercised");
+    }
+
+    #[test]
+    fn the_reported_cost_is_every_model_evaluation() {
+        // The test the old one could not be. `iterations` used to be
+        // `spent + BISECTION_STEPS` by construction, so a test that READ the
+        // field was arithmetically incapable of noticing that three
+        // evaluations -- the two bracket ends and the one at the answer --
+        // were never counted. The real cost was 75 against a documented
+        // ceiling of 72, on the one crate whose selling point is an arithmetic
+        // ceiling.
+        //
+        // `MODEL_EVALUATIONS` counts at `Checked::greeks`, the single function
+        // every evaluation in this crate passes through. It is a number the
+        // solver did not compute.
+
+        // A solve that finishes in Newton.
+        let easy = at_the_money();
+        let quoted = easy.price(0.2, OptionKind::Call).expect("priced");
+        MODEL_EVALUATIONS.with(|spent| spent.set(0));
+        let newton = easy
+            .implied_volatility(quoted, OptionKind::Call)
+            .expect("solved");
+        let spent = MODEL_EVALUATIONS.with(std::cell::Cell::get);
+        assert_eq!(newton.method, Method::Newton);
+        assert_eq!(
+            newton.iterations, spent,
+            "reported {} against {spent} actually taken",
+            newton.iterations
+        );
+
+        // The stubborn one, which spends the whole budget.
+        let stubborn = Contract {
+            spot: 100.0,
+            strike: 50.0,
+            years_to_expiry: 1.0,
+            rate: 0.05,
+            carry: 0.0,
+        };
+        let quoted = stubborn.price(0.2, OptionKind::Call).expect("priced");
+        MODEL_EVALUATIONS.with(|spent| spent.set(0));
+        let exhausted = stubborn
+            .implied_volatility(quoted, OptionKind::Call)
+            .expect("solved");
+        let spent = MODEL_EVALUATIONS.with(std::cell::Cell::get);
+        println!(
+            "worst solve: reported {}, actually taken {spent}, ceiling {MAX_ITERATIONS}",
+            exhausted.iterations
+        );
+        assert_eq!(exhausted.iterations, spent);
+        assert_eq!(spent, MAX_ITERATIONS, "the ceiling is not the worst case");
+
+        // And a REFUSED solve costs the same, which is the sentence in
+        // `MAX_ITERATIONS`'s own documentation. A ceiling that holds only for
+        // the answers is not a ceiling on the work.
+        let floor = stubborn
+            .price(MIN_VOLATILITY, OptionKind::Call)
+            .expect("priced");
+        let degenerate = floor + 4.0 * floor * f64::EPSILON;
+        MODEL_EVALUATIONS.with(|spent| spent.set(0));
+        let refusal = stubborn.implied_volatility(degenerate, OptionKind::Call);
+        let spent = MODEL_EVALUATIONS.with(std::cell::Cell::get);
+        assert!(refusal.is_err(), "the degenerate quote was answered");
+        assert_eq!(spent, MAX_ITERATIONS, "a refusal cost {spent}");
     }
 
     #[test]
@@ -483,24 +672,34 @@ mod tests {
             .implied_volatility(quoted, OptionKind::Call)
             .expect("solved");
         assert_eq!(found.method, Method::Newton);
-        assert!(found.iterations <= 4, "took {} steps", found.iterations);
+        assert!(
+            found.iterations <= BRACKET_EVALUATIONS + FINAL_EVALUATION + 4,
+            "took {} evaluations",
+            found.iterations
+        );
     }
 
     #[test]
     fn the_iteration_count_is_the_work_actually_done() {
         // `iterations <= MAX_ITERATIONS` is satisfied by zero, so it cannot
         // tell a counter that counts from one that does not. Both floors are
-        // asserted here: a Newton solve spends at least one evaluation, and a
-        // bisection solve spends its 64 halvings PLUS the Newton steps that
-        // preceded them.
+        // asserted here: a Newton solve spends at least one search evaluation
+        // on top of the three that are not part of the search, and a bisection
+        // solve spends its 64 halvings PLUS the Newton steps that preceded
+        // them.
+        let fixed = BRACKET_EVALUATIONS + FINAL_EVALUATION;
         let contract = at_the_money();
         let quoted = contract.price(0.2, OptionKind::Call).expect("priced");
         let newton = contract
             .implied_volatility(quoted, OptionKind::Call)
             .expect("solved");
         assert_eq!(newton.method, Method::Newton);
-        assert!(newton.iterations >= 1, "{} evaluations", newton.iterations);
-        assert!(newton.iterations <= NEWTON_STEPS);
+        assert!(
+            newton.iterations > fixed,
+            "{} evaluations",
+            newton.iterations
+        );
+        assert!(newton.iterations <= fixed + NEWTON_STEPS);
 
         // Deep in the money at a low volatility, where Newton crawls towards
         // the answer and is still crawling when its cap arrives: the full
@@ -534,13 +733,21 @@ mod tests {
             .implied_volatility(quoted, OptionKind::Call)
             .expect("solved");
         assert_eq!(short.method, Method::Bisection);
-        assert_eq!(short.iterations, BISECTION_STEPS + 1);
+        assert_eq!(short.iterations, fixed + BISECTION_STEPS + 1);
         assert!(short.iterations > BISECTION_STEPS);
     }
 
     #[test]
     fn the_solver_is_idempotent_to_the_bit() {
-        // CLAUDE.md section 3 rule 5. Same inputs, same output, byte for byte.
+        // CLAUDE.md section 3 rule 5. Same inputs, same output, byte for byte
+        // -- WITHIN ONE PROCESS AND ONE TARGET, which is the whole of what
+        // rerunning a function in a loop can establish. It cannot distinguish
+        // "deterministic" from "reproducible on the machines this repository
+        // runs on", and the second is false: `exp` and `ln` come from the
+        // platform's libm, and against the pure-Rust libm that wasm32 links,
+        // 140 of 1,344 solved volatilities differ by up to 4.22e-14 relative.
+        // Invariant G-10 is narrowed to match and `docs/06-limits.md` section
+        // 18 carries the measurement. D-0037.
         let contract = at_the_money();
         let quoted = contract.price(0.23, OptionKind::Call).expect("priced");
         let first = contract
@@ -785,7 +992,10 @@ mod tests {
         assert_ne!(Method::Newton, Method::Bisection);
         let methods: HashSet<Method> = [Method::Newton, Method::Bisection].into_iter().collect();
         assert_eq!(methods.len(), 2);
-        assert!(found.iterations <= NEWTON_STEPS + BISECTION_STEPS);
+        assert!(
+            found.iterations
+                <= BRACKET_EVALUATIONS + NEWTON_STEPS + BISECTION_STEPS + FINAL_EVALUATION
+        );
         assert!(found.uncertainty <= MAX_RELATIVE_UNCERTAINTY);
         assert!(found.vega > 0.0);
     }

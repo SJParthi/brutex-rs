@@ -119,6 +119,15 @@ pub enum GreeksError {
     /// value plus a rounding error, and the rounding error is what the solver
     /// would be inverting.
     ///
+    /// "One unit in the last place of the market price" is the last place the
+    /// price *has*, not the last place its magnitude suggests. A model price
+    /// is a difference of two terms of the size of the spot, so it carries the
+    /// rounding of those terms — measured at 100.8× coarser than one unit in
+    /// the last place of the price itself on a one-day in-the-money NIFTY
+    /// strike — and screening on the finer of the two is what let materially
+    /// wrong answers through as `Ok`. See `crate::bsm::Checked::price_scale`
+    /// and D-0037.
+    ///
     /// Returning the number anyway is the failure `CLAUDE.md` §4 bans — a
     /// fallback that hides a failure. It is refused instead, with the numbers
     /// that make the refusal checkable.

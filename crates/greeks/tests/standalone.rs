@@ -1,28 +1,36 @@
 //! The structural proof that this crate is shareable.
 //!
 //! `crates/greeks` is consumed by the `tickvault` repository as well as this
-//! one, by git URL. Two properties make that possible and both are checked
-//! here rather than promised in a comment:
+//! one, by git URL. What this file proves, exactly:
 //!
-//! 1. **It declares no dependency.** Nothing but `greeks` is in scope in this
-//!    file, and an integration test is a separate crate that can only see what
-//!    the manifest lets it see.
-//! 2. **Its public surface mentions no type from this workspace.** Every path
-//!    named below starts with `greeks::`, and every value crossing the
-//!    boundary is an `f64`, a `u32`, an `i32` or a plain enum this crate owns.
-//!    If a `brutex_core::Price` — or any other workspace type — appeared in a
-//!    signature, a caller would have to name it and this file would stop
-//!    compiling.
+//! **Every public item listed below is reachable from outside the crate with
+//! nothing else in scope, and every value crossing the boundary is an `f64`, a
+//! `u32`, an `i32` or a plain enum this crate owns.** An integration test is a
+//! separate crate that can only see what the manifest lets it see, so a
+//! signature that had come to require a type from this workspace would make
+//! this file stop compiling.
 //!
-//! No paisa appears anywhere in this file, which is the other half of the
-//! argument in `docs/05-decisions.md` D-0036: the crate is `f64` throughout
-//! *because it never sees money*.
+//! **What it does NOT prove, stated because it was once claimed to.** An
+//! integration test can only fail on the items it *names*. A public item this
+//! file does not mention could take or return a workspace type and nothing
+//! here would notice; a `pub use` of one adds no code region at all, so even
+//! the coverage gate cannot see it. Both were measured, in a copy of this
+//! workspace outside the repository: re-exporting `core`'s paisa type from
+//! this crate's root left clippy, the whole suite and 100% coverage green.
+//! **CI gate 9b is the enforcement** — it reads the manifest and refuses a
+//! dependency, a dev-dependency, or any mention of a workspace type in this
+//! crate's sources. This file is the ergonomic check that sits beside it.
+//! `docs/05-decisions.md` D-0037.
+//!
+//! No paisa appears anywhere in this file, which is the other half of that
+//! entry's argument: the crate is `f64` throughout *because it never sees
+//! money*.
 
 // The same exceptions every test module in this workspace takes: a test that
 // cannot panic cannot fail, and the lints that forbid panicking exist to keep
 // a panic out of the LIBRARY, not out of its tests. `float_arithmetic` and
 // `float_cmp` are here for the reason the whole crate exists -- see the crate
-// documentation and D-0036.
+// documentation and D-0037.
 #![allow(
     clippy::indexing_slicing,
     clippy::expect_used,
@@ -121,8 +129,14 @@ fn the_whole_public_surface_is_reachable_with_nothing_else_in_scope() {
     assert!(solved.volatility > greeks::solver::MIN_VOLATILITY);
     assert!(solved.volatility < greeks::solver::MAX_VOLATILITY);
     assert!(rung.steps < greeks::moneyness::MAX_STEPS);
+    // Every evaluation is counted, including the two that establish the
+    // bracket and the one at the answer. 2 + 8 + 64 + 1.
     assert_eq!(
         greeks::solver::MAX_ITERATIONS,
-        greeks::solver::NEWTON_STEPS + greeks::solver::BISECTION_STEPS
+        greeks::solver::BRACKET_EVALUATIONS
+            + greeks::solver::NEWTON_STEPS
+            + greeks::solver::BISECTION_STEPS
+            + greeks::solver::FINAL_EVALUATION
     );
+    assert!(solved.iterations > greeks::solver::BRACKET_EVALUATIONS);
 }

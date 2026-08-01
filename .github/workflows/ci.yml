@@ -125,6 +125,58 @@ jobs:
           fi
           echo "OK — core depends on nothing."
 
+      - name: Gate 9b — greeks depends on nothing
+        run: |
+          set -euo pipefail
+          # Same shape as gate 9, for the same reason and a different consumer.
+          # crates/greeks is taken by the `tickvault` repository by git URL, so
+          # a dependency added here is a dependency forced on a repository that
+          # is not this one -- and a type from this workspace in its public
+          # surface makes it unusable there outright.
+          #
+          # Until this gate existed the property was advertised in six places
+          # and enforced in none. `crates/greeks/tests/standalone.rs` was named
+          # as the proof and cannot be: an integration test fails only on items
+          # it NAMES, so a leaked type it does not name is invisible to it, and
+          # a `pub use` adds zero code regions so the coverage gate cannot see
+          # one either. Both were verified by breaking the property in a copy
+          # of this workspace outside the repository -- clippy, the full test
+          # suite and 100% coverage all stayed green. See D-0037.
+          #
+          # No untrusted input reaches this step: the inputs are a tracked
+          # manifest path, `git ls-files` and static patterns. Nothing from the
+          # event payload is expanded.
+          f=crates/greeks/Cargo.toml
+          [ -f "$f" ] || { echo "skip — crate not created yet"; exit 0; }
+          deps=$(awk '/^\[dependencies\]/{f=1;next} /^\[/{f=0} f && /=/ {print $1}' "$f" \
+                 | grep -v '^$' || true)
+          if [ -n "$deps" ]; then
+            printf 'crates/greeks MUST DEPEND ON NOTHING. Found:\n%s\n' "$deps"
+            echo "It is shared with another repository by git URL. See D-0037."
+            exit 1
+          fi
+          # And no dev-dependency either: a dev-dependency is not forced on a
+          # consumer, but it is forced on anyone who runs this crate's tests,
+          # and this crate's tests are part of what is shared.
+          dev=$(awk '/^\[dev-dependencies\]/{f=1;next} /^\[/{f=0} f && /=/ {print $1}' "$f" \
+                 | grep -v '^$' || true)
+          if [ -n "$dev" ]; then
+            printf 'crates/greeks MUST DECLARE NO DEV-DEPENDENCY. Found:\n%s\n' "$dev"
+            exit 1
+          fi
+          # The public surface names no type from this workspace. Every other
+          # crate here is reachable only by its package name, so naming one at
+          # all is the leak -- including through a re-export, which is the case
+          # standalone.rs cannot see.
+          leaks=$(git ls-files 'crates/greeks/**/*.rs' \
+                  | xargs -r grep -nE '\b(brutex_core|core::(price|instrument|universe|vendor))\b' \
+                  || true)
+          if [ -n "$leaks" ]; then
+            printf 'A WORKSPACE TYPE APPEARS IN crates/greeks:\n%s\n' "$leaks"
+            exit 1
+          fi
+          echo "OK — greeks depends on nothing and names no workspace type."
+
       - name: Gate 10 — every invariant names a test that exists
         run: |
           set -euo pipefail

@@ -17,16 +17,21 @@
 //! | Quantity | Here | Dhan's chain, measured |
 //! |---|---|---|
 //! | vega | per `1.00` of volatility | per **one percentage point** — divide by 100 |
-//! | theta | per **year** | per **calendar day** — divide by 365 |
+//! | theta | per **year** | per a **calendar day**, not a trading day — divide by ≈365 |
 //! | rho | per `1.00` of rate | not published at all |
 //!
-//! The day divisor is a measurement, not a convention picked for tidiness.
+//! **What is measured about theta's divisor, and what is a convention.**
 //! Solving the captured chain twice, once with 365 and once with 252, the two
 //! sides of the same strike agree on `r` to **1.00 percentage point** under
-//! 365 and to **23.26** under 252 — a factor of 23.3. Getting it wrong costs
-//! `365/252 = 1.448`, so a theta of `−15.15` a day becomes `−10.46`: a 44.8%
-//! error on a single strike, invisible unless it is tested. See
-//! `docs/05-decisions.md` D-0036.
+//! 365 and to **23.26** under 252 — a factor of 23.3. That excludes a trading
+//! day, and it is the part this table rests on. It does **not** select 365:
+//! the same criterion has its root at **370.08**, where the two sides agree
+//! exactly, and it prefers 375 to 365. So `365` here is the nearest ordinary
+//! calendar convention to a root the sample puts elsewhere, and the day count
+//! behind it is UNVERIFIED. Getting the divisor wrong by the trading-day
+//! factor costs `365/252 = 1.448`, so a theta of `−15.15` a day becomes
+//! `−10.46`: a 44.8% error on a single strike, invisible unless it is tested.
+//! See `docs/05-decisions.md` D-0037 and `docs/06-limits.md` §18.
 //!
 //! # What is exact here and what is not
 //!
@@ -47,7 +52,7 @@
 // vega is a sensitivity; `CLAUDE.md` §7 puts statistical values at full
 // precision and reserves `i64` paisa for prices. No paisa reaches this file
 // and no value here is ever snapped to a tick. See the crate documentation
-// and D-0036.
+// and D-0037.
 #![allow(clippy::float_arithmetic)]
 
 use crate::error::GreeksError;
@@ -285,10 +290,31 @@ impl Contract {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Every model evaluation this crate performs passes through
+    /// [`Checked::greeks`], so counting there counts **all** of them —
+    /// including the two bracket ends and the final re-evaluation, which the
+    /// solver's own arithmetic used to leave out.
+    ///
+    /// This exists so that
+    /// `greeks::solver::the_reported_cost_is_every_model_evaluation` can check
+    /// [`crate::solver::ImpliedVolatility::iterations`] against a number the
+    /// solver did not compute. A counter that only reads the field the code
+    /// reports cannot see the field being wrong, which is exactly how a
+    /// three-evaluation gap survived a test named for the bound.
+    ///
+    /// Thread-local because `cargo test` runs tests in parallel and a shared
+    /// counter would measure other tests' work.
+    pub(crate) static MODEL_EVALUATIONS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 impl Checked {
     /// The closed form. No branch except the one that chooses a side, so the
     /// cost does not depend on any input value.
     pub(crate) fn greeks(&self, volatility: f64, kind: OptionKind) -> Greeks {
+        #[cfg(test)]
+        MODEL_EVALUATIONS.with(|spent| spent.set(spent.get().saturating_add(1)));
         let vol_root_years = volatility * self.root_years;
         let d1 = ((self.spot / self.strike).ln()
             + (self.rate - self.carry + 0.5 * volatility * volatility) * self.years)
@@ -338,6 +364,29 @@ impl Checked {
         }
     }
 
+    /// The magnitude the model price is a **difference of**, which is the
+    /// scale its absolute rounding error actually has.
+    ///
+    /// `price` is `forward · N(d1) − discounted_strike · N(d2)` for a call and
+    /// the mirror for a put. Each product carries up to one unit in the last
+    /// place of *its own* magnitude, and each `N` carries the CDF's `2.22e-16`
+    /// absolute error multiplied by the leg in front of it. So the granularity
+    /// of the answer is set by the two legs and **not** by the small residue
+    /// they leave behind: one day out and two percent in the money, a price of
+    /// `507.76` is what survives the subtraction of two terms near `25,600`,
+    /// and `ulp(507.76)` is a measured **100.8 times** finer than the noise
+    /// that price actually carries —
+    /// `the_price_scale_is_the_two_legs_and_it_dwarfs_the_price_they_leave`
+    /// takes that ratio on every run.
+    ///
+    /// Returned as the scale rather than as the error so the caller can divide
+    /// before it multiplies by [`f64::EPSILON`]. Multiplying first underflows
+    /// to exactly zero for a subnormal quantity, which reports the strongest
+    /// possible certainty at the moment there is none. See D-0037.
+    pub(crate) fn price_scale(&self) -> f64 {
+        self.forward + self.discounted_strike
+    }
+
     /// The two prices no volatility can reach past: the limit as volatility
     /// falls to zero, and the limit as it rises without bound.
     ///
@@ -379,10 +428,29 @@ pub(crate) mod tests {
 
     /// A grid wide enough to have an opinion, and small enough to read.
     /// Moneyness, maturity, volatility, rate, carry.
+    ///
+    /// **The near-the-money rungs at two and five days are not decoration.**
+    /// The first version of this grid stepped from 0.95 straight to 1.00 and
+    /// from one day straight to seven, and the solver's worst answers live in
+    /// exactly the gap that left: a strike a percent or two in the money, one
+    /// to five days out, at a low volatility, where the price is a small
+    /// residue of two terms near the spot. Every silently wrong implied
+    /// volatility D-0037 records was found there, and no point of the old grid
+    /// stood inside it. A grid that misses the regime a test exists to police
+    /// makes the test decorative.
     pub(crate) fn grid() -> Vec<(Contract, f64)> {
         let mut out = Vec::new();
-        for moneyness in [0.80_f64, 0.95, 1.0, 1.05, 1.25] {
-            for years in [1.0_f64 / 8760.0, 1.0 / 365.0, 7.0 / 365.0, 0.25, 1.0, 3.0] {
+        for moneyness in [0.80_f64, 0.95, 0.98, 1.0, 1.02, 1.05, 1.25] {
+            for years in [
+                1.0_f64 / 8760.0,
+                1.0 / 365.0,
+                2.0 / 365.0,
+                5.0 / 365.0,
+                7.0 / 365.0,
+                0.25,
+                1.0,
+                3.0,
+            ] {
                 for volatility in [0.05_f64, 0.12, 0.35, 1.0] {
                     for (rate, carry) in [(0.0_f64, 0.0_f64), (0.0946, 0.0), (0.07, 0.02)] {
                         out.push((
@@ -834,5 +902,38 @@ pub(crate) mod tests {
             checked.no_arbitrage_bounds(OptionKind::Put).0,
             checked.discounted_strike - checked.forward
         );
+    }
+
+    #[test]
+    fn the_price_scale_is_the_two_legs_and_it_dwarfs_the_price_they_leave() {
+        // The quantity `GreeksError::Indeterminate` screens on. It has to be
+        // the size of the terms the price is a DIFFERENCE of, not the size of
+        // the difference -- the whole defect D-0037 repairs is that those are
+        // not the same number in the regime the guard exists for.
+        let contract = Contract {
+            spot: 25_851.19,
+            strike: 25_350.0,
+            years_to_expiry: 1.0 / 365.0,
+            rate: 0.0946,
+            carry: 0.0,
+        };
+        let checked = contract.check().expect("checked");
+        assert_eq!(
+            checked.price_scale(),
+            checked.forward + checked.discounted_strike
+        );
+        // And the point of it, as a measured ratio rather than an assertion
+        // about the source: one day out and two percent in the money at five
+        // percent volatility, the granularity the price ACTUALLY has is nearly
+        // a hundred times coarser than one unit in its own last place.
+        let price = contract.price(0.05, OptionKind::Call).expect("priced");
+        let by_the_price = price * f64::EPSILON;
+        let by_the_legs = checked.price_scale() * f64::EPSILON;
+        let ratio = by_the_legs / by_the_price;
+        println!(
+            "price {price}: ulp-of-price noise {by_the_price:e}, \
+             ulp-of-legs noise {by_the_legs:e}, ratio {ratio:.1}"
+        );
+        assert!(ratio > 50.0, "the two estimates no longer differ: {ratio}");
     }
 }
