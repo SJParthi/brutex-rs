@@ -372,6 +372,23 @@ mod tests {
     }
 
     #[test]
+    fn an_out_of_range_month_has_zero_days() {
+        // `days_in_month` needs a catch-all arm to be exhaustive over u8, and
+        // `Expiry::new` validates the month before ever reaching it — so this
+        // arm is unreachable through the public API and the coverage gate
+        // correctly flagged it as dead.
+        //
+        // It is kept rather than removed, and tested directly here, because
+        // returning 0 makes the arm FAIL SAFE: any future caller that skips
+        // the month check gets "no day is valid in this month" instead of a
+        // plausible 31. Deleting it to satisfy coverage would trade a proven
+        // branch for an unprovable assumption about future callers.
+        assert_eq!(Expiry::days_in_month(2025, 0), 0);
+        assert_eq!(Expiry::days_in_month(2025, 13), 0);
+        assert_eq!(Expiry::days_in_month(2025, u8::MAX), 0);
+    }
+
+    #[test]
     fn expiry_honours_the_gregorian_leap_rule() {
         assert!(Expiry::new(2024, 2, 29).is_ok(), "2024 is a leap year");
         assert_eq!(
@@ -554,5 +571,38 @@ mod tests {
     #[test]
     fn require_sweepable_accepts_the_three() {
         assert_eq!(nifty().require_sweepable(), Ok(()));
+    }
+
+    /// A writer that fails on first use, to exercise the `?` in `Display`.
+    struct AlwaysFails;
+
+    impl fmt::Write for AlwaysFails {
+        fn write_str(&mut self, _: &str) -> fmt::Result {
+            Err(fmt::Error)
+        }
+    }
+
+    #[test]
+    fn display_propagates_a_writer_error_rather_than_swallowing_it() {
+        // `write!(f, ...)?` has an error path that a normal String formatter
+        // never takes, so it showed up as the one uncovered region. It is a
+        // real path: a Display that discards a writer error would report
+        // success while producing a truncated instrument name, and a truncated
+        // name in a store path is a different instrument.
+        use fmt::Write as _;
+        let mut w = AlwaysFails;
+        assert!(write!(w, "{}", nifty()).is_err());
+
+        let opt = InstrumentKey {
+            exchange: Exchange::Nse,
+            segment: Segment::Fno,
+            underlying: Symbol::new("NIFTY").expect("valid"),
+            kind: Kind::Option {
+                expiry: Expiry::new(2025, 7, 3).expect("valid"),
+                strike: Paisa::from_raw(2_280_000),
+                side: OptionSide::Call,
+            },
+        };
+        assert!(write!(w, "{opt}").is_err());
     }
 }
