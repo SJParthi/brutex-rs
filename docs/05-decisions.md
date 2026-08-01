@@ -269,6 +269,65 @@ is the finest granularity that is honest.
 
 ---
 
+## D-0015 · 2026-08-01 · Minute bars only until a minute-level result earns the upgrade
+
+**Decision.** The engine ingests **1-minute bars from the two brokers only**.
+Second-level data, tick data, bid/ask, and the two paid CSV vendors are
+**deferred until a minute-level sweep has produced a profitable result**. The
+seams that make them cheap to add are built now; the data is not bought now.
+
+**Rejected — buying the second-level data first.** Two live quotes exist:
+₹1,15,050 for 6.5 years of NIFTY F&O at 1-second, and ₹3,04,787 for 7 years of
+NSE F&O. Neither is recoverable if the minute-level hypothesis does not hold,
+and nothing measured so far says it does — `docs/06-limits.md` §4 still records
+that **a full production sweep has never been run**. Paying before that
+sentence is replaced by a measurement is buying on an extrapolation.
+
+**Rejected — deferring the seams as well.** The retrofit cost is what makes a
+deferral expensive, so the seams are load-bearing today:
+
+| Seam | Built now | Cost to switch on later |
+|---|---|---|
+| `timeframe_secs` is a `u32` of **seconds** | already the store header field; `1` is a legal value | none — no format change, no migration |
+| Path is the index | `bars/<exch>/<seg>/<sym>/<tf>/<yyyy-mm>.bin`; `<tf>` becomes `1sec` | none — the first write creates the directory |
+| Bid/ask/greeks live in the `.ovl` sibling | D-0011 already forbids widening the base record | none — own version, own stride, same index *i* |
+| Per-vendor decode behind one seam | the two brokers already disagree (rows vs parallel columns), so the seam is forced to exist | one implementation per vendor |
+
+**What this defers, and why that is a relief.** Fixed-stride addressing is O(1)
+only on a **dense** grid. At 1-second there are 22,500 slots per session, so a
+dense grid costs ~1.26 MB per instrument per day — roughly **1.5 TB for NIFTY
+options alone** over 6.5 years, against ~100 GB sparse. Sparse storage turns
+the timestamp→bar lookup into a search and breaks the repository's central
+guarantee. That choice is genuinely hard, it is unavoidable at second-level,
+and it does not arise at all at minute-level. Deferring the data defers the
+dilemma honestly rather than pre-committing to an answer.
+
+**Vendor facts captured now so they are not re-derived later** (evidence lane
+attached; none of this is in the engine surface):
+
+| Fact | Value | Lane |
+|---|---|---|
+| GDFL CSV columns | `Ticker,Date,Time,LTP,BuyPrice,BuyQty,SellPrice,SellQty,LTQ,OpenInterest`, header present, date `DD/MM/YYYY` | verified from a sample file |
+| TrueData CSV columns | `YYYYMMDD, HH:MM:SS, LTP, Volume, OpenInterest, Bid, BidQty, Ask, AskQty` — **no header row** | verified from the vendor's own email |
+| Column order differs | GDFL puts bid/ask **before** volume/OI; TrueData **after**. A positional reader silently swaps Open Interest with a bid price. | verified |
+| TrueData row identity | **none** — the instrument is the *filename* only | verified from a sample |
+| GDFL websocket identity | `OPTSTK_SBIN_28OCT2025_CE_860`, `OPTIDX_NIFTYNXT50_28OCT2025_CE_61900` | verified from vendor documentation |
+| GDFL CSV identity | `NIFTY03JUL2522800CE.NFO` | verified from a sample |
+| Naming conventions in play | **five, all mutually incompatible** — Groww symbol, Dhan numeric id, GDFL CSV, GDFL websocket, TrueData filename | verified |
+| GDFL epoch fields | `LastTradeTime` / `ServerTime` are epoch **seconds** | documented |
+| Excluded from the GDFL quote | Option Chain, Option Greeks | quoted |
+| TrueData licence | forbids forwarding, resale, and commercial use | quoted |
+
+**Why five naming conventions is the real reason the mapping layer exists.**
+One canonical `InstrumentKey` that every vendor resolves *to* is not
+architectural taste; with five incompatible spellings of the same contract, a
+shared identity is the only thing that makes deduplication meaningful across
+sources. That layer is built at minute-level, where there are only two
+spellings to reconcile, and it is the thing that makes vendors three and four
+cheap.
+
+---
+
 ## How to add an entry
 
 Next free ID, today's date, the decision in one sentence, the alternative
