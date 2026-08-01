@@ -1535,3 +1535,262 @@ depends on a filesystem, a page cache and a device the harness does not control,
 and timing it would report the state of one machine's cache rather than a
 property of the code. Any statement about that saving is an **EXTRAPOLATION**
 from the entry scan above.
+
+---
+
+## D-0036 · 2026-08-01 · The pull crate's bounds, its redactions and its fall-backs are made real, and three claims that were not measured are withdrawn
+
+**Decision — eighteen defects found by adversarial review of `crates/pull` are
+fixed at their cause rather than at the symptom. Where a claim could not be
+made true, the claim is withdrawn and the residual is recorded. No test that
+exposed a defect was deleted, no range was narrowed, and no gate was weakened.**
+
+This entry supersedes three statements in D-0035. That entry is not edited —
+the ledger is append-only — so what was wrong is named here, sentence by
+sentence.
+
+### 1 — The configuration file's size bound was not a bound
+
+`CredentialConfig::load` took its bound from `std::fs::metadata(path).len()` and
+then called `read_to_string`. For every non-regular file that number is `0`:
+`stat /dev/zero` on this host reports `size=0 type=Character Device`, and a
+FIFO and a `/proc` entry report the same. So the check passed trivially and the
+read that followed was unbounded on an endless stream. The review that found
+this drove it: `load` on `/dev/zero` reached about 3 GB of resident memory in a
+second and was still growing when it was killed, and `load` on a FIFO blocked in
+`open` and never returned — those two numbers are that review's, not a
+re-measurement here. They are precisely the two outcomes the comment above
+`MAX_FILE_BYTES` said the check existed to prevent — "an allocator failure or an
+OOM kill, and neither reaches an operator as *the credential configuration is
+too big*". It was also a TOCTOU: `metadata` and `read_to_string` are two
+syscalls, and a regular file that grew in between was read in full.
+
+**Now:** `metadata` is still called first, and its *only* job is to refuse
+anything that is not a regular file — `ConfigError::NotARegularFile`, naming the
+path (P-19). A FIFO must be refused before `open`, because `open` on a FIFO with
+no writer blocks forever and a hang is the one failure a test suite cannot
+report. The read that follows is bounded by `Read::take(MAX_FILE_BYTES + 1)` and
+the refusal is on what was actually read (P-17), which closes the device case
+and the growth race in one change.
+
+**Rejected — reporting the file's true length in `TooLarge`.** The read stops
+one byte past the bound, so the true length is not known here. The variant
+carries `at_least` and says so, rather than a second `stat` whose answer would
+be as stale as the first one was.
+
+### 2 — The assembled path was printable, from the type built to hold it
+
+`secret.rs` states the threat model in its own words: a halt "never carries the
+assembled path, which names an account, and an error is the thing most likely to
+be logged, pasted into an issue and pushed to a public repository". `Secret` was
+given a hand-written redacting `Debug` for exactly that reason. `CredentialPath`
+— which *is* the assembled path — got a derive, and so did `CredentialConfig`
+and the vendor table. `format!("{path:?}")` against the operator's real file
+rendered all four live segments in the clear, and `pull::unit::the_only_path_
+is_the_one_the_configuration_assembles` **asserted** that it did.
+
+**Now:** all three carry hand-written `Debug` implementations rendering the
+shape and the segment lengths (P-18), `Display` on the path is the single
+audited exit in the role `Secret::expose` plays for a value, and the test that
+certified the leak now asserts its absence.
+
+### 3 — Gate 1c proves less than X-08 claimed
+
+`crates/pull/src/lib.rs` called gate 1c "the check that this held". It is not:
+its pattern needs a slash-joined path whose environment segment is one of ten
+words. A file hardcoding a real `org` and a real `env` as two bare constants was
+run past that exact regex and did not match.
+
+**Now:** X-08's row is narrowed to what the gate does, `lib.rs` and the
+`config.rs` header say the same, and **gate 1d** is added: every double-quoted
+literal under `crates/pull` that could *be* a path segment must appear in an
+allowlist in the workflow. That turns "every segment here is invented" into a
+check and makes adding one a deliberate act. `docs/06-limits.md` §18 records
+what neither gate can do.
+
+### 4 — D-0035's "one honest caveat" is not hypothetical here
+
+D-0035 wrote that if an operator sets the vendor key to the same text as the
+table name "the two coincide in *their* file — which is their choice and which
+nothing here can see", and its "Checked, not assumed" paragraph searched only
+`org` and `env`. Extending that search to all four roles, against the operator's
+own untracked file, without printing any value:
+
+| role | tracked files containing it |
+|---|---|
+| `org` | 0 |
+| `env` | 1 — inside gate 1c's own `envs=` alphabet in `ci.yml` |
+| region | 5 — `CLAUDE.md` publishes it in the law |
+| `vendor` segment (each of two) | **11 and 13**, including `crates/pull` |
+| field names | 2 documents each, which §8 expressly permits |
+
+So of the four segments, the vendor and the field are published and the region
+is published by law. The separation the `vendor` key exists to make possible is
+available in this deployment and is not taken. That is an operator-side choice —
+a parameter path whose vendor segment is not the broker's public name — and it
+is now said plainly in `config.rs` and in `docs/06-limits.md` §18 instead of
+being implied to be unknowable.
+
+### 5 — A fall-back that made a broken file look like a working one
+
+`ManifestHeader::read_region` computed a header-slot refusal, stored it in a
+local, and dropped it on the success path. Flipping one bit in the newest slot
+of a two-month manifest returned `Ok` with the census silently reduced from 2
+entries / 300 rows to 1 / 100, and no API a caller could reach said so. That is
+the fallback `CLAUDE.md` §4 bans, on the one file whose entire purpose is a
+number that can be trusted without a walk.
+
+**Now:** `read_region` returns a `HeaderRead` — the newest generation, the one
+below it, and what was stepped over — and `Manifest::degraded_reason()` carries
+that to the caller (M-16). Recording is still permitted on a degraded census,
+because recovering from a torn commit *is* writing the next generation and
+refusing would leave the commonest crash with no way forward.
+
+### 6 — M-05 was false as stated
+
+M-05 claims a header that became durable before its entries "falls back one
+generation rather than condemning the file". The fall-back lived entirely in
+`validate(capacity)`, where `capacity` is the entry region's **byte length**. So
+it engaged only when the region was physically short. When the counted entry's
+64 bytes were present and never written back — a crash between a data write and
+its flush, a lost block, a preallocated extent — the entry's CRC failed and
+`load` condemned the whole file, while the previous generation sat intact in the
+other slot and loaded perfectly when handed to `load` on its own. The test named
+as M-05's proof passed an **empty** entry region, so it could only ever exercise
+the length arm.
+
+**Now:** `Manifest::load` walks *down* the generations. If the published one
+does not describe these bytes, the one below it is tried — it counts a prefix of
+the same entries, and `read_region` has already validated it. Measured against
+a zeroed tail entry, a garbage one and a half-written one, all three now recover
+to the previous generation and name what they stepped over. When no generation
+survives it is a refusal, and the refusal reported is the newest generation's,
+because that is the state a writer published.
+
+### 7 — A genesis census over a file that already had one
+
+`Manifest::genesis` was public. A writer that called it on a vendor which
+already had a manifest produced a census that was silently, verifiably wrong and
+still loaded clean: the stale slot 0 wins on generation, the fresh generation-1
+commit lands in slot 1, entry 0 is overwritten, and because real index months
+share a row count the recomputed key count and row total still agree with the
+stale header.
+
+**Now:** `genesis` is private and `Manifest::open(vendor, header, entries)` is
+the door. It hands out a genesis manifest for a file with **nothing** in it and
+calls `load` otherwise, so the wrong state is unrepresentable rather than merely
+discouraged (M-14).
+
+### 8 — The index was reserved from the file, not from the census
+
+`let reserve = MAX_ENTRIES_LEN.min(entries.len() / IMAGE_LEN);` sized the map
+from the untrusted region length while the comment above it argued for the tight
+bound. A header committing exactly one entry inside a region at the design
+ceiling allocated **574,619,656 bytes** to hold a one-key index — measured with
+a counting allocator.
+
+**Now:** the reservation is `header.n_valid`, which `validate` has already
+proved is within both `MAX_ENTRIES` and the region's capacity, so the no-rehash
+property is unchanged and the allocation is proportional to the census (M-17).
+
+### 9 — C-12 measured a map the claim was not about
+
+`census()` built every manifest it timed with `genesis` + `record`, and that map
+reserves nothing and grows by rehashing. `Manifest::load` — the only place a
+bound is reserved — was never called in the bench. Meanwhile `docs/06-limits.md`
+§17, `docs/07-o1-architecture.md` line 79 and the bench's own doc comment all
+attributed the flatness to that reservation. Two mutants of the reservation
+expression survived the whole suite for the same reason.
+
+**Now:** `census()` round-trips through `Manifest::load`, so the map measured is
+the map the claim is about, and M-17 asserts the reservation as a number.
+
+### 10 — The C-11 spread's stated cause is refuted by measuring the clock
+
+D-0035, `docs/06-limits.md` §17 and `docs/07-o1-architecture.md` all said "a
+field read sits at the clock's resolution floor, so its measured picoseconds
+move by a factor of two between runs". The harness now measures the smallest
+non-zero interval `Instant` reports and prints it beside the ratio. It is tens
+of nanoseconds; the counter side is averaged over 100,000 repetitions, so one
+tick is a fraction of a picosecond of reported cost against observations of
+hundreds of picoseconds. The counter side is roughly three orders of magnitude
+above the clock floor, so the floor is not what moves it.
+
+**Now:** the observation is recorded (378–789 ps across runs, scan holding at
+~152 µs) and the cause is recorded as **not established**. The 100× floor never
+rested on the explanation. `CLAUDE.md` §3 rule 6.
+
+### 11 — `SecretError::NotDecrypted` advertised a check nobody wrote
+
+Nothing in `crates/pull/src` constructed it. `SsmSecretSource::read` passes
+`with_decryption: true` and wraps whatever came back with no ciphertext check at
+all, so the protection its doc comment described did not exist and the failure
+it named would still occur — as a `DeadToken` halt naming the wrong cause.
+
+**Rejected — writing the check.** Recognising a KMS blob means knowing a
+vendor's ciphertext prefix and length, which is an external fact with no source
+recorded in `docs/00-charter.md`; `CLAUDE.md` §3 rule 1 forbids inventing one.
+The variant is removed and `docs/06-limits.md` §19 records what that leaves
+unprotected, so no doc comment describes a check that is not there.
+
+### 12 — The counters can drift from the bar files, and nothing said so
+
+`Manifest::load` checks the header against this file's own entries and against
+nothing else. An entry claiming 999,999,999 rows for a month with no bar file
+anywhere loads clean and `total_rows()` returns it as fact; a crash between a
+bar write and the manifest append leaves the census permanently short; a deleted
+bar file leaves it permanently long. That is inherent — confirming it is the
+~248,000-operation directory walk the layer exists to avoid — but it was
+nowhere written down. `docs/06-limits.md` §17, the `manifest` module doc and
+`docs/07-o1-architecture.md` now name it, and say that a reconciliation pass is
+not built.
+
+### 13 — `cargo-mutants` was not run, and §9 requires it
+
+D-0035 stated plainly that it had not been run and left X-07 at `—`, which that
+file's legend defines as "not yet reachable (the crate does not exist)". The
+crate exists. It was run here, and the survivors it found are fixed at their
+cause:
+
+- **Seven exact-limit boundaries** — `MAX_ENTRIES` in `advance`, `validate` and
+  `commit`, `MAX_FILE_BYTES`, `MAX_LINE_BYTES`, `MAX_FIELDS`, and the load-time
+  equal-timestamp check — had no test supplying a value sitting *on* the limit,
+  so every one of those comparisons could be flipped between `>` and `>=` with
+  the suite green. M-15 and the P-17 test now pin each one at the limit and one
+  past it, which is the standard `the_secret_backstop_is_the_first_byte_that_
+  is_too_many` already set for one bound and nowhere else.
+- **The map reservation** — killed by rewriting it to come from the counter
+  (item 8), which removes the arithmetic operator that was being mutated, and by
+  M-17 asserting the result.
+- **`is_specific -> false`** — killed by M-16, which requires the stepped-over
+  refusal to be reported by name.
+- **`Secret::is_empty -> false`** — an *equivalent* mutant: the method can only
+  ever return `false`, because `Secret::new` refuses an empty value, so no test
+  could distinguish the mutant from the original. It existed only because clippy
+  demands an `is_empty` beside a method named `len`. `len` is renamed
+  `byte_len`, and `is_empty` is deleted. A function whose only possible answer
+  is one value is not proven by a test that calls it.
+
+X-07's status moves off `—`.
+
+### What was measured, and on what
+
+An Apple M4 Pro, macOS 26.5.2, rustc 1.97.1, release profile for the bench.
+
+| | measured |
+|---|---|
+| smallest non-zero `Instant` interval on this host | **41 ns**, so 410 fs of reported cost at 100,000 reps |
+| C-11 counter, this run | **789 ps** — **1,924 clock ticks**, not one |
+| C-11 census counter vs decoding 10,000 entries | 789 ps vs 180,058,300 ps — **228,210×** |
+| C-12 entry lookup, 10× / 100× census | 0.929× / 1.025×, on the **loaded** map |
+| C-12 absent lookup, 10× / 100× census | 1.008× / 0.909× |
+| `cargo mutants --package pull` | 263 mutants, **227 caught, 36 unviable, 0 survivors**, 3m |
+| coverage, `crates/pull` | config 603 regions / 384 lines, manifest 874 / 598, secret 103 / 83 — 100.00% on both measures |
+
+The clock figure is the one that settles item 10: the counter observation is
+three orders of magnitude above the clock's floor, so the floor is not what
+moves it between runs.
+
+Every gate in `CLAUDE.md` §9 was re-run against the finished tree. The `x86_64`
+numbers are still unrecorded (`docs/06-limits.md` §17), and the directory walk
+the manifest replaces is still an **EXTRAPOLATION**.

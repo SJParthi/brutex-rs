@@ -4,8 +4,20 @@ Every row names the test that proves it. **An invariant with no test named
 beside it is deleted from this file, not shipped.** A consistency check in CI
 fails if a row's test does not exist.
 
-Status: `✓` proven · `○` test written, awaiting the crate · `—` not yet
-reachable (the crate does not exist).
+Status: `✓` proven · `◐` proven where it has been run, and where that is is
+named · `○` test written, awaiting the crate · `—` not yet reachable (the crate
+does not exist).
+
+**X-07 and X-08 were narrowed by D-0036, not weakened.** X-07 sat at `—`, which
+this legend defines as "the crate does not exist" — untrue once `crates/pull`
+existed, and `CLAUDE.md` §9's mutation bullet had simply not been run. It is now
+`◐` and names where it *has* been run: `crates/pull` only. `crates/core`,
+`crates/store` and `crates/api` have never been measured, and no row here claims
+otherwise. X-08 claimed CI gate 1c proved "no literal credential path"; the gate
+matches only a slash-joined path with a well-known environment segment, which
+was demonstrated by running its exact pattern over a file hardcoding two real
+segments as bare constants. The row now says what the gate does, gate 1d covers
+the crate where the gap matters, and `docs/06-limits.md` §18 records the rest.
 
 ---
 
@@ -66,7 +78,15 @@ reachable (the crate does not exist).
 | C-09 | Decoding one vendor row costs the same whether a field is 28 bytes or 4 MiB | `core::bench::decode_is_flat_in_field_width` | ✓ |
 | C-10 | An over-wide vendor field is **refused**, not merely decoded quickly | `core::bench::an_over_wide_row_is_refused` | ✓ |
 | C-11 | Reading the census beats re-deriving it from the entries by at least 100×, measured in one process | `pull::bench::census_beats_the_scan_it_replaces` | ✓ |
-| C-12 | One entry lookup — hit or miss — costs the same at 1×, 10× and 100× the census | `pull::bench::entry_lookup_is_flat` | ✓ |
+| C-12 | One entry lookup — hit or miss — costs the same at 1×, 10× and 100× the census, measured on the map a **loaded** manifest holds | `pull::bench::entry_lookup_is_flat` | ✓ |
+
+C-12 was measured on a manifest built by `Manifest::genesis` + `record` until
+D-0036 — a map that grew by rehashing — while three documents attributed the
+flatness to a reservation taken on the load path that the harness never
+called. The bench now builds its census through `Manifest::load`, so the map
+measured is the map the claim is about, and
+`pull::unit::the_loaded_index_is_reserved_from_the_census` (M-17) asserts where
+the reservation comes from as a number.
 
 C-01 was previously stated as "bar read cost is flat from 1× to 100× file size"
 and proven by `store::bench::read_ratio`, which did not exist — there is no bar
@@ -112,7 +132,17 @@ them is the change that makes a live vendor call.
 | P-14 | The declared path bound is reached exactly by a maximal configuration; it is tight, not merely sufficient | `pull::unit::a_maximal_path_is_exactly_the_declared_bound` | ✓ |
 | P-15 | Every line the configuration reader does not understand is a halt naming the line; none is skipped | `pull::unit::every_line_this_reader_does_not_know_is_a_halt` · `pull::unit::a_vendor_tables_own_keys_are_checked_too` | ✓ |
 | P-16 | The configured region is checked against the one `CLAUDE.md` §8 fixes, not merely read | `pull::unit::the_region_is_checked_rather_than_merely_read` | ✓ |
-| P-17 | The configuration file is bounded — by size before it is read, and by line length before a line is parsed | `pull::unit::the_configuration_file_is_bounded_before_it_is_read` | ✓ |
+| P-17 | The configuration file is bounded **at the read** — at most `MAX_FILE_BYTES` + 1 bytes are ever pulled in, whatever `stat` claimed — and by line length before a line is parsed | `pull::unit::the_configuration_file_is_bounded_before_it_is_read` | ✓ |
+
+Added by D-0036. P-17 previously read "by size before it is read", and the
+check was `metadata().len()`, which is `0` for a FIFO, a character device and
+any `/proc` entry — so the bound was not a bound and the read that followed was
+unbounded. It is now taken on what was actually read.
+
+| # | Must hold | Proven by | |
+|---|---|---|---|
+| P-18 | No formatter renders a path segment: `Debug` on the assembled path, on the whole configuration and on a vendor's table is a redaction, and `Display` on the path is the one audited exit | `pull::unit::no_formatter_renders_a_path_segment` | ✓ |
+| P-19 | A path that is not a regular file is refused by name before it is opened, so a FIFO cannot hang the read and a device cannot make it unbounded | `pull::unit::a_path_that_is_not_a_regular_file_is_refused_by_name` | ✓ |
 
 ## The manifest — layer 13
 
@@ -125,15 +155,23 @@ Every row here is proven by a test that runs today.
 | M-02 | The checksum's domain is exactly bytes `0..60`; covering the checksum itself is a different number and is pinned against a hardcoded value | `pull::unit::the_covered_domain_is_the_image_minus_its_checksum` | ✓ |
 | M-03 | A flipped bit in any of an entry's 512 bits is detected | `pull::unit::a_flipped_bit_in_any_entry_byte_is_detected` | ✓ |
 | M-04 | A torn header commit never reports a count that was not committed — every one of the 65 prefixes gives the previous generation or the new one | `pull::unit::a_torn_header_commit_never_reports_an_uncommitted_count` | ✓ |
-| M-05 | A header that became durable before the entries it counts falls back one generation rather than condemning the file | `pull::unit::a_header_published_before_its_entries_falls_back_a_generation` | ✓ |
+| M-05 | A header that became durable before the entries it counts falls back one generation rather than condemning the file — whether the entry region is short, **or its committed bytes are zeroed, garbage or half-written** | `pull::unit::a_header_published_before_its_entries_falls_back_a_generation` | ✓ |
 | M-06 | A header counter that disagrees with the entries it counts is refused; the counter is checked against the thing it counts, once, on load | `pull::unit::a_counter_that_disagrees_with_its_entries_is_refused` | ✓ |
-| M-07 | A key whose row count or last timestamp goes backwards is refused, on write and on load | `pull::unit::a_row_count_that_went_backwards_is_refused` · `pull::unit::a_key_whose_history_goes_backwards_on_disk_is_refused` | ✓ |
+| M-07 | A key whose row count or last timestamp goes backwards is refused, on write and on load — and one that repeats its last timestamp exactly is accepted, on both | `pull::unit::a_row_count_that_went_backwards_is_refused` · `pull::unit::a_key_whose_history_goes_backwards_on_disk_is_refused` · `pull::unit::a_key_that_repeats_its_last_timestamp_is_accepted` | ✓ |
 | M-08 | An entry's address is arithmetic, and the ordinal is bounded rather than the product checked | `pull::unit::the_offset_of_an_entry_is_arithmetic` | ✓ |
 | M-09 | The exchange and segment codes on disk are frozen against hardcoded numbers, never re-derived from the enum | `pull::unit::the_exchange_and_segment_codes_are_frozen` | ✓ |
 | M-10 | A manifest whose header names another vendor is refused by name; the file name and the header must agree | `pull::unit::a_manifest_for_another_vendor_is_refused` | ✓ |
 | M-11 | The three counters are maintained on every write, and a refused record leaves them untouched | `pull::unit::the_counters_are_maintained_on_write` | ✓ |
 | M-12 | Every counter refuses to wrap — generation, entry count, key count and row total, on write and on load | `pull::unit::the_header_counters_refuse_to_wrap` · `pull::unit::the_row_total_refuses_to_wrap` · `pull::unit::the_load_time_row_total_refuses_to_wrap` | ✓ |
 | M-13 | A slot that is not this format's header is refused by name, and a commit found in the wrong slot is not a candidate | `pull::unit::a_slot_that_is_not_a_header_is_named` · `pull::unit::a_short_or_misplaced_header_region_is_refused` | ✓ |
+| M-14 | A genesis census exists only for a file with nothing in it; a writer cannot start a new census over one that already holds months | `pull::unit::the_only_genesis_is_an_empty_file` | ✓ |
+| M-15 | Every declared bound is exact — the value at the limit is accepted and the first one past it is refused, on `advance`, `validate`, `commit`, the line bound and the field bound | `pull::unit::every_declared_bound_is_exact_at_the_limit` | ✓ |
+| M-16 | A generation recovered by stepping over a damaged one is never silent: the census names what it stepped over | `pull::unit::a_corrupt_header_slot_is_named_by_the_census_that_survives_it` | ✓ |
+| M-17 | The loaded index is reserved from the committed entry count, not from the region's byte length, so the reservation is proportional to the census and never to the file | `pull::unit::the_loaded_index_is_reserved_from_the_census` | ✓ |
+
+M-14 through M-17 added by D-0036, each closing a defect that the tests above
+could not see. M-05 and M-07 were restated there rather than replaced: both
+claimed more than the code did.
 
 ## Instrument identity and the vendor merge
 
@@ -212,8 +250,9 @@ while `CLAUDE.md` §9 was violated.
 | X-05 | `web` depends on `core` alone | CI gate 7 | ✓ |
 | X-06 | **Line and region** coverage is 100% on every crate, with no omit list | CI coverage job (`--fail-under-lines 100 --fail-under-regions 100`) | ✓ |
 | X-06b | ~~Branch coverage is 100% on every crate~~ | **NOT MEASURED.** `llvm-cov` instruments zero branches on the pinned stable toolchain and `--branch` cannot run there at all. Narrowed by D-0030; recorded in `docs/06-limits.md` §7. | — |
-| X-07 | No mutant survives on a touched module | `cargo-mutants`, scheduled | — |
-| X-08 | No tracked file contains a literal credential path | CI gate 1c | ✓ |
+| X-07 | No mutant survives on a touched module | `cargo-mutants`, run per change. `crates/pull`, D-0036: **263 mutants, 227 caught, 36 unviable, 0 survivors** | ◐ |
+| X-08 | No tracked file contains a **slash-joined** credential path whose environment segment is a well-known one | CI gate 1c | ✓ |
+| X-08b | No literal under `crates/pull` that could be a path segment is undeclared | CI gate 1d | ✓ |
 | X-09 | `core` declares no dependency at all | CI gate 9 | ✓ |
 | X-10 | Every reachable row in this file names a test that exists | CI gate 10 | ✓ |
 | X-12 | Each vendor writes only under its own path prefix; no vendor can overwrite another | `store::unit::vendor_prefix_isolated` | — |

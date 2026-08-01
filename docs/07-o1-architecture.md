@@ -75,19 +75,31 @@ Measured on an Apple M4 Pro, 48 GB, macOS 26.5.2, rustc 1.97.1.
 | Checksum per block | **~7,050 ns** table, from 15,622 ns bitwise | The hardware instruction reaches 381.9 ns; see `docs/06-limits.md` |
 | GPU vs all 14 cores | **66 ms vs 142 ms — 2.1×** | Compute-bound: 1,219 GB/s effective, 5.3× measured DRAM bandwidth |
 | Bar read past RAM | ~100 ns → **61,566 ns** | 616×. Physics. Layer 7 exists because of it |
-| Manifest census vs deriving it | **193,449×** and **402,568×** on two runs | Layer 13. The counter against decoding 10,000 entries, same process. The spread is the counter side at the clock's floor; the scan holds at ~152 µs. D-0035 |
-| Manifest entry lookup, 1→100× census | **0.994–1.049×** | Layer 3 in the layer-13 file: reserved from a known bound, so no rehash |
+| Manifest census vs deriving it | **193,449×** and **402,568×** on two runs | Layer 13. The counter against decoding 10,000 entries, same process. The counter side has been seen at 378–789 ps across runs while the scan holds at ~152 µs; **the cause of that spread is not established** — see below. D-0035, D-0036 |
+| Manifest entry lookup, 1→100× census | **0.994–1.049×** | Layer 3 in the layer-13 file: reserved from a known bound, so no rehash — measured on the map a **loaded** manifest holds, which is the only one that reservation applies to (D-0036) |
 
 **Not O(1), and never claimed to be:** the sweep. Apriori over the vocabulary is
 combinatorial — each *step* is 0.2 ns, the number of steps is not constant.
 `CLAUDE.md` §3 rule 4 says "constant **per-operation** cost" for that reason.
+
+**The C-11 spread was explained here, and the explanation was wrong.** This
+table said "the spread is the counter side at the clock's floor". The bench now
+measures the clock and prints it: the smallest non-zero interval `Instant`
+reports on this host is **41 ns**, and the counter side is averaged over 100,000
+repetitions, so one tick is **410 fs** of reported cost — the 789 ps observation
+is 1,924 ticks. The counter side is three orders of magnitude above the clock
+floor, so the floor is not what moves it. The observation stays; the cause is now recorded as unestablished.
+`CLAUDE.md` §3 rule 6 — never claim a measurement you did not take, and a causal
+claim asserted as measured fact is that. D-0036.
 
 **Layer 13 is `◐`, not `✓`.** The manifest exists, its three totals are
 maintained on write and checked against the entries on load, and both bounds
 above are measured. What is *not* built is a **filtered** census — "how many
 expired option series" still walks the manifest's own entries, which is one
 sequential file read instead of ~248,000 directory operations but is not a
-counter read. And the directory walk the file replaces has never been measured
+counter read. The counters are also never checked against `bars/` itself, so
+they can drift from the files they describe in both directions and nothing here
+detects it. And the directory walk the file replaces has never been measured
 here at all; every statement about that saving is an **EXTRAPOLATION**. See
 `docs/06-limits.md` §17.
 

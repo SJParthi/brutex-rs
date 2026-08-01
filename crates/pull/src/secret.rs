@@ -58,6 +58,25 @@
 //! is [`Secret::expose`], which is spelled to be visible in a diff.
 //! [`CredentialHalt`] carries the vendor and the field *name*; it never carries
 //! the value, and it never carries the assembled path, which names an account.
+//! [`crate::config::CredentialPath`] and [`crate::config::CredentialConfig`]
+//! carry hand-written `Debug` implementations for the same reason — until
+//! D-0036 they carried derives, so the path this type was careful not to hold
+//! was printable from the type that does hold it. P-11 and P-18.
+//!
+//! # What this port cannot tell, and says so
+//!
+//! [`SsmSecretSource::read`] always passes `with_decryption: true`, and it has
+//! **no** check that what came back is not ciphertext. There was a
+//! `SecretError::NotDecrypted` variant here describing such a check; nothing
+//! ever constructed it, so it advertised a protection that did not exist and
+//! D-0036 removed it. Telling a decrypted value from a `SecureString`'s
+//! ciphertext means recognising a KMS blob's shape, which is an external fact
+//! with no source recorded in `docs/00-charter.md` — `CLAUDE.md` §3 rule 1
+//! forbids inventing one. If it ever happens the vendor rejects the value, the
+//! re-read returns the same ciphertext, and the halt reads
+//! [`CredentialHalt::DeadToken`], which is loud but names the wrong cause.
+//! `docs/06-limits.md` §19 records that, rather than a doc comment describing a
+//! check nobody wrote.
 //!
 //! # There is no AWS SDK in this change
 //!
@@ -111,18 +130,16 @@ impl Secret {
     /// How many bytes the value holds.
     ///
     /// The one property of a credential that is safe to report.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    /// Always false — [`Secret::new`] refuses an empty value.
     ///
-    /// Present because clippy asks for it beside [`Secret::len`], and it
-    /// documents the invariant rather than implying emptiness is reachable.
+    /// Spelled `byte_len` rather than `len` deliberately. `len` obliges clippy
+    /// to demand an `is_empty` beside it, and `is_empty` on this type can only
+    /// ever return `false` — [`Secret::new`] refuses an empty value — which
+    /// makes it a function no test can distinguish from a constant. D-0036:
+    /// a method whose only possible answer is one value is not covered by a
+    /// test that calls it, it is merely executed by one.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+    pub fn byte_len(&self) -> usize {
+        self.0.len()
     }
 }
 
@@ -156,12 +173,6 @@ pub enum SecretError {
     NotFound,
     /// The parameter exists and holds nothing.
     Empty,
-    /// The source returned the `SecureString` without decrypting it.
-    ///
-    /// Reported rather than passed through. Ciphertext is a perfectly ordinary
-    /// string, so a vendor would reject it as a bad credential and the pull
-    /// would spend its retries on the wrong problem.
-    NotDecrypted,
     /// The source could not be reached.
     Unreachable,
 }
@@ -172,7 +183,6 @@ impl fmt::Display for SecretError {
             Self::AccessDenied => f.write_str("access denied reading the parameter"),
             Self::NotFound => f.write_str("no parameter at that path"),
             Self::Empty => f.write_str("the parameter holds an empty value"),
-            Self::NotDecrypted => f.write_str("the parameter came back undecrypted"),
             Self::Unreachable => f.write_str("the parameter store could not be reached"),
         }
     }
@@ -328,6 +338,10 @@ impl<C: ParameterStore> SecretSource for SsmSecretSource<C> {
         // `true`, always. `false` returns the ciphertext of a SecureString,
         // which is a valid string that every vendor rejects as a bad
         // credential -- a failure that looks like an expired token and is not.
+        //
+        // There is NO check here that the value came back decrypted, and that
+        // is stated rather than implied: see this module's header and
+        // docs/06-limits.md section 19.
         let value = self.client.get_parameter(&name, true)?;
         Secret::new(value)
     }

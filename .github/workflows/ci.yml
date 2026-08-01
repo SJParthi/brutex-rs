@@ -73,6 +73,14 @@ jobs:
           # pattern, because <env> is not a real environment name.
           # See docs/05-decisions.md D-0013 and docs/04-invariants.md X-08.
           #
+          # WHAT THIS GATE DOES NOT SEE, stated because X-08 used to claim more
+          # than it proves and crates/pull's whole safety argument leans on it.
+          # It matches a SLASH-JOINED path whose environment segment is one of
+          # the ten words below. It cannot see a bare `const ORG: &str = "..."`,
+          # and it cannot see a joined path whose env segment is outside that
+          # alphabet. Gate 1d below is the check for the crate where that gap
+          # matters; docs/06-limits.md §18 records what neither of them can do.
+          #
           # No untrusted input reaches this step: the inputs are `git ls-files`
           # and a static pattern. Nothing from the event payload is expanded.
           envs='prod|production|dev|development|stage|staging|uat|qa|sandbox|live'
@@ -92,6 +100,64 @@ jobs:
             printf 'CREDENTIAL CONFIG IS TRACKED:\n%s\n' "$tracked"; exit 1
           fi
           echo "OK — no literal credential path, no tracked credential config."
+
+      - name: Gate 1d — every segment-shaped literal in crates/pull is declared
+        run: |
+          set -euo pipefail
+          # WHY THIS EXISTS. crates/pull is the one crate whose safety argument
+          # is "every path segment written down here is invented", and until
+          # this gate that sentence was a comment. Gate 1c cannot check it: it
+          # only matches a slash-JOINED path with a well-known environment
+          # name, so a bare `const ORG: &str = "<the real org>";` passes it —
+          # demonstrated, not assumed. See docs/06-limits.md §18.
+          #
+          # WHAT IT CHECKS. Every double-quoted literal under crates/pull that
+          # could BE a parameter path segment — lower-case, [a-z0-9_-], at most
+          # MAX_SEGMENT_LEN bytes — must appear in the list below. Comments and
+          # doc examples are scanned too: a real segment pasted into a doc
+          # example publishes it exactly as effectively as a constant does.
+          #
+          # WHAT IT CANNOT CHECK. That the words below are not themselves an
+          # operator's real segments. `groww` and `dhan` are on the list because
+          # crates/core has tracked them since its first commit, and an operator
+          # whose parameter path uses the broker's public name as its vendor
+          # segment has published that segment by their own choice. That is
+          # operator-side and docs/06-limits.md §18 says so.
+          #
+          # A NEW ENTRY IS A DELIBERATE ACT. Adding a word here is the moment to
+          # ask whether it is invented. That is the whole mechanism.
+          allowed='
+          org env region vendor fields
+          ap-south-1
+          groww dhan
+          orgone testenv vendorone vendortwo fieldone fieldtwo fieldthree
+          field-one_2 a-value
+          k7f2p9q1w8e3-5t6y0u4i2o9 k7f2p9q1w8e3r5t6y0u4i2o
+          k7f2p9q1w8e3r5t6y0u4i2o9 kfpqwerstyuioasdfghjklzx
+          hunter2 hunter2-and-then-some stale fresh 9876
+          a v one no ok big good invalid genesis manifest write read-only deny
+          anything mkdir notutf8 atthebound brutex-pull june july nifty
+          core store pull ratio
+          '
+          bad=0
+          while IFS= read -r word; do
+            if [ -z "$word" ]; then continue; fi
+            if ! printf '%s\n' $allowed | grep -qxF -- "$word"; then
+              printf 'UNDECLARED SEGMENT-SHAPED LITERAL IN crates/pull: %s\n' "$word"
+              { git ls-files 'crates/pull' | xargs grep -nF -- "\"$word\"" || true; } \
+                | head -3
+              bad=1
+            fi
+          done < <(git ls-files 'crates/pull' \
+                   | xargs grep -ohE '"[a-z0-9][a-z0-9_-]{0,31}"' \
+                   | tr -d '"' | sort -u)
+          if [ "$bad" -ne 0 ]; then
+            echo
+            echo "Either the literal is invented — add it above — or it is a real"
+            echo "path segment and must not be tracked. See CLAUDE.md section 8."
+            exit 1
+          fi
+          echo "OK — every segment-shaped literal under crates/pull is declared."
 
       - name: Gate 2 — no build script shells out
         run: |

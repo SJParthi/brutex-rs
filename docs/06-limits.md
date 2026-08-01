@@ -481,13 +481,27 @@ D-0035, layer 13 of `docs/07-o1-architecture.md`.
 vendor hold" is a field read of the manifest header —
 `pull::bench::census_beats_the_scan_it_replaces` measured it at **193,449×** and
 **402,568×** on two runs of the same tree, against re-deriving the same number
-from 10,000 entries in the same process on an Apple M4 Pro. The spread is the
-counter side: a field read sits at the clock's resolution floor, while the scan
-holds at ~152 µs across both. The gate asserts 100×, three orders of magnitude
-below the worse observation, so it detects a regression rather than reporting a
-scheduler. "What do I hold for this month" is one hash probe into a map reserved
-from a count known before the load walk begins, flat to within 1.05× at 100× the
-census (`pull::bench::entry_lookup_is_flat`).
+from 10,000 entries in the same process on an Apple M4 Pro. "What do I hold for
+this month" is one hash probe into a map reserved from the committed entry
+count, flat to within 1.05× at 100× the census
+(`pull::bench::entry_lookup_is_flat`).
+
+**The cause of the C-11 spread is NOT established, and D-0035 said it was.**
+That entry, and this section, and `docs/07-o1-architecture.md` all read "a field
+read sits at the clock's resolution floor, so its measured picoseconds move by a
+factor of two between runs". The harness now measures the clock and prints it,
+and the explanation does not survive the measurement: the smallest non-zero
+interval `Instant` reports on this host is **41 ns**, and the counter side is
+averaged over 100,000 repetitions, so one clock tick is **410 femtoseconds** of
+reported cost — and the 789 ps observation is **1,924 ticks**, not one. Whatever
+moves the counter side between runs, it is not the resolution of the clock. What
+is recorded is therefore the observation alone: the counter side has been seen
+at 378 ps, 604 ps and 789 ps across runs of the same tree while the scan side
+holds at ~152 µs (180 µs on the run that produced the 41 ns figure, on a
+debug-symbol release build).
+The gate asserts 100×, three orders of magnitude below the worst observation, so
+it detects a regression rather than reporting a scheduler — and that argument
+never needed the explanation that was attached to it. D-0036.
 
 **NOT O(1), and not claimed to be.**
 
@@ -509,13 +523,104 @@ timing it would report the state of one machine's cache rather than a property
 of the code. Every statement in this repository about that saving is an
 **EXTRAPOLATION** from the in-memory entry scan, and is labelled one.
 
-*The writer's index.* A manifest built from `Manifest::genesis` reserves
-nothing, because nothing is yet known to reserve from, so its map grows as the
-first keys are recorded. Layer 3's no-rehash guarantee is about the **loaded**
-index — the one a query touches — and it holds there because the reservation
-comes from the entry count known before the walk. The writer pays one rehash per
-doubling, once, on a path that is already doing I/O.
+*The writer's index.* A manifest built from a genesis header reserves nothing,
+because nothing is yet known to reserve from, so its map grows as the first keys
+are recorded. Layer 3's no-rehash guarantee is about the **loaded** index — the
+one a query touches — and it holds there because the reservation comes from the
+committed entry count. The writer pays one rehash per doubling, once, on a path
+that is already doing I/O. Until D-0036 the C-12 bench measured the *writer's*
+map and three documents credited the result to the loaded one's reservation;
+the bench now round-trips its census through `Manifest::load`, and
+`pull::unit::the_loaded_index_is_reserved_from_the_census` asserts where the
+reservation comes from as a number.
+
+**The census can drift from the bar files, in both directions, and nothing here
+detects it.** `Manifest::load` checks the header against *this file's own
+entries* and against nothing else. `bars/` is never consulted. So:
+
+- an entry claiming 999,999,999 rows for a month with no bar file anywhere loads
+  clean, and `total_rows()` returns that number as fact;
+- a pull that writes a bar file and crashes before the manifest append leaves
+  the census permanently short;
+- a bar file deleted afterwards leaves it permanently long.
+
+No API in `crates/pull` can notice any of the three, and none is a bug in the
+manifest: the manifest is a record of what a writer *said* it wrote, and the
+only thing that could confirm it is a reconciliation pass over `bars/` — which
+is exactly the ~248,000-operation directory walk layer 13 exists to avoid. A
+reconciliation entry point is **not built**. If one is ever added it is a
+deliberate, occasional, O(files) operation with its own invariant row, and it
+does not belong on the load path. Recorded here rather than left implied, which
+is what this file is for.
 
 **Unmeasured: `x86_64`.** Every number above is aarch64. CI runs on `x86_64` and
 the ratios are asserted there against the shared-hardware ceiling, but the
 absolute picoseconds on that host have never been recorded here.
+
+---
+
+## 18. What CI cannot prove about a credential path
+
+D-0036. `CLAUDE.md` §8 says `crates/pull` "holds no `org`, `env`, or `vendor`
+literal", and X-08 used to be recorded as proven by CI gate 1c. It is not, and
+here is exactly what the two gates do and do not see.
+
+**Gate 1c sees a joined path with a well-known environment name.** Its pattern
+is `/<segment>/(prod|production|dev|development|stage|staging|uat|qa|sandbox|
+live)/`. A synthetic source file containing `const ORG: &str = "<the real org>";`
+and `const ENV_SEGMENT: &str = "<the real env>";` on two lines was run past that
+exact regex and **did not match**. Adding a third line with the joined path did
+match. So gate 1c catches the paste of a whole path; it does not catch a bare
+segment, and it does not catch a joined path whose environment segment is
+outside its ten-word alphabet.
+
+**Gate 1d is the compensating check, and only for `crates/pull`.** Every
+double-quoted literal under that crate which could *be* a segment — lower case,
+`[a-z0-9_-]`, at most `MAX_SEGMENT_LEN` — must appear in an allowlist in the
+workflow. That turns "every segment written down here is invented" from a
+comment into a check, and makes adding one a deliberate act. It says nothing
+about the rest of the repository.
+
+**What neither can do is know the operator's real segments**, because the file
+that holds them is untracked and a CI runner has never seen it. That check is a
+local one, and D-0036 ran it: of the four segment roles, `org` appears in no
+tracked file, `env` appears in one (inside gate 1c's own alphabet in
+`ci.yml`), the region appears in five and is published by `CLAUDE.md` itself,
+each vendor **path** segment appears in eleven and thirteen tracked files
+because the operator set it to the broker's public name, and the field names
+appear in two documents each, which §8 expressly permits.
+
+**So the residual is operator-side and is stated as such.** The `vendor` key
+exists so that a deployment *can* keep its vendor path segment out of a public
+tree. In this deployment that separation is available and is not taken. Nothing
+in this repository can change that, and nothing in this repository will pretend
+to have checked it on a runner.
+
+---
+
+## 19. The secret port cannot tell ciphertext from a credential
+
+D-0036. `SsmSecretSource::read` always passes `with_decryption: true`, and it
+has **no** check that what came back is not the ciphertext of a `SecureString`.
+
+There was a `SecretError::NotDecrypted` variant documented as exactly that
+check — "reported rather than passed through … a vendor would reject it as a bad
+credential and the pull would spend its retries on the wrong problem" — and
+nothing in `crates/pull/src` ever constructed it. A doc comment describing a
+protection nobody wrote is worse than no protection, so the variant is gone.
+
+**What that leaves.** If a `ParameterStore` implementation ever returns
+ciphertext, `read` wraps it in a `Secret`, the vendor rejects it,
+`reread_after_rejection` reads the same ciphertext again, and the pull halts
+with `CredentialHalt::DeadToken` — "the vendor rejected this credential and the
+re-read returned the same value; it is dead and nothing here mints one". That is
+loud, and it names the wrong cause. `CLAUDE.md` §4 is about not failing
+silently; this fails noisily with a wrong diagnosis, which is a smaller fault
+and is written down rather than left to be discovered.
+
+**Why it is not fixed instead.** Recognising a KMS blob means knowing its
+prefix and its length, which is an external fact about a vendor's format, and
+`CLAUDE.md` §3 rule 1 permits no claim about a vendor that is not traceable to a
+source recorded in `docs/00-charter.md`. There is no such source. The change
+that first makes a live call is the change that can record one, and until then
+this is a limit rather than an invention.

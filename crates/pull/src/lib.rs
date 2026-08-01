@@ -31,9 +31,20 @@
 //! environment and a vendor relationship; once pushed it is in every fork's
 //! history forever. So this crate holds the *shape* — `/<org>/<env>/<vendor>/
 //! <field>` — and the field *names* come from a local file that is never
-//! committed. There is no `org` literal, no `env` literal and no real vendor
-//! path segment anywhere under `crates/pull`, including in its tests, which use
-//! invented segments. CI gate 1c is the check that this held.
+//! committed. There is no `org` literal and no `env` literal anywhere under
+//! `crates/pull`, including in its tests, which use invented segments.
+//!
+//! **Two gates check that, and between them they do not check everything.** CI
+//! gate 1c matches a slash-*joined* path whose environment segment is one of ten
+//! well-known words — it cannot see a bare constant, which was demonstrated
+//! rather than assumed. CI gate 1d is the one that covers this crate: every
+//! quoted literal here that could *be* a segment must appear in an allowlist in
+//! the workflow, which turns "every segment written down here is invented" from
+//! a comment into a check. Neither can know the operator's real segments,
+//! because the file holding them is untracked and a runner has never seen it.
+//! `docs/06-limits.md` §18 records exactly what that leaves, including the one
+//! segment role that a local search found published — the vendor's, because an
+//! operator may set it to the broker's public name. D-0036.
 //!
 //! # The one rule that shapes every line of `secret`
 //!
@@ -51,6 +62,10 @@
 //! "How many expired option series do I hold" against a directory tree of
 //! ~248,000 files is ~248,000 `stat` calls, and it gets slower with every
 //! ingest. A counter maintained on write turns it into one read of one header.
+//!
+//! What that counter is *not* checked against is `bars/` itself, so it can
+//! drift from the files it describes in both directions. See
+//! [`manifest`]'s header and `docs/06-limits.md` §17.
 
 #![forbid(unsafe_code)]
 

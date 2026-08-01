@@ -47,12 +47,22 @@
 //! *parameter path* segment: a separate string, supplied at runtime, that this
 //! repository never writes down.
 //!
-//! Whether those two happen to be the same text in a given operator's file is
-//! that operator's business, and nothing here can tell. That is precisely why
-//! the key exists rather than the segment being derived from
-//! [`Vendor::as_str`] — deriving it would make the path segment a **tracked
-//! literal by construction**, for every deployment, permanently, and no local
-//! configuration could ever take it back out.
+//! The key exists rather than the segment being derived from
+//! [`Vendor::as_str`] because deriving it would make the path segment a
+//! **tracked literal by construction**, for every deployment, permanently, and
+//! no local configuration could ever take it back out.
+//!
+//! **In this deployment the two coincide, and that was measured rather than
+//! assumed.** D-0036 searched every tracked file for each of the four segment
+//! roles in the operator's own untracked file: `org` appears in none, `env`
+//! appears once — inside CI gate 1c's own search alphabet — and each `vendor`
+//! path segment appears in eleven and thirteen tracked files, because the
+//! operator set it to the broker name that `crates/core` has tracked since its
+//! first commit. So of the four segments, two are published and one is
+//! published by `CLAUDE.md` itself (the region); the separation this key buys
+//! is available and is not currently taken. That is an operator-side choice —
+//! a parameter path whose vendor segment is not the broker's public name — and
+//! `docs/06-limits.md` §18 says so rather than implying nothing can be known.
 //!
 //! # It halts. It never defaults
 //!
@@ -84,6 +94,23 @@
 //! single offending byte — one byte is not a credential, and naming it is what
 //! makes `IllegalByte` actionable — and a length.
 //!
+//! # Neither is a segment, through a formatter
+//!
+//! [`CredentialPath`], [`CredentialConfig`] and the vendor table each carry a
+//! **hand-written** [`std::fmt::Debug`] that renders the *shape* and the
+//! segment lengths, never the segments. The reason is the one
+//! [`crate::secret::Secret`] already states for a credential value: an error is
+//! the thing most likely to be logged, pasted into an issue and pushed to a
+//! public repository, and a `{:?}` in a `tracing::debug!`, a `panic!` or a
+//! failing `assert_eq!` reaches exactly that surface. A derived `Debug` on the
+//! assembled path would have published the org, the env and the vendor segment
+//! from every one of them, which is precisely what `CredentialHalt` was built
+//! to avoid carrying. Invariant P-18.
+//!
+//! [`std::fmt::Display`] on [`CredentialPath`] is the one audited exit — the
+//! same role [`crate::secret::Secret::expose`] plays for the value — because
+//! `SsmSecretSource::read` must name the parameter to fetch it.
+//!
 //! # Cost
 //!
 //! Reading is a bounded scan of a bounded file: at most [`MAX_FILE_BYTES`],
@@ -95,6 +122,7 @@
 //! the caller's sink.
 
 use std::fmt;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use brutex_core::vendor::Vendor;
@@ -140,11 +168,31 @@ pub const MAX_LINE_BYTES: usize = 512;
 
 /// The largest configuration file this reader will pull into memory.
 ///
-/// Checked from `metadata` **before** the read, not after. A file this process
-/// cannot hold is not an error `read_to_string` can report — it is an allocator
-/// failure or an OOM kill, and neither reaches an operator as "the credential
-/// configuration is too big". The real file is under a kilobyte.
+/// **The bound is taken at the read, not from `metadata`.** It used to be
+/// `metadata(path).len()`, and that is not a bound: `st_size` is `0` for a
+/// FIFO, for a character device and for a procfs-style file, so the check
+/// passed trivially and the read that followed was unbounded — `/dev/zero`
+/// grew the string until the allocator gave up, which is exactly the OOM kill
+/// this constant exists to prevent. A regular file that grew between the
+/// `stat` and the read was read in full for the same reason. So the read is
+/// bounded at [`MAX_FILE_BYTES`] + 1 bytes by [`std::io::Read::take`] and the
+/// refusal is on what was actually read, and anything that is not a regular
+/// file is refused by name before it is opened — a FIFO with no writer blocks
+/// in `open` forever, and a hang is the one failure nothing reports. See
+/// [`ConfigError::NotARegularFile`] and D-0036. The real file is under a
+/// kilobyte.
 pub const MAX_FILE_BYTES: u64 = 64 * 1024;
+
+/// [`MAX_FILE_BYTES`] as a length, for comparing against what was read.
+///
+/// Written as a literal in both widths rather than converted, for the reason
+/// `manifest::MAX_ENTRIES_LEN` gives: a conversion here would carry a failure
+/// arm no test could reach. The assertion below keeps the two honest, and
+/// `pull::unit::the_configuration_file_is_bounded_before_it_is_read` pins the
+/// value itself so the expression cannot drift.
+const MAX_FILE_BYTES_LEN: usize = 64 * 1024;
+
+const _: () = assert!(MAX_FILE_BYTES == 65_536 && MAX_FILE_BYTES_LEN == 65_536);
 
 /// The length at which an undelimited alphanumeric run is treated as a pasted
 /// secret rather than as a name.
@@ -324,10 +372,25 @@ pub enum ConfigError {
         /// What the operating system said.
         kind: std::io::ErrorKind,
     },
-    /// The file is larger than [`MAX_FILE_BYTES`].
+    /// The path is not a regular file.
+    ///
+    /// A FIFO, a character device, a directory or a procfs-style file. Refused
+    /// by name rather than read, because for every one of them
+    /// `metadata().len()` is `0` — a size bound taken from it is not a bound —
+    /// and because opening a FIFO that has no writer blocks forever, which is
+    /// the one failure mode nothing ever reports.
+    NotARegularFile {
+        /// The path that is not a regular file.
+        path: PathBuf,
+    },
+    /// The file holds more than [`MAX_FILE_BYTES`].
+    ///
+    /// Carries `at_least` rather than a length: the read stops one byte past
+    /// the bound, so how much more there was is not known here and is not
+    /// guessed at.
     TooLarge {
-        /// How large it is.
-        len: u64,
+        /// The number of bytes read before the reader stopped.
+        at_least: u64,
     },
     /// A line is longer than [`MAX_LINE_BYTES`].
     LineTooLong {
@@ -446,8 +509,14 @@ impl fmt::Display for ConfigError {
             Self::Unreadable { path, kind } => {
                 write!(f, "{}: {kind:?}", path.display())
             }
-            Self::TooLarge { len } => {
-                write!(f, "{len} bytes; this reader holds at most {MAX_FILE_BYTES}")
+            Self::NotARegularFile { path } => {
+                write!(f, "{}: not a regular file", path.display())
+            }
+            Self::TooLarge { at_least } => {
+                write!(
+                    f,
+                    "at least {at_least} bytes; this reader holds at most {MAX_FILE_BYTES}"
+                )
             }
             Self::LineTooLong { line, len } => {
                 write!(f, "line {line} is {len} bytes, max {MAX_LINE_BYTES}")
@@ -500,7 +569,7 @@ impl std::error::Error for ConfigError {}
 /// only way to obtain one is [`CredentialConfig::path_for`], which assembles it
 /// from segments that were each validated, so a path that was never configured
 /// is unrepresentable rather than merely unlikely.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CredentialPath<'a> {
     org: &'a str,
     env: &'a str,
@@ -520,8 +589,40 @@ impl<'a> CredentialPath<'a> {
     }
 }
 
+impl fmt::Debug for CredentialPath<'_> {
+    /// The shape, the three account-naming segments as lengths, and the field
+    /// name.
+    ///
+    /// **Not a derive, and P-18 is the reason.** A derived `Debug` renders all
+    /// four segments verbatim, and `{:?}` is reached by a `tracing::debug!`, a
+    /// `panic!`, an error chain and a failing `assert_eq!` — every one of which
+    /// ends up in a log that gets pasted into an issue on a public repository.
+    /// `CredentialHalt` was built never to carry the assembled path for that
+    /// exact reason; a derive here would have handed it over anyway.
+    ///
+    /// The field *name* is rendered because it is the one segment a halt is
+    /// already allowed to carry ([`CredentialPath::field`] is public and
+    /// `CredentialHalt` prints it): an operator has to be able to tell which of
+    /// a vendor's credentials failed.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "CredentialPath(/<org:{}>/<env:{}>/<vendor:{}>/{})",
+            self.org.len(),
+            self.env.len(),
+            self.vendor.len(),
+            self.field
+        )
+    }
+}
+
 impl fmt::Display for CredentialPath<'_> {
     /// The one renderer, and the only place the four segments are ever joined.
+    ///
+    /// The audited exit, in the role [`crate::secret::Secret::expose`] plays
+    /// for a credential value: spelled out, greppable, and reached from exactly
+    /// one place — `SsmSecretSource::read`, which has to name the parameter to
+    /// fetch it.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -532,11 +633,30 @@ impl fmt::Display for CredentialPath<'_> {
 }
 
 /// One vendor's segment and its field names.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct VendorPaths {
     vendor: Vendor,
     segment: String,
     fields: Vec<String>,
+}
+
+impl fmt::Debug for VendorPaths {
+    /// The vendor this build knows, the path segment as a length, and the field
+    /// names. P-18, for the reason [`CredentialPath`]'s `Debug` gives.
+    ///
+    /// The vendor *enum* is safe — it is a public broker name tracked in
+    /// `crates/core` since that crate's first commit. The `segment` is the
+    /// vendor's **parameter path** segment, which is a different string that
+    /// this repository never writes down, so it is a length.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "VendorPaths {{ vendor: {}, segment: <{} bytes>, fields: {:?} }}",
+            self.vendor.as_str(),
+            self.segment.len(),
+            self.fields
+        )
+    }
 }
 
 /// The validated contents of `~/.brutex/credentials.toml`.
@@ -544,12 +664,33 @@ struct VendorPaths {
 /// Holds path segments. It never holds, reads, receives or returns a credential
 /// **value** — that is [`crate::secret`]'s job, and the value comes from
 /// Parameter Store and from nowhere else (`CLAUDE.md` §8).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CredentialConfig {
     org: String,
     env: String,
     region: String,
     vendors: Vec<VendorPaths>,
+}
+
+impl fmt::Debug for CredentialConfig {
+    /// The two account-naming segments as lengths, the region, and the vendors.
+    ///
+    /// P-18. `org` and `env` are the two segments `CLAUDE.md` §8 names first,
+    /// and a whole configuration is the single most likely thing to reach a
+    /// `{:?}` at start-up — `config.rs`'s header defers reading `HOME` to the
+    /// operator entry point, and an entry point that fails after `load` prints
+    /// what it loaded. The region is rendered because `CLAUDE.md` §8 publishes
+    /// it in the law itself.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "CredentialConfig {{ org: <{} bytes>, env: <{} bytes>, region: {}, vendors: {:?} }}",
+            self.org.len(),
+            self.env.len(),
+            self.region,
+            self.vendors
+        )
+    }
 }
 
 impl CredentialConfig {
@@ -559,21 +700,30 @@ impl CredentialConfig {
     ///
     /// [`ConfigError::Unreadable`] if the file is absent or cannot be opened —
     /// which is invariant P-07's headline case and is a halt, never a default.
-    /// [`ConfigError::TooLarge`] if it exceeds [`MAX_FILE_BYTES`]. Otherwise
-    /// whatever [`CredentialConfig::parse`] refuses.
+    /// [`ConfigError::NotARegularFile`] for a FIFO, a device or a directory.
+    /// [`ConfigError::TooLarge`] if it holds more than [`MAX_FILE_BYTES`].
+    /// Otherwise whatever [`CredentialConfig::parse`] refuses.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
-        // THE SIZE IS CHECKED BEFORE THE READ, NOT AFTER. A file this process
-        // cannot hold is an OOM kill, not an error `read_to_string` reports.
-        let meta = std::fs::metadata(path).map_err(|e| ConfigError::Unreadable {
+        // THE BOUND IS ON WHAT WAS READ, not on what `stat` claimed is there.
+        // See `MAX_FILE_BYTES` and D-0036 for the two ways the old check was
+        // not a check at all.
+        let read = read_bounded(path).map_err(|e| ConfigError::Unreadable {
             path: path.to_path_buf(),
             kind: e.kind(),
         })?;
-        if meta.len() > MAX_FILE_BYTES {
-            return Err(ConfigError::TooLarge { len: meta.len() });
+        let Some(bytes) = read else {
+            return Err(ConfigError::NotARegularFile {
+                path: path.to_path_buf(),
+            });
+        };
+        if bytes.len() > MAX_FILE_BYTES_LEN {
+            return Err(ConfigError::TooLarge {
+                at_least: MAX_FILE_BYTES + 1,
+            });
         }
-        let text = std::fs::read_to_string(path).map_err(|e| ConfigError::Unreadable {
+        let text = String::from_utf8(bytes).map_err(|_| ConfigError::Unreadable {
             path: path.to_path_buf(),
-            kind: e.kind(),
+            kind: std::io::ErrorKind::InvalidData,
         })?;
         Self::parse(&text)
     }
@@ -738,6 +888,35 @@ impl CredentialConfig {
                 })
             })
     }
+}
+
+/// At most [`MAX_FILE_BYTES`] + 1 bytes of a **regular** file, or `None` when
+/// the path is not one.
+///
+/// Two syscalls, and the order is the whole point. `metadata` first, because a
+/// FIFO with no writer blocks in `open` and a blocked process reports nothing;
+/// and then a read bounded by [`std::io::Read::take`] rather than by the size
+/// `metadata` reported, because that size is `0` for every non-regular file and
+/// is stale for a regular file that grew in between. One byte past the bound is
+/// read on purpose: it is what lets the caller tell "exactly at the bound" from
+/// "over it" without trusting a second `stat`.
+///
+/// The two fallible calls are joined with `and_then` and `map` rather than with
+/// `?`, for the reason `CredentialConfig::path_for` gives: their failure arms
+/// then live in `std`, which is not this repository's code to measure, instead
+/// of being two arms in this function that a test would have to force a
+/// permission error to reach.
+fn read_bounded(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    if !std::fs::metadata(path)?.is_file() {
+        return Ok(None);
+    }
+    std::fs::File::open(path).and_then(|handle| {
+        let mut bytes = Vec::new();
+        handle
+            .take(MAX_FILE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map(|_| Some(bytes))
+    })
 }
 
 /// A vendor table being built.

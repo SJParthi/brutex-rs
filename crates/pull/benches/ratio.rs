@@ -46,7 +46,14 @@ use brutex_core::symbol::Symbol;
 use brutex_core::vendor::Vendor;
 use store::path::{Timeframe, YearMonth};
 
-use pull::manifest::{Entry, EntryKey, IMAGE_LEN, Manifest};
+use pull::manifest::{Commit, Entry, EntryKey, HEADER_LEN, IMAGE_LEN, Manifest};
+
+/// [`HEADER_LEN`] as a length, for building a header region.
+const HEADER_LEN_LEN: usize = 32_768;
+/// `store::format::SLOT_STRIDE` as a length, for placing the second slot.
+const SLOT_STRIDE_LEN: usize = 16_384;
+
+const _: () = assert!(HEADER_LEN == 32_768);
 
 /// A ratio above this is a failure. Thousandths, so the comparison is integer.
 ///
@@ -73,6 +80,33 @@ fn cost_ps<T>(reps: u32, mut op: impl FnMut() -> T) -> u128 {
         let ps = start.elapsed().as_nanos() * 1_000 / u128::from(reps);
         if ps < best {
             best = ps;
+        }
+    }
+    best
+}
+
+/// The smallest non-zero interval [`Instant`] reports on this host, in
+/// nanoseconds.
+///
+/// Measured, printed, and asserted against nothing — it is context, not a
+/// ratio. It exists because D-0035 explained the C-11 spread as "a field read
+/// sits at the clock's resolution floor", and that explanation was never
+/// measured. This number is what decides whether it is true: one tick spread
+/// over `reps` repetitions is the smallest cost this harness can report, and if
+/// an observation is a thousand times that, the clock is not what moved it.
+/// `CLAUDE.md` §3 rule 6 — never claim a measurement you did not take. D-0036.
+fn clock_tick_ns() -> u128 {
+    let mut best = u128::MAX;
+    for _ in 0..2_000 {
+        let start = Instant::now();
+        loop {
+            let seen = start.elapsed().as_nanos();
+            if seen > 0 {
+                if seen < best {
+                    best = seen;
+                }
+                break;
+            }
         }
     }
     best
@@ -149,10 +183,38 @@ fn key_for(symbol: &str, index: u32) -> EntryKey {
     }
 }
 
-/// A manifest holding `count` months, and the entry bytes a reader would see.
+/// The header region holding one commit in the slot it belongs to.
+///
+/// Built by extension rather than by writing into an index, because
+/// `clippy::indexing_slicing` is denied across this workspace and a bench is a
+/// target like any other.
+fn header_region(commit: &Commit) -> Vec<u8> {
+    let mut region: Vec<u8> = Vec::with_capacity(HEADER_LEN_LEN);
+    if commit.slot != 0 {
+        region.resize(SLOT_STRIDE_LEN, 0);
+    }
+    region.extend_from_slice(&commit.bytes);
+    region.resize(HEADER_LEN_LEN, 0);
+    region
+}
+
+/// A manifest holding `count` months, **as a reader sees it**, and the entry
+/// bytes a reader would see.
+///
+/// It is written with `record` and then round-tripped through
+/// [`Manifest::load`], and that round trip is the point of this function rather
+/// than a flourish. C-12 is a claim about layer 3 — a map reserved from a known
+/// bound, so no rehash — and only the loaded index is reserved;
+/// `Manifest::genesis` reserves nothing and grows by rehashing. Measuring the
+/// writer's map would have reported a number that had nothing to do with the
+/// mechanism `docs/06-limits.md` §17 and `docs/07-o1-architecture.md` line 79
+/// attribute it to, which is the shape `CLAUDE.md` §3 rule 6 forbids. D-0036.
 fn census(count: u32) -> (Manifest, Vec<u8>) {
-    let mut manifest = Manifest::genesis(Vendor::Groww);
+    let Ok(mut writer) = Manifest::open(Vendor::Groww, &[], &[]) else {
+        refuse("a genesis manifest")
+    };
     let mut data = Vec::with_capacity(count as usize * IMAGE_LEN);
+    let mut published: Option<Commit> = None;
     for index in 0..count {
         let entry = Entry {
             key: key(index),
@@ -160,12 +222,21 @@ fn census(count: u32) -> (Manifest, Vec<u8>) {
             first_ts_micros: 1_000,
             last_ts_micros: 2_000,
         };
-        match manifest.record(entry) {
-            Ok(append) => data.extend_from_slice(&append.bytes),
+        match writer.record(entry) {
+            Ok(append) => {
+                data.extend_from_slice(&append.bytes);
+                published = Some(append.commit);
+            }
             Err(e) => refuse(&e.to_string()),
         }
     }
-    (manifest, data)
+    let Some(commit) = published else {
+        refuse("a census of no months")
+    };
+    match Manifest::load(Vendor::Groww, &header_region(&commit), &data) {
+        Ok(manifest) => (manifest, data),
+        Err(e) => refuse(&e.to_string()),
+    }
 }
 
 /// C-11 — the census is a counter read, not a walk of what it counts.
@@ -185,8 +256,11 @@ fn census_beats_the_scan_it_replaces() -> bool {
     /// become a walk could reach.
     const FLOOR_PERMILLE: u128 = 100_000;
 
+    /// Repetitions the counter side is averaged over.
+    const REPS: u32 = 100_000;
+
     let (manifest, data) = census(10_000);
-    let counter = cost_ps(100_000, || black_box(&manifest).total_rows());
+    let counter = cost_ps(REPS, || black_box(&manifest).total_rows());
     let scan = cost_ps(20, || {
         data.chunks_exact(IMAGE_LEN)
             .filter_map(|chunk| Entry::decode(chunk).ok())
@@ -196,6 +270,17 @@ fn census_beats_the_scan_it_replaces() -> bool {
         println!("  C-11 census vs the scan                      UNMEASURABLE");
         return false;
     }
+
+    // How far the counter observation sits above the clock's own floor. The
+    // whole point of printing it is that the answer is not "one".
+    let tick = clock_tick_ns();
+    let floor_fs = tick * 1_000_000 / u128::from(REPS);
+    println!(
+        "  {:<44} {tick} ns; one tick over {REPS} reps is {floor_fs} fs of reported cost, \
+         so the counter observation is {} ticks",
+        "clock granularity (context, not a ratio)",
+        counter * u128::from(REPS) / (tick * 1_000)
+    );
     let permille = scan * 1_000 / counter;
     let ok = permille >= FLOOR_PERMILLE;
     println!(

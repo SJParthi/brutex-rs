@@ -46,7 +46,10 @@ use pull::secret::{
 
 /// [`HEADER_LEN`] as a length, for building test regions.
 const HEADER_LEN_USIZE: usize = 32_768;
+/// `store::format::SLOT_STRIDE` as a length, for reaching the second slot.
+const SLOT_STRIDE_USIZE: usize = 16_384;
 const _: () = assert!(HEADER_LEN_USIZE as u64 == HEADER_LEN);
+const _: () = assert!(SLOT_STRIDE_USIZE * 2 == HEADER_LEN_USIZE);
 
 // ===========================================================================
 // The credential path configuration — part 1
@@ -271,13 +274,65 @@ fn the_only_path_is_the_one_the_configuration_assembles() {
         })
     );
 
-    // The derived impls this type carries are exercised, so the coverage gate
-    // is measuring them rather than reporting on code nothing calls.
+    // The impls this type carries are exercised, so the coverage gate is
+    // measuring them rather than reporting on code nothing calls.
     let twin = config.clone();
     assert_eq!(config, twin);
-    assert!(format!("{config:?}").contains("orgone"));
     assert_eq!(path, path);
-    assert!(format!("{path:?}").contains("fieldtwo"));
+}
+
+/// P-18 — no formatter renders a path segment. `Debug` is a redaction on the
+/// path, on the whole configuration and on a vendor's table.
+///
+/// This test asserted the opposite until D-0036: it required
+/// `format!("{config:?}")` to *contain* `orgone`, certifying the leak. The
+/// segments here are invented, so what is being checked is the shape of the
+/// rendering rather than the safety of these particular five bytes — a derived
+/// `Debug` prints whatever is in the field, and in a real deployment that is
+/// the operator's org, env and vendor path segment.
+#[test]
+fn no_formatter_renders_a_path_segment() {
+    let config = CredentialConfig::parse(CONFIG).expect("the reference config parses");
+    let path = config
+        .path_for(Vendor::Groww, "fieldtwo")
+        .expect("a configured field");
+
+    let rendered = format!("{path:?}");
+    for segment in ["orgone", "testenv", "vendorone"] {
+        assert!(
+            !rendered.contains(segment),
+            "the path's Debug leaked {segment}: {rendered}"
+        );
+    }
+    // The lengths and the shape are there, and so is the field name — the one
+    // segment a halt already carries, so an operator can tell which credential
+    // of a vendor's four failed.
+    assert_eq!(
+        rendered,
+        "CredentialPath(/<org:6>/<env:7>/<vendor:9>/fieldtwo)"
+    );
+
+    let rendered = format!("{config:?}");
+    for segment in ["orgone", "testenv", "vendorone", "vendortwo"] {
+        assert!(
+            !rendered.contains(segment),
+            "the configuration's Debug leaked {segment}: {rendered}"
+        );
+    }
+    // The region is rendered because `CLAUDE.md` §8 publishes it in the law
+    // itself, and the vendor enum because `crates/core` has tracked those names
+    // since its first commit. Neither is a path segment this repository is
+    // keeping.
+    assert_eq!(
+        rendered,
+        "CredentialConfig { org: <6 bytes>, env: <7 bytes>, region: ap-south-1, \
+         vendors: [VendorPaths { vendor: groww, segment: <9 bytes>, \
+         fields: [\"fieldone\", \"fieldtwo\"] }, \
+         VendorPaths { vendor: dhan, segment: <9 bytes>, fields: [\"fieldthree\"] }] }"
+    );
+
+    // And the assembled path is still reachable, through the one audited exit.
+    assert_eq!(path.to_string(), "/orgone/testenv/vendorone/fieldtwo");
 }
 
 /// P-14 — the declared path bound is tight, not merely sufficient.
@@ -547,32 +602,97 @@ fn the_region_is_checked_rather_than_merely_read() {
     );
 }
 
-/// The file is bounded before it is read, and both bounds are named.
+/// P-17 — the file is bounded **at the read**, and both bounds are named.
 #[test]
 fn the_configuration_file_is_bounded_before_it_is_read() {
+    // The bound is a number, and it is pinned. An expression nothing asserts on
+    // can be edited into a different number by anything that compiles.
+    assert_eq!(MAX_FILE_BYTES, 65_536);
+
     let good = tmp("good", CONFIG.as_bytes());
     let config = CredentialConfig::load(&good).expect("the reference config loads from disk");
     assert_eq!(config.region(), REGION);
 
-    let big = tmp(
-        "big",
-        &vec![b'#'; usize::try_from(MAX_FILE_BYTES).unwrap() + 1],
-    );
+    let over = usize::try_from(MAX_FILE_BYTES).unwrap() + 1;
+    let big = tmp("big", &vec![b'#'; over]);
     assert_eq!(
         CredentialConfig::load(&big),
         Err(ConfigError::TooLarge {
-            len: MAX_FILE_BYTES + 1
+            at_least: MAX_FILE_BYTES + 1
         })
     );
 
-    // Present, small enough, and not text. The read fails after the size check
-    // passed, which is a different arm.
+    // EXACTLY at the bound is not over it. Without this case the comparison's
+    // sign is free: `>` and `>=` pass every other test in this file. Padded
+    // with blank lines rather than with one enormous comment, so that what is
+    // being tested is the file bound and not the line bound.
+    let mut exact = CONFIG.as_bytes().to_vec();
+    exact.resize(over - 1, b'\n');
+    assert_eq!(exact.len(), usize::try_from(MAX_FILE_BYTES).unwrap());
+    let at = tmp("atthebound", &exact);
+    assert_eq!(
+        CredentialConfig::load(&at)
+            .expect("a file exactly at the bound is read")
+            .region(),
+        REGION
+    );
+
+    // Present, small enough, and not text. The read succeeded and the bytes are
+    // not a string, which is a different arm.
     let raw = tmp("notutf8", &[0xF0, 0x28, 0x8C, 0x28]);
     match CredentialConfig::load(&raw) {
         Err(ConfigError::Unreadable { kind, .. }) => {
             assert_eq!(kind, std::io::ErrorKind::InvalidData);
         }
         other => panic!("expected an unreadable file, got {other:?}"),
+    }
+}
+
+/// P-19 — anything that is not a regular file is refused by name, before it is
+/// opened.
+///
+/// The bound used to be `metadata(path).len()`, and for a FIFO, a character
+/// device or a procfs-style file that number is `0`: the check passed and the
+/// read that followed was unbounded. `/dev/zero` grew the string until the
+/// allocator gave up, and a FIFO blocked in `open` — the two failures the
+/// comment above `MAX_FILE_BYTES` said the check existed to prevent. Now the
+/// read is bounded by `take`, and a path that is not a regular file never
+/// reaches it.
+///
+/// **There is no FIFO case here, and that is a limit rather than an omission.**
+/// Creating one needs `mkfifo`, which is either an external process or a libc
+/// binding, and `CLAUDE.md` §2 forbids both — so this drives the same code path
+/// through the two non-regular files that can be reached from `std` alone. The
+/// refusal is on `!is_file()`, which is one branch for all of them: a FIFO
+/// cannot take a different path through this function than a device does.
+#[test]
+fn a_path_that_is_not_a_regular_file_is_refused_by_name() {
+    // A directory: `metadata` succeeds, its length is not the length of
+    // anything readable, and this is the one non-regular file every platform
+    // this builds for has.
+    let dir = std::env::temp_dir().join("brutex-pull");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    assert_eq!(
+        CredentialConfig::load(&dir),
+        Err(ConfigError::NotARegularFile { path: dir.clone() })
+    );
+    // It names the path, so the operator is told what is wrong rather than
+    // being handed an OOM kill or a process that never returns.
+    let rendered = ConfigError::NotARegularFile { path: dir }.to_string();
+    assert!(rendered.contains("brutex-pull") && rendered.contains("not a regular file"));
+
+    // A character device, where the platform has one. `/dev/zero` measures
+    // `st_size == 0` and is an endless stream of NUL bytes, every one of which
+    // is valid UTF-8: under the old check it was an unbounded read of an
+    // infinite file.
+    let zero = std::path::Path::new("/dev/zero");
+    if zero.exists() {
+        assert_eq!(
+            CredentialConfig::load(zero),
+            Err(ConfigError::NotARegularFile {
+                path: zero.to_path_buf()
+            })
+        );
     }
 }
 
@@ -596,7 +716,10 @@ fn every_config_error_prints_something_distinct() {
             path: std::path::PathBuf::from("/x"),
             kind: std::io::ErrorKind::NotFound,
         },
-        ConfigError::TooLarge { len: 1 },
+        ConfigError::NotARegularFile {
+            path: std::path::PathBuf::from("/y"),
+        },
+        ConfigError::TooLarge { at_least: 1 },
         ConfigError::LineTooLong { line: 1, len: 2 },
         ConfigError::Unparseable { line: 1 },
         ConfigError::UnknownTable { line: 1 },
@@ -830,8 +953,7 @@ fn the_adapter_always_asks_for_a_decrypted_value() {
 #[test]
 fn a_secret_never_prints_its_value() {
     let secret = Secret::new("hunter2-and-then-some".to_owned()).expect("a value");
-    assert_eq!(secret.len(), 21);
-    assert!(!secret.is_empty());
+    assert_eq!(secret.byte_len(), 21);
     let rendered = format!("{secret:?}");
     assert!(!rendered.contains("hunter2"), "{rendered}");
     assert_eq!(rendered, "Secret(<redacted, 21 bytes>)");
@@ -844,11 +966,16 @@ fn a_secret_never_prints_its_value() {
 /// Every refusal and halt renders something, and no two render the same thing.
 #[test]
 fn every_secret_error_prints_something_distinct() {
+    // `SecretError::NotDecrypted` was here until D-0036, and nothing in
+    // `crates/pull/src` ever constructed it: it documented a ciphertext check
+    // that did not exist. Recognising KMS ciphertext is an external fact with
+    // no source recorded in `docs/00-charter.md`, so the variant went rather
+    // than the doc comment staying, and `docs/06-limits.md` §19 records what
+    // that leaves unprotected.
     let errors = [
         SecretError::AccessDenied,
         SecretError::NotFound,
         SecretError::Empty,
-        SecretError::NotDecrypted,
         SecretError::Unreachable,
     ];
     let rendered: HashSet<String> = errors.iter().map(ToString::to_string).collect();
@@ -863,7 +990,7 @@ fn every_secret_error_prints_something_distinct() {
         CredentialHalt::Refused {
             vendor: Vendor::Groww,
             field: "fieldone".to_owned(),
-            cause: SecretError::NotDecrypted,
+            cause: SecretError::NotFound,
         },
         CredentialHalt::DeadToken {
             vendor: Vendor::Dhan,
@@ -916,10 +1043,15 @@ fn region(commits: &[Commit]) -> Vec<u8> {
     bytes
 }
 
+/// A manifest for a vendor whose file is empty — the only way to a genesis one.
+fn fresh(vendor: Vendor) -> Manifest {
+    Manifest::open(vendor, &[], &[]).expect("an empty file is a genesis manifest")
+}
+
 /// Builds a manifest on paper: the header region, the entry region, and the
 /// in-memory state a writer would hold.
 fn built(vendor: Vendor, entries: &[Entry]) -> (Vec<u8>, Vec<u8>, Manifest) {
-    let mut manifest = Manifest::genesis(vendor);
+    let mut manifest = fresh(vendor);
     let genesis = ManifestHeader::genesis(vendor)
         .commit()
         .expect("the genesis commit");
@@ -1134,7 +1266,7 @@ fn the_offset_of_an_entry_is_arithmetic() {
 /// M-11 — the counters are maintained on write and read without a scan.
 #[test]
 fn the_counters_are_maintained_on_write() {
-    let mut manifest = Manifest::genesis(Vendor::Groww);
+    let mut manifest = fresh(Vendor::Groww);
     assert_eq!(manifest.entries(), 0);
     assert_eq!(manifest.keys(), 0);
     assert_eq!(manifest.total_rows(), 0);
@@ -1183,7 +1315,7 @@ fn the_counters_are_maintained_on_write() {
 /// An entry that contradicts what a key already holds is refused, on write.
 #[test]
 fn a_row_count_that_went_backwards_is_refused() {
-    let mut manifest = Manifest::genesis(Vendor::Groww);
+    let mut manifest = fresh(Vendor::Groww);
     manifest
         .record(entry("NIFTY", 2024, 6, 7_312, 1_000, 2_000))
         .expect("june");
@@ -1231,7 +1363,7 @@ fn a_row_count_that_went_backwards_is_refused() {
 /// path.
 #[test]
 fn the_row_total_refuses_to_wrap() {
-    let mut manifest = Manifest::genesis(Vendor::Groww);
+    let mut manifest = fresh(Vendor::Groww);
     manifest
         .record(entry("NIFTY", 2024, 6, u64::MAX - 1, 0, 1))
         .expect("a very large month");
@@ -1316,19 +1448,96 @@ fn a_torn_header_commit_never_reports_an_uncommitted_count() {
 }
 
 /// M-05 — a header that became durable before its entries falls back one
-/// generation rather than condemning the file.
+/// generation rather than condemning the file, and says that it did.
+///
+/// The region-is-short case was the only one this test exercised before
+/// D-0036, and it is the only one the code handled: the fall-back lived
+/// entirely in `validate(capacity)`, where `capacity` is the region's *byte
+/// length*. The commonest shape of the crash M-05 names leaves the length
+/// right and the bytes wrong — a block allocated and never written back — and
+/// that condemned the whole file while the previous generation sat intact in
+/// the other slot.
 #[test]
 fn a_header_published_before_its_entries_falls_back_a_generation() {
     let one = entry("NIFTY", 2024, 6, 7_312, 1_000, 2_000);
     let (header_region, _, _) = built(Vendor::Groww, &[one]);
 
-    // The commit landed; the entry did not. The newest slot counts an entry
-    // the region cannot support, and the previous generation is intact.
+    // (a) The commit landed; the entry region is SHORT. The newest slot counts
+    // an entry the region cannot support, and the previous generation is
+    // intact.
     let recovered = Manifest::load(Vendor::Groww, &header_region, &[]).expect("the fallback");
     assert_eq!(recovered.entries(), 0);
     assert_eq!(recovered.total_rows(), 0);
+    assert_eq!(
+        recovered.degraded_reason(),
+        Some(ManifestError::CounterExceedsRegion {
+            n_valid: 1,
+            capacity: 0
+        }),
+        "recovering a generation is never silent"
+    );
+    assert_eq!(recovered.reserved(), 0, "an empty census reserves nothing");
 
-    // When neither generation can be supported, the refusal is a refusal.
+    // (b) The commit landed; the entry's 64 bytes are PRESENT and were never
+    // written back. The region is long enough, `validate` passes, and the
+    // entry's own checksum is what fails.
+    let two = entry("BANKNIFTY", 2024, 6, 7_310, 1_000, 2_000);
+    let (header_region, data, _) = built(Vendor::Groww, &[one, two]);
+    let mut torn = data.clone();
+    torn[IMAGE_LEN..].fill(0);
+    assert_eq!(torn.len(), 2 * IMAGE_LEN, "the region is its full length");
+
+    let recovered = Manifest::load(Vendor::Groww, &header_region, &torn)
+        .expect("the previous generation describes the durable prefix");
+    assert_eq!(recovered.entries(), 1);
+    assert_eq!(recovered.keys(), 1);
+    assert_eq!(recovered.total_rows(), 7_312);
+    assert_eq!(recovered.entry(&one.key), Some(one));
+    assert_eq!(recovered.entry(&two.key), None);
+    match recovered.degraded_reason() {
+        Some(ManifestError::Entry {
+            ordinal: 1,
+            fault: EntryFault::Checksum { .. },
+        }) => {}
+        other => panic!("the recovery must name what it stepped over, got {other:?}"),
+    }
+
+    // The same, with a garbage tail rather than a zeroed one.
+    let mut garbage = data.clone();
+    garbage[IMAGE_LEN..].fill(0xA5);
+    assert_eq!(
+        Manifest::load(Vendor::Groww, &header_region, &garbage)
+            .expect("the fallback")
+            .entries(),
+        1
+    );
+
+    // And with a half-written one: the first 32 bytes are new, the rest is not.
+    let mut half = data.clone();
+    half[IMAGE_LEN + 32..].fill(0);
+    assert_eq!(
+        Manifest::load(Vendor::Groww, &header_region, &half)
+            .expect("the fallback")
+            .entries(),
+        1
+    );
+
+    // (c) When NO generation survives, it is a refusal — and the refusal is the
+    // newest generation's, because that is the state a writer published.
+    let mut both_gone = data.clone();
+    both_gone.fill(0);
+    assert_eq!(
+        Manifest::load(Vendor::Groww, &header_region, &both_gone),
+        Err(ManifestError::Entry {
+            ordinal: 0,
+            fault: EntryFault::Checksum {
+                stored: 0,
+                computed: crc32c(&[0u8; 60])
+            }
+        })
+    );
+
+    // (d) And when neither generation can be supported by the region at all.
     let header = ManifestHeader {
         n_valid: 5,
         n_keys: 1,
@@ -1343,6 +1552,149 @@ fn a_header_published_before_its_entries_falls_back_a_generation() {
             capacity: 0
         })
     );
+}
+
+/// A header slot that fails its own checksum is stepped over, and the census
+/// that survives says so.
+///
+/// Until D-0036 `read_region` computed this refusal, stored it in a local, and
+/// dropped it the moment the other slot validated. `Manifest::load` then
+/// returned `Ok` on a file it had just proved was damaged: a committed month
+/// vanished from the index, the row total under-reported by that month, and no
+/// API a caller could reach said anything had happened. `CLAUDE.md` §4 —
+/// degrade loudly and name the reason, or refuse. Never both silently.
+#[test]
+fn a_corrupt_header_slot_is_named_by_the_census_that_survives_it() {
+    let june = entry("NIFTY", 2024, 1, 100, 1_000, 2_000);
+    let july = entry("BANKNIFTY", 2024, 2, 200, 1_000, 2_000);
+    let (header_region, data, whole) = built(Vendor::Groww, &[june, july]);
+    assert_eq!(whole.header().generation, 2, "generation 2 is in slot 0");
+    assert_eq!(whole.degraded_reason(), None, "the writer is not degraded");
+
+    // A clean load reports both months and nothing stepped over.
+    let clean = Manifest::load(Vendor::Groww, &header_region, &data).expect("a clean load");
+    assert_eq!(
+        (clean.entries(), clean.keys(), clean.total_rows()),
+        (2, 2, 300)
+    );
+    assert_eq!(clean.degraded_reason(), None);
+
+    // One bit, in the newest slot.
+    let mut damaged = header_region.clone();
+    damaged[40] ^= 1;
+    let recovered = Manifest::load(Vendor::Groww, &damaged, &data).expect("the older generation");
+    assert_eq!(
+        (
+            recovered.entries(),
+            recovered.keys(),
+            recovered.total_rows()
+        ),
+        (1, 1, 100),
+        "the census really is smaller — which is exactly why it must be said"
+    );
+    match recovered.degraded_reason() {
+        Some(ManifestError::SlotChecksum { stored, computed }) => assert_ne!(stored, computed),
+        other => panic!("expected the slot checksum to be reported, got {other:?}"),
+    }
+    assert!(
+        recovered
+            .degraded_reason()
+            .expect("a reason")
+            .to_string()
+            .contains("header slot checksum"),
+        "the reason an operator reads names the slot"
+    );
+}
+
+/// M-14 — a genesis census exists only for a file with nothing in it.
+///
+/// `Manifest::genesis` was public, and a writer that called it on a vendor
+/// which already had a manifest produced a census that was silently wrong and
+/// still loaded clean: the stale slot 0 wins on generation, the fresh
+/// generation-1 commit lands in slot 1, entry 0 is overwritten, and because
+/// real index months share a row count the recomputed totals still agree.
+#[test]
+fn the_only_genesis_is_an_empty_file() {
+    // Four months of four instruments, every one 7,312 rows — which is what a
+    // real set of index months looks like, not a contrivance.
+    let months = [
+        entry("NIFTY", 2024, 6, 7_312, 1_000, 2_000),
+        entry("BANKNIFTY", 2024, 6, 7_312, 1_000, 2_000),
+        entry("FINNIFTY", 2024, 6, 7_312, 1_000, 2_000),
+        entry("MIDCPNIFTY", 2024, 6, 7_312, 1_000, 2_000),
+    ];
+    let (header_region, data, _) = built(Vendor::Groww, &months);
+
+    // A file that is there is opened, never started again.
+    let opened = Manifest::open(Vendor::Groww, &header_region, &data).expect("it opens");
+    assert_eq!(
+        (opened.entries(), opened.keys(), opened.total_rows()),
+        (4, 4, 4 * 7_312)
+    );
+    assert_eq!(opened.entry(&months[0].key), Some(months[0]));
+
+    // A file with nothing in it is the one and only genesis.
+    let empty = Manifest::open(Vendor::Dhan, &[], &[]).expect("a genesis manifest");
+    assert_eq!(
+        (empty.entries(), empty.keys(), empty.total_rows()),
+        (0, 0, 0)
+    );
+    assert_eq!(empty.degraded_reason(), None);
+
+    // Half a file is not an empty one, and is not a genesis either. Neither
+    // half is quietly treated as "nothing is here yet".
+    assert_eq!(
+        Manifest::open(Vendor::Groww, &[], &data),
+        Err(ManifestError::HeaderRegionTooShort { slots: 0, need: 2 })
+    );
+    assert_eq!(
+        Manifest::open(Vendor::Groww, &header_region, &[]),
+        Err(ManifestError::CounterExceedsRegion {
+            n_valid: 4,
+            capacity: 0
+        }),
+        "the newest generation's refusal, because that is what a writer published"
+    );
+}
+
+/// C-12's mechanism — the loaded index is reserved from the **census**, not
+/// from the file it came in.
+///
+/// `docs/07-o1-architecture.md`: *"Layer 3's guarantee is the absence of a
+/// rehash, so the bound is the reservation itself."* The reservation was
+/// `entries.len() / IMAGE_LEN` — the region's byte length, which is untrusted
+/// input — so a one-entry census inside a region at the design ceiling
+/// reserved for 2,097,152 entries and allocated 574 MB to hold one key.
+#[test]
+fn the_loaded_index_is_reserved_from_the_census() {
+    let one = entry("NIFTY", 2024, 6, 7_312, 1_000, 2_000);
+    let (header_region, mut data, _) = built(Vendor::Groww, &[one]);
+
+    // One committed entry, in a region with room for a thousand.
+    data.resize(1_000 * IMAGE_LEN, 0);
+    let manifest = Manifest::load(Vendor::Groww, &header_region, &data).expect("it loads");
+    assert_eq!(manifest.entries(), 1);
+    assert!(
+        manifest.reserved() >= 1,
+        "the bound is at least the census, or the map rehashes: {}",
+        manifest.reserved()
+    );
+    assert!(
+        manifest.reserved() < 1_000,
+        "the bound is the census and not the file: {}",
+        manifest.reserved()
+    );
+
+    // And at a census of a thousand it does reserve for a thousand, so the
+    // assertion above is about where the number comes from rather than about
+    // the number being small.
+    let months: Vec<Entry> = (0..1_000u16)
+        .map(|i| entry("NIFTY", 2_000 + i, 6, 7_312, 1_000, 2_000))
+        .collect();
+    let (header_region, data, _) = built(Vendor::Groww, &months);
+    let manifest = Manifest::load(Vendor::Groww, &header_region, &data).expect("it loads");
+    assert_eq!(manifest.entries(), 1_000);
+    assert!(manifest.reserved() >= 1_000, "{}", manifest.reserved());
 }
 
 /// M-06 — a counter that disagrees with the entries it counts is refused.
@@ -1553,10 +1905,13 @@ fn a_short_or_misplaced_header_region_is_refused() {
         ManifestHeader::read_region(&[0u8; 16_384], 0, Vendor::Groww),
         Err(ManifestError::HeaderRegionTooShort { slots: 1, need: 2 })
     );
-    assert_eq!(
-        ManifestHeader::read_region(&region(&[genesis]), 0, Vendor::Groww),
-        Ok(ManifestHeader::genesis(Vendor::Groww))
-    );
+    let read = ManifestHeader::read_region(&region(&[genesis]), 0, Vendor::Groww)
+        .expect("the genesis commit");
+    assert_eq!(read.newest(), ManifestHeader::genesis(Vendor::Groww));
+    assert_eq!(read.older(), None, "one commit is one generation");
+    assert_eq!(read.stepped_over(), None, "and nothing was stepped over");
+    assert_eq!(read, read);
+    assert!(format!("{read:?}").contains("Groww"));
     // Nothing at all: no slot decodes, and none gave a specific reason.
     assert_eq!(
         ManifestHeader::read_region(&vec![0u8; HEADER_LEN_USIZE], 0, Vendor::Groww),
@@ -1580,16 +1935,42 @@ fn a_short_or_misplaced_header_region_is_refused() {
         })
     );
 
-    // Two whole slots, and the newer one wins.
+    // A misplaced commit beside a good one is not a candidate, and the reason
+    // it was passed over is REPORTED rather than dropped on the floor.
+    let mut beside = region(&[genesis]);
+    beside[SLOT_STRIDE_USIZE..SLOT_STRIDE_USIZE + IMAGE_LEN]
+        .copy_from_slice(&odd.commit().expect("a commit").bytes);
+    // Generation 1 belongs in slot 1, so put a generation-2 commit there
+    // instead: that one belongs in slot 0 and is found in slot 1.
+    let even = ManifestHeader {
+        generation: 2,
+        ..ManifestHeader::genesis(Vendor::Groww)
+    };
+    beside[SLOT_STRIDE_USIZE..SLOT_STRIDE_USIZE + IMAGE_LEN]
+        .copy_from_slice(&even.commit().expect("a commit").bytes);
+    let read = ManifestHeader::read_region(&beside, 0, Vendor::Groww).expect("the genesis commit");
+    assert_eq!(read.newest(), ManifestHeader::genesis(Vendor::Groww));
+    assert_eq!(
+        read.stepped_over(),
+        Some(ManifestError::SlotPositionMismatch {
+            expected: 0,
+            found: 1
+        })
+    );
+
+    // Two whole slots: the newer one wins, and the older one is KEPT — it is
+    // the generation `Manifest::load` falls back to, and until D-0036 it was
+    // discarded here, which is why the fall-back only ever worked for a region
+    // that was physically short.
     let newer = ManifestHeader {
         generation: 1,
         ..ManifestHeader::genesis(Vendor::Groww)
     };
     let both = region(&[genesis, newer.commit().expect("a commit")]);
-    assert_eq!(
-        ManifestHeader::read_region(&both, 0, Vendor::Groww),
-        Ok(newer)
-    );
+    let read = ManifestHeader::read_region(&both, 0, Vendor::Groww).expect("two generations");
+    assert_eq!(read.newest(), newer);
+    assert_eq!(read.older(), Some(ManifestHeader::genesis(Vendor::Groww)));
+    assert_eq!(read.stepped_over(), None);
 }
 
 /// The counters refuse to wrap, and the bounds are named.
@@ -1695,6 +2076,147 @@ fn the_header_counters_refuse_to_wrap() {
         manifest.record(entry("NIFTY", 2024, 6, 1, 0, 1)),
         Err(ManifestError::GenerationExhausted)
     );
+}
+
+/// M-15 — every declared bound is exact: the value **at** the limit is
+/// accepted and the first one past it is refused.
+///
+/// Written because `cargo mutants` proved it was missing. Seven boundaries in
+/// this crate could have their comparison flipped from `>` to `>=` with the
+/// whole suite still green, because no test ever supplied a value sitting
+/// exactly on a limit — the standard
+/// `pull::unit::the_secret_backstop_is_the_first_byte_that_is_too_many` already
+/// set for one bound and nowhere else. X-07 and D-0036.
+#[test]
+fn every_declared_bound_is_exact_at_the_limit() {
+    let genesis = ManifestHeader::genesis(Vendor::Groww);
+
+    // `advance` — MAX_ENTRIES exactly is a header, one more is a refusal.
+    let at = ManifestHeader {
+        n_valid: MAX_ENTRIES - 1,
+        ..genesis
+    }
+    .advance(1, 1, 1)
+    .expect("exactly MAX_ENTRIES is not too many");
+    assert_eq!(at.n_valid, MAX_ENTRIES);
+
+    // `validate` — n_valid exactly at MAX_ENTRIES, and exactly at the region's
+    // capacity, are both supported.
+    assert_eq!(
+        ManifestHeader {
+            n_valid: MAX_ENTRIES,
+            n_keys: MAX_ENTRIES,
+            ..genesis
+        }
+        .validate(MAX_ENTRIES),
+        Ok(())
+    );
+    assert_eq!(
+        ManifestHeader {
+            n_valid: 4,
+            n_keys: 4,
+            ..genesis
+        }
+        .validate(4),
+        Ok(()),
+        "a counter equal to the capacity is addressable"
+    );
+    assert_eq!(
+        ManifestHeader {
+            n_valid: 5,
+            n_keys: 0,
+            ..genesis
+        }
+        .validate(4),
+        Err(ManifestError::CounterExceedsRegion {
+            n_valid: 5,
+            capacity: 4
+        })
+    );
+
+    // `commit` — the same limit, one function later.
+    assert_eq!(
+        ManifestHeader {
+            n_valid: MAX_ENTRIES,
+            ..genesis
+        }
+        .commit()
+        .expect("exactly MAX_ENTRIES commits")
+        .durable_through,
+        HEADER_LEN + MAX_ENTRIES * 64
+    );
+
+    // `n_keys > n_valid` — equal is the ordinary case of every key being new.
+    assert_eq!(
+        genesis.advance(1, 1, 7).expect("one entry, one key").n_keys,
+        1
+    );
+
+    // The configuration's bounds, each exactly at its limit. A line exactly at
+    // the bound is READ — it reaches the segment check, which is what refuses
+    // it — rather than being refused for its length.
+    let widest = "a".repeat(MAX_LINE_BYTES - 8);
+    let line = format!("org = \"{widest}\"");
+    assert_eq!(line.len(), MAX_LINE_BYTES);
+    assert_eq!(
+        CredentialConfig::parse(&line),
+        Err(ConfigError::Segment {
+            line: 1,
+            key: "org",
+            fault: SegmentFault::TooLong {
+                len: MAX_LINE_BYTES - 8
+            }
+        }),
+        "a line exactly at the bound is parsed, not refused for its length"
+    );
+    assert_eq!(
+        CredentialConfig::parse(&format!("{line}a")),
+        Err(ConfigError::LineTooLong {
+            line: 1,
+            len: MAX_LINE_BYTES + 1
+        })
+    );
+
+    let exactly = (0..MAX_FIELDS)
+        .map(|i| format!("\"field{i}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let config = CredentialConfig::parse(&config_without(
+        "fields = [\"fieldone\", \"fieldtwo\"]",
+        &format!("fields = [{exactly}]"),
+    ))
+    .expect("exactly MAX_FIELDS fields is not too many");
+    assert_eq!(
+        config.fields(Vendor::Groww).expect("groww").len(),
+        MAX_FIELDS
+    );
+}
+
+/// M-07's other half — a key that stands still is not a key that went
+/// backwards, on write and on load.
+#[test]
+fn a_key_that_repeats_its_last_timestamp_is_accepted() {
+    // On write: the same last timestamp and the same row count is a re-pull
+    // that found nothing new, which is a fact to record rather than a fault.
+    let mut manifest = fresh(Vendor::Groww);
+    let june = entry("NIFTY", 2024, 6, 7_312, 1_000, 2_000);
+    manifest.record(june).expect("june");
+    manifest.record(june).expect("june again, unchanged");
+    assert_eq!(
+        (manifest.entries(), manifest.keys(), manifest.total_rows()),
+        (2, 1, 7_312)
+    );
+
+    // On load: the same two entries, from disk. Without this case the
+    // comparison at the load-time key check can be flipped to `<=` and every
+    // other test still passes.
+    let (header_region, data, _) = built(Vendor::Groww, &[june, june]);
+    let read = Manifest::load(Vendor::Groww, &header_region, &data).expect("it loads");
+    assert_eq!(
+        (read.entries(), read.keys(), read.total_rows()),
+        (2, 1, 7_312)
+    );
+    assert_eq!(read.degraded_reason(), None);
 }
 
 /// One manifest per vendor, named after the vendor.

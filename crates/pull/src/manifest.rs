@@ -81,15 +81,37 @@
 //! | Failure | What catches it |
 //! |---|---|
 //! | a half-written entry at the tail | `n_valid` — the reader never looks at it |
-//! | a half-written or corrupt entry *below* `n_valid` | that entry's own CRC-32C |
+//! | a half-written or corrupt entry *below* `n_valid` | that entry's own CRC-32C, and then the previous generation is tried |
 //! | a half-written header slot | that slot's own CRC-32C, and the other slot |
-//! | a header published before the entries it counts | [`ManifestHeader::validate`] against the region, falling back to the previous generation |
+//! | a header published before the entries it counts | [`ManifestHeader::validate`] against the region, then [`Manifest::load`] walking down the generations |
 //! | a header whose counters do not match its entries | [`Manifest::load`] recomputes both and refuses a disagreement |
 //!
 //! The last one is what makes the counter worth having. A counter that is never
 //! checked against the thing it counts is a number, not a measurement — and
 //! this whole module exists so that number can be trusted without a walk. The
 //! check runs once, on load, where a walk is already being paid.
+//!
+//! **Falling back is never silent.** Every generation stepped over on the way
+//! to the one that loaded is reported by [`Manifest::degraded_reason`], because
+//! `CLAUDE.md` §4 admits exactly two behaviours and "returned `Ok` on a file it
+//! had just proved was damaged" is neither of them. Until D-0036 the fault was
+//! computed, stored in a local, and dropped on the success path: a manifest
+//! whose newest header slot failed its checksum loaded silently at the previous
+//! generation, a committed month vanished from the census, and no API said so.
+//!
+//! # What the counters do NOT check: the bar files themselves
+//!
+//! The header is checked against **this file's own entries** and against
+//! nothing else. `bars/` is never consulted, and no API here can tell that an
+//! entry claiming 7,312 rows describes a month with no bar file at all, or that
+//! a bar file written by a pull that crashed before its append is missing from
+//! the census. The manifest is a record of what a writer *said* it wrote.
+//!
+//! That is inherent rather than an oversight: confirming it means walking
+//! `bars/`, which is the ~248,000 directory operations this layer exists to
+//! avoid, so a reconciliation pass is a deliberate, occasional, O(files)
+//! operation and is not built. `docs/06-limits.md` §17 records it as an
+//! open gap rather than leaving it implied.
 //!
 //! # Nothing here writes
 //!
@@ -973,13 +995,15 @@ impl ManifestHeader {
         })
     }
 
-    /// Reads the whole header region and returns the committed state.
+    /// Reads the whole header region and returns every generation that
+    /// survived, newest first, together with anything stepped over on the way.
     ///
     /// Each of the first [`store::format::MAX_SLOTS`] slot positions is decoded
-    /// independently, and the valid one with the highest generation that the
-    /// region's entry capacity supports wins. A slot that is empty, stale,
-    /// half-written, corrupt or in the wrong position is simply not a
-    /// candidate.
+    /// independently, and every valid one whose generation the region's entry
+    /// capacity supports becomes a candidate, in generation order. A slot that
+    /// is empty, stale, half-written, corrupt or in the wrong position is not a
+    /// candidate — and the reason it is not is **returned**, in
+    /// [`HeaderRead::stepped_over`], rather than dropped.
     ///
     /// It does not condemn the file when the newest slot fails its check
     /// against the capacity. That is the crash where the header became durable
@@ -997,7 +1021,7 @@ impl ManifestHeader {
         region: &[u8],
         capacity: u64,
         vendor: Vendor,
-    ) -> Result<Self, ManifestError> {
+    ) -> Result<HeaderRead, ManifestError> {
         let slots = whole_slots(region);
         if slots < SLOT_COUNT {
             return Err(ManifestError::HeaderRegionTooShort {
@@ -1034,51 +1058,155 @@ impl ManifestHeader {
         // would hang rather than fail if that comparison stopped being strict,
         // and a hang is the one failure a test suite cannot report.
         candidates.sort_unstable_by_key(|header| std::cmp::Reverse(header.generation));
-        let mut refusal = fault.unwrap_or(ManifestError::NoValidHeader);
+        let mut newest: Option<Self> = None;
+        let mut older: Option<Self> = None;
+        // Kept apart from `fault` on purpose. A generation the region cannot
+        // support is what an operator needs to hear about first — it is the
+        // state a writer published — and it is reported for the NEWEST such
+        // generation rather than the last one looked at.
+        let mut unsupported: Option<ManifestError> = None;
         for candidate in candidates {
             match candidate.validate(capacity) {
                 Ok(()) => {
-                    if candidate.vendor == vendor {
-                        return Ok(candidate);
+                    if candidate.vendor != vendor {
+                        return Err(ManifestError::VendorMismatch {
+                            asked: vendor,
+                            found: candidate.vendor,
+                        });
                     }
-                    return Err(ManifestError::VendorMismatch {
-                        asked: vendor,
-                        found: candidate.vendor,
-                    });
+                    // Two slots, so two places to put a survivor. The assertion
+                    // below is what keeps that spelling honest: a third slot
+                    // would silently overwrite `older` here, so a family that
+                    // grew one would be a compile error rather than a lost
+                    // generation.
+                    if newest.is_none() {
+                        newest = Some(candidate);
+                    } else {
+                        older = Some(candidate);
+                    }
                 }
-                Err(refused) => refusal = refused,
+                Err(refused) => {
+                    unsupported.get_or_insert(refused);
+                }
             }
         }
-        Err(refusal)
+        let stepped_over = unsupported.or(fault);
+        let Some(newest) = newest else {
+            return Err(stepped_over.unwrap_or(ManifestError::NoValidHeader));
+        };
+        Ok(HeaderRead {
+            newest,
+            older,
+            stepped_over,
+        })
+    }
+}
+
+const _: () = assert!(MAX_SLOTS == 2);
+
+/// What one header region held: the generations that survived, and what did
+/// not.
+///
+/// Returned by [`ManifestHeader::read_region`] rather than a bare header,
+/// because both of the other two answers are load-bearing and both used to be
+/// thrown away. The older generation is what makes [`Manifest::load`]'s
+/// fall-back real rather than only true for a region that is physically short,
+/// and `stepped_over` is what makes the fall-back loud.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeaderRead {
+    newest: ManifestHeader,
+    older: Option<ManifestHeader>,
+    stepped_over: Option<ManifestError>,
+}
+
+impl HeaderRead {
+    /// The highest generation that survived. This is the committed state.
+    #[must_use]
+    pub const fn newest(&self) -> ManifestHeader {
+        self.newest
+    }
+
+    /// The generation below it, if the other slot still holds one.
+    ///
+    /// The recovery point. A commit that became durable before the entries it
+    /// counts leaves this one describing exactly the prefix that *is* durable.
+    #[must_use]
+    pub const fn older(&self) -> Option<ManifestHeader> {
+        self.older
+    }
+
+    /// A refusal that was stepped over to produce [`HeaderRead::newest`].
+    ///
+    /// `Some` means the file is damaged even though a header was recovered: a
+    /// slot that failed its checksum, one that names a version this build does
+    /// not read, one found in the wrong position, or a generation whose counter
+    /// the region cannot support. There is at most one, because a fault costs a
+    /// slot and there are two.
+    #[must_use]
+    pub const fn stepped_over(&self) -> Option<ManifestError> {
+        self.stepped_over
     }
 }
 
 /// One vendor's census, loaded.
 ///
 /// Holds the header — the counters — and an index from key to the newest entry
-/// for that key. The index is reserved from the entry count known before the
-/// walk begins, so it never rehashes: `docs/07-o1-architecture.md` layer 3, O(1)
-/// **worst case** rather than average.
+/// for that key. The index is reserved from the **committed entry count**,
+/// which is known before the walk begins and which `validate` has already
+/// checked against the region, so it never rehashes and the reservation is
+/// proportional to the census rather than to the file it arrived in:
+/// `docs/07-o1-architecture.md` layer 3, O(1) **worst case** rather than
+/// average. [`Manifest::reserved`] is that number, and M-17 asserts it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
     header: ManifestHeader,
     index: HashMap<EntryKey, Entry>,
+    degraded: Option<ManifestError>,
 }
 
 impl Manifest {
     /// An empty manifest for a vendor that has none yet.
+    ///
+    /// **Private, and D-0036 is the reason.** A writer that called this on a
+    /// vendor which already had a manifest produced a census that was silently,
+    /// verifiably wrong and still loaded clean: the stale slot 0 wins on
+    /// generation, the fresh generation-1 commit lands in slot 1, entry 0 is
+    /// overwritten, and — because real index months share a row count — the
+    /// recomputed key count and row total still agree with the stale header. So
+    /// the only public doors are [`Manifest::open`], which hands out a genesis
+    /// only for a file that has nothing in it, and [`Manifest::load`].
     ///
     /// The index reserves nothing, because nothing is known yet to reserve
     /// from. That is a write-path cost — one rehash per doubling as keys are
     /// first recorded — and it is stated rather than hidden: layer 3's
     /// guarantee is about the loaded index, which is the one a query touches.
     /// See `docs/06-limits.md` §17.
-    #[must_use]
-    pub fn genesis(vendor: Vendor) -> Self {
+    fn genesis(vendor: Vendor) -> Self {
         Self {
             header: ManifestHeader::genesis(vendor),
             index: HashMap::new(),
+            degraded: None,
         }
+    }
+
+    /// The manifest of a vendor whose file may or may not exist yet.
+    ///
+    /// Both regions empty is a file with nothing in it, and that — and only
+    /// that — is a genesis manifest. Anything else is [`Manifest::load`], so a
+    /// writer cannot start a new census over a file that already holds one.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`Manifest::load`] refuses.
+    pub fn open(
+        vendor: Vendor,
+        header_region: &[u8],
+        entries: &[u8],
+    ) -> Result<Self, ManifestError> {
+        if header_region.is_empty() && entries.is_empty() {
+            return Ok(Self::genesis(vendor));
+        }
+        Self::load(vendor, header_region, entries)
     }
 
     /// Loads a manifest from its header region and its entry region.
@@ -1089,24 +1217,85 @@ impl Manifest {
     /// not match what the entries actually hold is refused. Afterwards every
     /// question this type answers is a field read or one hash probe.
     ///
+    /// # It walks *down* the generations, and says that it did
+    ///
+    /// If the newest committed generation does not describe what is on disk —
+    /// its tail entry is zeroed, or garbage, or half-written, all of which are
+    /// ordinary results of a crash between a data write and its flush — the
+    /// generation below it is tried, because that one counts a prefix of these
+    /// same entries and the whole point of alternating slots is that it is
+    /// still intact. Whichever generation loads,
+    /// [`Manifest::degraded_reason`] carries what was stepped over. Before
+    /// D-0036 the fall-back existed only for a region that was physically too
+    /// **short**, so the commonest shape of the crash it was written for
+    /// condemned the file and left recovery to the ~248,000-file directory walk
+    /// this module exists to avoid.
+    ///
     /// # Errors
     ///
     /// [`ManifestError`] — a header that does not decode, a counter the region
     /// cannot support, an entry that fails its own checksum or its own checks,
     /// a key whose history goes backwards, or a counter that disagrees with the
-    /// entries it claims to count.
+    /// entries it claims to count. When no generation survives, the refusal
+    /// reported is the **newest** one's: that is the state a writer published,
+    /// and `ManifestError` is `Copy` and does not nest.
     pub fn load(
         vendor: Vendor,
         header_region: &[u8],
         entries: &[u8],
     ) -> Result<Self, ManifestError> {
         let capacity = whole_entries(entries);
-        let header = ManifestHeader::read_region(header_region, capacity, vendor)?;
+        let read = ManifestHeader::read_region(header_region, capacity, vendor)?;
 
-        // The bound is known before the loop starts, and it is at least
-        // `n_valid` because `validate` has already refused a counter the region
-        // cannot support. So the map is built once and never grows.
-        let reserve = MAX_ENTRIES_LEN.min(entries.len() / IMAGE_LEN);
+        let header = read.newest();
+        let published = match Self::walk(header, entries) {
+            Ok(index) => {
+                return Ok(Self {
+                    header,
+                    index,
+                    degraded: read.stepped_over(),
+                });
+            }
+            Err(fault) => fault,
+        };
+        // The published generation does not describe these bytes. The one below
+        // it counts a prefix of them, and `read_region` has already validated
+        // it against the region. Nothing is lost by not also carrying
+        // `stepped_over` here: a stepped-over slot costs a candidate, and with
+        // two slots a file cannot both have one and still offer an older
+        // generation.
+        let Some(previous) = read.older() else {
+            return Err(published);
+        };
+        Self::walk(previous, entries)
+            .map(|index| Self {
+                header: previous,
+                index,
+                degraded: Some(published),
+            })
+            .map_err(|_| published)
+    }
+
+    /// Decodes every committed entry under one header and checks the counters
+    /// against them.
+    ///
+    /// Split out of [`Manifest::load`] so that walking a second generation is
+    /// the same code rather than a paraphrase of it.
+    fn walk(
+        header: ManifestHeader,
+        entries: &[u8],
+    ) -> Result<HashMap<EntryKey, Entry>, ManifestError> {
+        // Reserved from the COUNTER, which `validate` has already proved is
+        // within both `MAX_ENTRIES` and the region's capacity -- not from the
+        // region's byte length, which is untrusted input. Sizing it from the
+        // length made a one-entry census inside a region at the design ceiling
+        // allocate 574 MB, because the reservation followed the file rather
+        // than the census. The bound is still known before the loop starts, so
+        // the map is still built once and never grows: layer 3. The `unwrap_or`
+        // arm cannot be reached — `n_valid` is at most `MAX_ENTRIES`, which
+        // fits a `usize` on every target this builds for — and it lives in
+        // `Result::unwrap_or`, which is not this repository's code to measure.
+        let reserve = usize::try_from(header.n_valid).unwrap_or(MAX_ENTRIES_LEN);
         let mut index: HashMap<EntryKey, Entry> = HashMap::with_capacity(reserve);
         let mut n_keys = 0u64;
 
@@ -1152,13 +1341,43 @@ impl Manifest {
                 entries: total_rows,
             });
         }
-        Ok(Self { header, index })
+        Ok(index)
     }
 
     /// The header, counters and all.
     #[must_use]
     pub const fn header(&self) -> ManifestHeader {
         self.header
+    }
+
+    /// What this census had to step over to load, if anything.
+    ///
+    /// `Some` means the file is damaged and this manifest is what could still
+    /// be recovered from it: a header slot that failed its checksum, a
+    /// generation whose entries were not all there, a slot in the wrong
+    /// position. The counters below are then the *recovered* generation's, and
+    /// a month that a later generation had committed is not in them.
+    ///
+    /// **An operator entry point renders this.** `CLAUDE.md` §4 allows
+    /// degrading loudly and naming the reason, or refusing — and this crate
+    /// performs no I/O and holds no logger, so the loudest thing available to
+    /// it is a value the census carries and a `#[must_use]` on the way to it.
+    #[must_use]
+    pub const fn degraded_reason(&self) -> Option<ManifestError> {
+        self.degraded
+    }
+
+    /// How many entries the index reserved room for — layer 3, as a number.
+    ///
+    /// `docs/07-o1-architecture.md`: *"Layer 3's guarantee is the absence of a
+    /// rehash, so the bound is the reservation itself."* A guarantee about an
+    /// allocation that nothing can observe is a guarantee nothing can test, so
+    /// this exposes it: `pull::unit::the_loaded_index_is_reserved_from_the_census`
+    /// asserts that a one-entry census inside a large region reserves for the
+    /// census and not for the region.
+    #[must_use]
+    pub fn reserved(&self) -> usize {
+        self.index.capacity()
     }
 
     /// How many entries have been committed. One field read.
@@ -1196,6 +1415,13 @@ impl Manifest {
     /// `self` is left untouched unless every check passes, so a refused record
     /// cannot leave the in-memory counters describing a write that never
     /// happened.
+    ///
+    /// A census that loaded degraded may still be appended to, and that is
+    /// deliberate: recovering from a torn commit *is* writing the next
+    /// generation, and refusing here would leave the commonest crash with no
+    /// way forward at all. What the writer may not do is append without having
+    /// looked at [`Manifest::degraded_reason`], which is why that answer is
+    /// carried on the value rather than logged and forgotten.
     ///
     /// # Errors
     ///
