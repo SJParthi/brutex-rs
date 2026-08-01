@@ -1,0 +1,150 @@
+name: Auto-merge
+
+# Enables GitHub's native squash auto-merge on a pull request, but only once
+# every gate is green. It refuses — loudly, and without merging — when any
+# gate is red, when any gate is still pending, or when the branch is behind
+# main. Refusing is a successful run that did not merge; it is not a red X,
+# because the red X belongs to whichever gate actually failed.
+#
+# Two triggers, because one is not enough:
+#   pull_request  — catches a PR that is already green when it opens or is
+#                   re-pushed (a rebase onto a green main, for instance).
+#   workflow_run  — catches the far more common case: the PR opened while CI
+#                   was still running, and CI has only now finished.
+#
+# SECURITY. No value from the event payload is interpolated into a `run:`
+# body. Every value crosses into the shell through `env:` and is quoted at the
+# point of use, so a branch name or a title cannot become a command. The base
+# branch is a literal rather than `github.event.*.default_branch`, so nothing
+# attacker-shaped decides what we compare against.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+
+concurrency:
+  # One evaluation at a time per head commit. Not cancel-in-progress: a
+  # cancelled evaluation is a pull request that silently never merges.
+  group: auto-merge-${{ github.event.pull_request.head.sha || github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
+
+jobs:
+  auto-merge:
+    name: Enable squash auto-merge on green
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Evaluate every gate, then enable or refuse
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_BRANCH: main
+          # Exactly one of these is populated, depending on the trigger.
+          PR_FROM_EVENT: ${{ github.event.pull_request.number }}
+          SHA_FROM_RUN: ${{ github.event.workflow_run.head_sha }}
+          # This job's own check run. It is in progress while it evaluates, so
+          # counting it as a pending gate would deadlock every merge forever.
+          SELF_CHECK_NAME: Enable squash auto-merge on green
+          REQUIRED_CHECK: ci-ok
+        run: |
+          set -euo pipefail
+
+          say() { printf '%s\n' "$*"; printf '%s\n' "$*" >> "$GITHUB_STEP_SUMMARY"; }
+          refuse() { say "REFUSED — $*"; say "No merge was enabled."; exit 0; }
+
+          # ---------------------------------------------------------------
+          # 1. Which pull request is this about?
+          # ---------------------------------------------------------------
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            pr="$PR_FROM_EVENT"
+            sha=""
+          else
+            sha="$SHA_FROM_RUN"
+            pr=$(gh api "repos/${REPO}/commits/${sha}/pulls" \
+                   --jq '[.[] | select(.state == "open")] | .[0].number // empty')
+          fi
+          if [ -z "${pr:-}" ]; then
+            say "No open pull request is associated with this event. Nothing to do."
+            exit 0
+          fi
+          say "Pull request: #${pr}"
+
+          # ---------------------------------------------------------------
+          # 2. Is it even a candidate?
+          # ---------------------------------------------------------------
+          read -r state draft fork head < <(
+            gh pr view "$pr" --repo "$REPO" \
+              --json state,isDraft,isCrossRepository,headRefOid \
+              --jq '[.state, (.isDraft|tostring), (.isCrossRepository|tostring), .headRefOid] | @tsv'
+          )
+          say "State ${state} · draft ${draft} · fork ${fork} · head ${head}"
+
+          [ "$state" = "OPEN" ]  || refuse "the pull request is ${state}, not OPEN."
+          [ "$draft" = "false" ] || refuse "the pull request is a draft."
+          [ "$fork"  = "false" ] || refuse "the pull request comes from a fork; a fork gets a read-only token by design."
+
+          # The head this job evaluated must be the head that gets merged. If a
+          # push landed while we were deciding, a later run will handle it.
+          if [ -n "$sha" ] && [ "$sha" != "$head" ]; then
+            refuse "the branch moved during evaluation (evaluated ${sha}, head is now ${head})."
+          fi
+
+          # ---------------------------------------------------------------
+          # 3. Behind main is a refusal, not a merge.
+          # ---------------------------------------------------------------
+          # A pull request that passed CI against an older main proves nothing
+          # about the merge result. Linear history is required on main, so a
+          # behind branch could not fast-forward anyway.
+          behind=$(gh api "repos/${REPO}/compare/${BASE_BRANCH}...${head}" --jq '.behind_by')
+          say "Commits behind ${BASE_BRANCH}: ${behind}"
+          [ "$behind" -eq 0 ] || refuse "the branch is ${behind} commit(s) behind ${BASE_BRANCH}; rebase it."
+
+          # ---------------------------------------------------------------
+          # 4. Every gate. Not only the required one.
+          # ---------------------------------------------------------------
+          runs=$(gh api "repos/${REPO}/commits/${head}/check-runs" --paginate \
+                   --jq '.check_runs[] | [.name, .status, (.conclusion // "none")] | @tsv')
+
+          if [ -z "$runs" ]; then
+            refuse "no check run has reported for ${head} yet."
+          fi
+
+          red=0; pending=0; required_ok=0
+          while IFS=$'\t' read -r name status conclusion; do
+            [ -n "$name" ] || continue
+            if [ "$name" = "$SELF_CHECK_NAME" ]; then
+              continue                       # do not wait on ourselves
+            fi
+            say "  gate ${name}: ${status}/${conclusion}"
+            case "$conclusion" in
+              failure|cancelled|timed_out|action_required|stale)
+                red=$((red + 1)) ;;
+            esac
+            if [ "$status" != "completed" ]; then
+              pending=$((pending + 1))
+            fi
+            if [ "$name" = "$REQUIRED_CHECK" ] \
+               && [ "$status" = "completed" ] && [ "$conclusion" = "success" ]; then
+              required_ok=1
+            fi
+          done <<< "$runs"
+
+          [ "$red" -eq 0 ]     || refuse "${red} gate(s) are red."
+          [ "$pending" -eq 0 ] || refuse "${pending} gate(s) are still running."
+          [ "$required_ok" -eq 1 ] \
+            || refuse "the required check '${REQUIRED_CHECK}' has not reported success."
+
+          # ---------------------------------------------------------------
+          # 5. Green. Hand it to GitHub.
+          # ---------------------------------------------------------------
+          say "Every gate is green. Enabling squash auto-merge on #${pr}."
+          gh pr merge "$pr" --repo "$REPO" --auto --squash
+          say "Squash auto-merge enabled."

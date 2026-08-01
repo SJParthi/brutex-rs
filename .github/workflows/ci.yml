@@ -1,0 +1,267 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # ==========================================================================
+  # GATE 1 + 2 — the load-bearing gates. No toolchain, no cache, seconds.
+  # These run first so a violation fails before anything expensive starts.
+  # ==========================================================================
+  language-purity:
+    name: Gate 1+2 — one language
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Gate 1 — extension allowlist
+        run: |
+          set -euo pipefail
+          # The ONLY extensions this repository may contain.
+          allowed='rs|toml|md|lock|html|css|yml|json'
+          # Files with no extension that are still legitimate.
+          allowed_names='LICENSE|CODEOWNERS|.gitignore|.gitattributes'
+          bad=0
+          while IFS= read -r f; do
+            base="${f##*/}"
+            if printf '%s\n' "$base" | grep -Eq "^(${allowed_names})$"; then continue; fi
+            case "$base" in
+              *.*) ext="${base##*.}" ;;
+              *)   ext="" ;;
+            esac
+            if ! printf '%s\n' "$ext" | grep -Eq "^(${allowed})$"; then
+              printf 'FORBIDDEN FILE  %s  (extension %s)\n' "$f" "${ext:-<none>}"
+              bad=1
+            fi
+          done < <(git ls-files)
+          if [ "$bad" -ne 0 ]; then
+            echo
+            echo "This repository is Rust only. See CLAUDE.md section 2."
+            echo "Allowed extensions: ${allowed//|/ }"
+            exit 1
+          fi
+          echo "OK — every tracked file is in the allowlist."
+
+      - name: Gate 1b — .json and .yml are confined
+        run: |
+          set -euo pipefail
+          # JSON and YAML are config, not source, and only belong in two places.
+          bad=$(git ls-files '*.json' '*.yml' \
+                | grep -Ev '^(\.github/|crates/web/)' || true)
+          if [ -n "$bad" ]; then
+            printf 'CONFIG OUTSIDE ITS HOME:\n%s\n' "$bad"; exit 1
+          fi
+          echo "OK."
+
+      - name: Gate 1c — no literal credential path
+        run: |
+          set -euo pipefail
+          # This repository is public. A Parameter Store path names an account,
+          # an environment and a vendor relationship; once pushed it lives in
+          # every fork's history forever. Documents carry only the generic
+          # shape /<org>/<env>/<vendor>/<field> — which does not match this
+          # pattern, because <env> is not a real environment name.
+          # See docs/05-decisions.md D-0013 and docs/04-invariants.md X-08.
+          #
+          # No untrusted input reaches this step: the inputs are `git ls-files`
+          # and a static pattern. Nothing from the event payload is expanded.
+          envs='prod|production|dev|development|stage|staging|uat|qa|sandbox|live'
+          hits=$(git ls-files -z \
+                 | xargs -0 -r grep -nE "/[A-Za-z0-9][A-Za-z0-9_.-]*/(${envs})/" \
+                 || true)
+          if [ -n "$hits" ]; then
+            printf 'LITERAL CREDENTIAL PATH IN A TRACKED FILE:\n%s\n' "$hits"
+            echo
+            echo "Use the shape /<org>/<env>/<vendor>/<field>. The real"
+            echo "segments are resolved at runtime. See D-0013."
+            exit 1
+          fi
+          # The runtime configuration itself is never tracked.
+          tracked=$(git ls-files | grep -E '(^|/)credentials\.toml$' || true)
+          if [ -n "$tracked" ]; then
+            printf 'CREDENTIAL CONFIG IS TRACKED:\n%s\n' "$tracked"; exit 1
+          fi
+          echo "OK — no literal credential path, no tracked credential config."
+
+      - name: Gate 2 — no build script shells out
+        run: |
+          set -euo pipefail
+          hits=$(git ls-files '*build.rs' | xargs -r grep -ln \
+                 -e 'Command::new' -e 'std::process' || true)
+          if [ -n "$hits" ]; then
+            printf 'BUILD SCRIPT INVOKES AN EXTERNAL PROCESS:\n%s\n' "$hits"
+            echo "A build script is Rust, so gate 1 passes it — and then it runs"
+            echo "something else. That is the side door. See CLAUDE.md section 2."
+            exit 1
+          fi
+          echo "OK — no build script invokes an external process."
+
+      - name: Gate 7 — the browser crate depends on core alone
+        run: |
+          set -euo pipefail
+          f=crates/web/Cargo.toml
+          [ -f "$f" ] || { echo "skip — crate not created yet"; exit 0; }
+          deps=$(awk '/^\[dependencies\]/{f=1;next} /^\[/{f=0} f && /=/ {print $1}' "$f" \
+                 | grep -v '^$' || true)
+          extra=$(printf '%s\n' "$deps" | grep -v '^core$' || true)
+          if [ -n "$extra" ]; then
+            printf 'crates/web MAY ONLY DEPEND ON core. Found:\n%s\n' "$extra"
+            echo "It compiles to wasm32 where the filesystem does not exist."
+            exit 1
+          fi
+          echo "OK."
+
+  # ==========================================================================
+  # GATES 3-6 — the toolchain gates.
+  # ==========================================================================
+  build:
+    name: Gates 3-6 — fmt, clippy, deny, test
+    runs-on: ubuntu-24.04
+    needs: language-purity
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+
+      # Cargo refuses a virtual workspace with no members, so between the
+      # automation commit and the first crate there is genuinely nothing to
+      # compile. This probe says so out loud rather than letting a green tick
+      # imply a build happened. It disarms itself permanently the moment
+      # crates/core lands, and it is checked against the tracked tree, not the
+      # manifest, so it cannot be satisfied by an untracked directory.
+      - name: Is there a crate to build yet?
+        id: probe
+        run: |
+          set -euo pipefail
+          n=$(git ls-files 'crates/*/Cargo.toml' | wc -l | tr -d ' ')
+          if [ "$n" -eq 0 ]; then
+            echo "has_crates=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=No crate exists yet::\
+          The toolchain gates (fmt, build, clippy, deny, test) compiled NOTHING \
+          on this commit because the workspace has no members. This is not a \
+          passing build — it is an empty one. It stops being possible as soon \
+          as crates/core is merged."
+          else
+            echo "has_crates=true" >> "$GITHUB_OUTPUT"
+            echo "$n crate manifest(s) tracked — the toolchain gates apply."
+          fi
+
+      - name: Gate 6a — formatting
+        if: steps.probe.outputs.has_crates == 'true'
+        run: cargo fmt --all --check
+
+      - name: Gate 4 — locked, offline
+        if: steps.probe.outputs.has_crates == 'true'
+        run: cargo build --workspace --locked --offline --all-targets
+
+      - name: Gate 6b — clippy
+        if: steps.probe.outputs.has_crates == 'true'
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Gate 5 — unsafe is denied, exceptions are counted
+        run: |
+          set -euo pipefail
+          # unsafe_code = "deny" at the workspace root already fails the build.
+          # This gate additionally caps how many documented exceptions exist,
+          # so they cannot quietly multiply.
+          n=$(git ls-files '*.rs' | xargs -r grep -c 'allow(unsafe_code)' \
+              | awk -F: '{s+=$2} END{print s+0}')
+          echo "documented unsafe exceptions: $n"
+          if [ "$n" -gt 3 ]; then
+            echo "More than 3 unsafe exceptions. Each needs a decision entry."
+            git ls-files '*.rs' | xargs -r grep -n 'allow(unsafe_code)'
+            exit 1
+          fi
+
+      - name: Gate 3 — dependency policy
+        if: steps.probe.outputs.has_crates == 'true'
+        run: |
+          cargo install cargo-deny --locked --version ^0.16
+          cargo deny check
+
+      - name: Tests
+        if: steps.probe.outputs.has_crates == 'true'
+        run: cargo test --workspace --locked
+
+      - name: The browser crate actually builds for the browser
+        run: |
+          [ -d crates/web ] || { echo "skip"; exit 0; }
+          cargo build -p web --target wasm32-unknown-unknown --locked
+
+  # ==========================================================================
+  # Coverage — 100% line and branch, no omit list.
+  # ==========================================================================
+  coverage:
+    name: Coverage 100%
+    runs-on: ubuntu-24.04
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: llvm-tools-preview }
+      - uses: Swatinem/rust-cache@v2
+      - name: Measure
+        run: |
+          set -euo pipefail
+          n=$(git ls-files 'crates/*/Cargo.toml' | wc -l | tr -d ' ')
+          if [ "$n" -eq 0 ]; then
+            echo "::warning title=Coverage measured nothing::\
+          No crate exists yet, so 100% coverage is vacuously true. \
+          See docs/06-limits.md section 7."
+            exit 0
+          fi
+          cargo install cargo-llvm-cov --locked
+          cargo llvm-cov --workspace --locked \
+            --fail-under-lines 100 --fail-under-regions 100 \
+            --summary-only
+
+  # ==========================================================================
+  # GATE 8 — per-operation cost stays constant as input grows.
+  # ==========================================================================
+  complexity:
+    name: Gate 8 — O(1) ratio
+    runs-on: ubuntu-24.04
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Per-operation cost at 1x / 10x / 100x
+        run: |
+          [ -d benches ] || { echo "skip — no benches yet"; exit 0; }
+          cargo bench --workspace --locked -- --save-baseline ci
+          # The harness itself asserts the ratio ceiling and exits non-zero on
+          # breach; see docs/04-invariants.md C-01 through C-04.
+
+  # ==========================================================================
+  # Aggregate — this is the only required check on the branch rule.
+  # ==========================================================================
+  # The job NAME is what a branch-protection rule and the auto-merge workflow
+  # match on, so it is spelled exactly as the required check: `ci-ok`.
+  ci-ok:
+    name: ci-ok
+    runs-on: ubuntu-24.04
+    needs: [language-purity, build, coverage, complexity]
+    if: always()
+    steps:
+      - name: Verify every gate went green
+        run: |
+          r='${{ join(needs.*.result, " ") }}'
+          echo "results: $r"
+          for x in $r; do
+            [ "$x" = "success" ] || { echo "a gate did not pass: $x"; exit 1; }
+          done
+          echo "all gates green"
