@@ -271,7 +271,7 @@ jobs:
           # version is pinned EXACTLY at 0.18.3 -- the newest release cargo
           # itself reports as supporting 1.85.0. A caret range would silently
           # re-break the moment a newer cargo-deny raises its MSRV again.
-          cargo install cargo-deny --locked --version =0.18.3
+          cargo install cargo-deny --locked
           cargo deny check
 
       - name: Tests

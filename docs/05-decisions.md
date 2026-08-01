@@ -328,6 +328,45 @@ cheap.
 
 ---
 
+## D-0016 · 2026-08-01 · Track the latest stable toolchain, not a frozen one
+
+**Decision.** `rust-toolchain.toml` moves from **1.85.0 to 1.97.1** — current
+stable — and CI tooling installs its latest release rather than a pinned old
+one. The toolchain is still checked in and still identical on every machine and
+in CI; what changes is that it is kept current instead of left to age.
+
+**Rejected — keeping 1.85.0.** It was pinned in February 2025 and had become
+the binding constraint on everything else. Concretely, gate 3 could not run at
+all:
+
+1. `cargo-deny ^0.16` failed to *parse* the RUSTSEC advisory database:
+   `RUSTSEC-2026-0109.md` uses TOML front-matter it rejects.
+2. `cargo-deny 0.18.9` fixes that, but requires rustc **1.88.0**.
+3. `cargo-deny 0.18.3` installs on 1.85.0 — and still cannot parse the
+   database.
+
+There was no version of the tool that both installed on the pinned toolchain
+and did its job. The gate was not misconfigured; it was **impossible**. A
+security gate that cannot run is worse than an absent one, because red starts
+to mean "the tool is broken again" rather than "something is wrong".
+
+**Rejected — floating `channel = "stable"`.** Reproducibility requires that
+two machines resolve the same compiler. A named version keeps that guarantee;
+only the number moves, and moving it stays a decision recorded here.
+
+**Verified before landing, not assumed.** On 1.97.1: `cargo fmt --check`
+clean, `cargo clippy --workspace --all-targets -- -D warnings` clean, 14 tests
+passing. `edition = "2024"` and `resolver = "3"` are unaffected;
+`rust-version` moves to 1.97 to match.
+
+**The general rule this sets.** Pinning is for *reproducibility*, not for
+*avoidance*. A pin that is never advanced silently becomes a ceiling on tools,
+lints and advisories — and the failure surfaces far from its cause, as it did
+here: three separate commits chased a symptom in `deny.toml` and in the tool
+version before the toolchain itself turned out to be the constraint.
+
+---
+
 ## How to add an entry
 
 Next free ID, today's date, the decision in one sentence, the alternative
