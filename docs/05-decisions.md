@@ -588,7 +588,23 @@ corrected only by going to the live source.
 | Dhan `/v2/charts/rollingoption`: **45 days** per call, intervals `1/5/15/30/60`, strike enum `ATM, ATM+10, ATM-10`, **last 5 years rolling**, index **and** stock options, returns IV/OI/spot | **live browser** on `docs.dhanhq.co` | verified |
 | **Dhan cannot reach 2020-01.** Five years *rolling* puts the floor at ~2021-08 and moving | live browser | verified |
 | Dhan has **no expired-futures endpoint** | live browser | verified |
-| Rate limits, either vendor · Dhan Data-API pricing · any behaviour with a real token | — | **UNVERIFIED** |
+| Dhan rate limits: Order **10/s, 100,000/day**; **Data 5/s, 7,000/day**; Market Quote 1/s and **max 1,000 instruments per request**; Option Chain **1 per 3 s**; breach returns `RL001` | **live browser**, `docs.dhanhq.co/api/v2/guides/rate-limits` | verified |
+| Groww rate limits for the historical/backtesting endpoints | not found on introduction, annexures or live-data | **UNVERIFIED** |
+| Dhan Data-API pricing · any behaviour with a real token | — | **UNVERIFIED** |
+
+**A correction inside this entry, kept rather than edited away.** An earlier
+draft recorded Dhan's Data-API daily limit as 100,000, reasoning from release
+notes in the local capture. The live page says **7,000**. That is a 14× error
+in the direction that matters: at ~1,722 calls per underlying for a five-year
+expired-options pull, 7,000/day allows roughly **four underlyings per day**,
+not fifty-eight. The number was wrong because it came from the capture rather
+than the source — the same failure this decision exists to prevent, committed
+inside the decision itself.
+
+**Two Dhan documentation URLs 404.** `/api/v2/rate-limit` and
+`/api/v2/guides/rate-limit` are both dead; the live page is
+`/api/v2/guides/rate-limits`. A URL that appears in a capture is not evidence
+that it resolves.
 
 **The method matters, and is part of the decision.** Dhan's documentation is a
 JavaScript application: three different URLs return one byte-identical 33,884
