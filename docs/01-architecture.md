@@ -103,12 +103,13 @@ Three properties matter more than the boxes:
 ## 4. Path is the index
 
 ```
-bars/NSE/INDEX/NIFTY/1min/2024-03.bin
-     │   │     │     │    └── the month file
-     │   │     │     └─────── timeframe
-     │   │     └───────────── symbol
-     │   └─────────────────── segment
-     └─────────────────────── exchange
+bars/groww/NSE/INDEX/NIFTY/1min/2024-03.bin
+     │     │   │     │     │    └── the month file
+     │     │   │     │     └─────── timeframe
+     │     │   │     └───────────── symbol
+     │     │   └─────────────────── segment
+     │     └─────────────────────── exchange
+     └───────────────────────────── vendor (D-0019)
 ```
 
 Locating a slice is a string join and an open. There is no catalogue to

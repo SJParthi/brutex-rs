@@ -90,6 +90,8 @@ dedicated hardware before it is believed.
 | X-08 | No tracked file contains a literal credential path | CI gate 1c | ✓ |
 | X-09 | `core` declares no dependency at all | CI gate 9 | ✓ |
 | X-10 | Every reachable row in this file names a test that exists | CI gate 10 | ✓ |
+| X-12 | Each vendor writes only under its own path prefix; no vendor can overwrite another | `store::unit::vendor_prefix_isolated` | — |
+| X-13 | A bar-for-bar mismatch between two vendors refuses the window and names the timestamp | `store::unit::vendor_disagreement_refuses` | — |
 | X-11 | A price is constructible from a float only through the one checked conversion | `core::price::refuses_an_out_of_range_price_instead_of_saturating` (private field; no other path exists) | ✓ |
 
 ---
