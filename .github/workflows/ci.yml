@@ -256,7 +256,19 @@ jobs:
       - name: Gate 3 — dependency policy
         if: steps.probe.outputs.has_crates == 'true'
         run: |
-          cargo install cargo-deny --locked --version ^0.16
+          set -euo pipefail
+          # The pin was ^0.16, which cannot PARSE the current RUSTSEC advisory
+          # database: RUSTSEC-2026-0109.md uses TOML front-matter that 0.16.4
+          # rejects, so the gate died on "failed to load advisory database"
+          # before it checked anything. That is the worst shape of failure for
+          # a security gate -- red for a reason unrelated to security, which
+          # trains a reader to ignore it.
+          #
+          # This is a CI tool version, not a workspace dependency: it adds
+          # nothing to the dependency graph and needs no ledger entry. The
+          # constraint stays bounded rather than floating, so a future breaking
+          # change is a visible edit here.
+          cargo install cargo-deny --locked --version ^0.18
           cargo deny check
 
       - name: Tests
