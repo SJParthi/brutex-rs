@@ -23,6 +23,11 @@ reachable (the crate does not exist).
 | S-08 | `i64::MIN` in `open_interest` round-trips as null and is never confused with `0` | `store::proptest::oi_sentinel_distinct` | — |
 | S-09 | Opening a file with an unknown `format_version` refuses; it never guesses | `store::unit::unknown_version_refuses` | — |
 | S-10 | Two concurrent writers on one file are refused by the advisory lock | `store::integration::second_writer_refused` | — |
+| S-11 | The checksum reproduces a hardcoded value at every length a wide kernel can break on — 0, 1, 8, 15, 16, 56, 60, 64, 4087, 4088, 4089 bytes, and the all-zero and all-ones block | `store::unit::the_crc_reproduces_a_hardcoded_value_at_every_length_that_can_break` | ✓ |
+| S-12 | The shipped checksum kernel agrees with an independent bit-by-bit reference at every length across a stride boundary, on every target | `store::unit::the_fast_kernel_agrees_with_a_bit_by_bit_reference_on_every_length` | ✓ |
+| S-13 | The header slot's covered domain is exactly bytes `0..56 ‖ 60..64`; filling the four-byte hole is a different number and is refused as such | `store::unit::the_covered_domain_is_the_slot_minus_its_checksum` | ✓ |
+| S-14 | Splitting the checksum input at any point gives the answer for the whole | `store::unit::splitting_the_input_anywhere_gives_the_same_checksum` | ✓ |
+| S-15 | The lookup table is the polynomial: lane 0 is one folded byte, and lane *k* is lane *k−1* advanced by one zero byte | `store::crc::the_table_is_the_polynomial_lane_by_lane` | ✓ |
 
 ## Vocabulary and indicators
 
@@ -52,16 +57,31 @@ reachable (the crate does not exist).
 
 | # | Must hold | Proven by | |
 |---|---|---|---|
-| C-01 | Bar read cost is flat from 1× to 100× file size | `store::bench::read_ratio` | — |
+| C-01 | Reading the header costs the same at 1×, 10× and 100× the region offered | `store::bench::header_read_is_flat` | ✓ |
 | C-02 | Per-candidate evaluation cost is flat from 1× to 100× candidate count | `engine::bench::eval_ratio` | — |
 | C-03 | Duplicate-rejection cost is flat from 1× to 100× seen-set size | `engine::bench::dedup_ratio` | — |
 | C-04 | Result append cost is flat from 1× to 100× results held | `engine::bench::append_ratio` | — |
+| C-07 | Sealing one block costs the same at 1×, 10× and 100× the file's record count | `store::bench::block_seal_is_flat` | ✓ |
+| C-08 | The block checksum beats the bit-by-bit kernel it replaced by at least 3×, measured in the same process | `store::bench::checksum_beats_the_bit_loop` | ✓ |
+| C-09 | Decoding one vendor row costs the same whether a field is 28 bytes or 4 MiB | `core::bench::decode_is_flat_in_field_width` | ✓ |
+| C-10 | An over-wide vendor field is **refused**, not merely decoded quickly | `core::bench::an_over_wide_row_is_refused` | ✓ |
+
+C-01 was previously stated as "bar read cost is flat from 1× to 100× file size"
+and proven by `store::bench::read_ratio`, which did not exist — there is no bar
+reader in `crates/store` yet. D-0034 restated it as the flatness that **is**
+measurable today and named a bench that runs. The bar-read row returns when the
+reader does.
 
 **Ceiling.** A ratio is a failure above **1.4×** on dedicated hardware,
 **3.0×** on shared CI. The gap is measurement noise on shared vCPU, not a
 different standard — a ratio above 3.0× on shared hardware is a real
 regression, and a number between 1.4 and 3.0 on shared hardware is re-run on
-dedicated hardware before it is believed.
+dedicated hardware before it is believed. The harnesses assert the CI number
+and print the ratio, so a local run can be read against the tighter one.
+
+**These rows are enforced by a gate that ran for the first time on
+2026-08-01.** Before D-0034 gate 8 probed for a repository-root `benches/`
+directory, found none, and exited zero — see `docs/06-limits.md` §7b and §7c.
 
 ## Ingest
 
@@ -97,6 +117,13 @@ Added by D-0024. Every row here is proven by a test that runs today.
 | I-13 | A trailing dash that is not the row's own series is never stripped, so `BAJAJ-AUTO` survives | `core::vendor::a_dash_that_is_not_the_rows_own_series_is_never_stripped` | ✓ |
 | I-14 | Every column a vendor's reader needs is required by name, and a missing one is refused and named | `api::master::every_column_a_vendor_needs_is_required_and_named_when_absent` | ✓ |
 | I-15 | The binary's entry point is measured by running it, not exempted from the coverage gate | `api::binary::the_binary_reports_what_it_read_and_exits_zero` | ✓ |
+| I-16 | A vendor field wider than `MAX_FIELD_BYTES` is refused **before** anything reads it, whichever of the ten fields it is | `core::vendor::an_over_wide_field_is_refused_whichever_field_it_is` | ✓ |
+| I-17 | The width bound is the first byte that is too many and not one before, and it never substitutes for the parsers below it | `core::vendor::the_bound_is_the_first_byte_that_is_too_many_and_not_one_before` | ✓ |
+| I-18 | The widest value measured in either real master still passes the width gate untouched | `core::vendor::a_row_of_ordinary_width_passes_the_gate_untouched` | ✓ |
+| I-19 | The width gate runs before the test-marker scan and does not shadow it | `core::vendor::the_test_marker_scan_still_declines_a_real_test_listing` | ✓ |
+| I-20 | A master larger than the reader holds is refused from its size, before it is read into memory | `api::master::a_master_larger_than_this_reader_holds_is_refused_before_it_is_read` | ✓ |
+| I-21 | A row longer than the reader splits is named at its line number and never split | `api::master::a_row_longer_than_this_reader_splits_is_named_and_never_split` | ✓ |
+| I-22 | An over-wide field makes the row an error that names the field; it is never a silent keep | `api::master::a_field_wider_than_core_will_read_is_an_error_and_not_a_silent_keep` | ✓ |
 
 ## The equity gate after D-0025, and the refusal after D-0026
 

@@ -175,13 +175,55 @@ impl Columns {
     }
 }
 
+/// The largest master file this reader will pull into memory.
+///
+/// [`load`] reads the whole file before it looks at a single row, which is a
+/// deliberate choice — the masters are read once at startup and a streaming
+/// reader would buy nothing — but it was previously *unbounded*, so the size of
+/// the allocation was whatever the vendor happened to serve.
+///
+/// Measured 2026-08-01: the real files are 33,990,514 B (Dhan, 200,461 rows)
+/// and 19,224,497 B (Groww, 133,379 rows). 256 MiB is 7.9× the larger, which
+/// leaves room for years of listing growth and still refuses a file that is
+/// not a master at all. The refusal names the size, so an operator who
+/// legitimately outgrows this sees the number rather than an out-of-memory
+/// kill. D-0033.
+pub const MAX_MASTER_BYTES: u64 = 256 * 1024 * 1024;
+
+/// The longest single row this reader will split.
+///
+/// A row is split into a `Vec<&str>` before any field is examined, so an
+/// unbounded row is an unbounded allocation *and* an unbounded number of
+/// fields, both paid before [`decode_master_row`]'s own width gate is reached.
+///
+/// Measured 2026-08-01 over both real masters: the longest row is 486 bytes
+/// (Dhan, 33 columns) and 269 bytes (Groww, 21 columns). 4,096 is 8.4× the
+/// larger. A row above it is reported at its line number like any other
+/// unreadable row — never dropped, never truncated and read anyway.
+pub const MAX_ROW_BYTES: usize = 4096;
+
 /// Reads a vendor master and decodes every row.
 ///
 /// # Errors
 ///
 /// A message naming what was wrong with the file itself — unreadable, empty,
-/// or missing a required column.
+/// larger than [`MAX_MASTER_BYTES`], or missing a required column.
 pub fn load(path: &std::path::Path, vendor: Vendor) -> Result<Loaded, String> {
+    // THE SIZE IS CHECKED BEFORE THE READ, NOT AFTER.
+    //
+    // `read_to_string` on a file this process cannot hold is not an error it
+    // can report -- it is an allocator failure or an OOM kill, and neither
+    // reaches the operator as "the master is too big". One `metadata` call is
+    // the difference between a named refusal and a dead process.
+    let size = std::fs::metadata(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?
+        .len();
+    if size > MAX_MASTER_BYTES {
+        return Err(format!(
+            "{}: {size} bytes; this reader holds at most {MAX_MASTER_BYTES}",
+            path.display()
+        ));
+    }
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut lines = text.lines();
     let header = lines.next().ok_or_else(|| "file is empty".to_owned())?;
@@ -191,6 +233,19 @@ pub fn load(path: &std::path::Path, vendor: Vendor) -> Result<Loaded, String> {
     let mut out = Loaded::default();
     for (n, line) in lines.enumerate() {
         if line.is_empty() {
+            continue;
+        }
+        // BEFORE THE SPLIT, NOT AFTER. `split(',').collect()` allocates one
+        // pointer pair per comma, and `decode_master_row`'s own width gate
+        // cannot run until that vector exists. `str::len` is a field read.
+        if line.len() > MAX_ROW_BYTES {
+            out.errors.push((
+                n + 2,
+                format!(
+                    "row is {} bytes; this reader splits at most {MAX_ROW_BYTES}",
+                    line.len()
+                ),
+            ));
             continue;
         }
         let f: Vec<&str> = line.split(',').collect();
@@ -504,6 +559,101 @@ mod tests {
             load(&p, Vendor::Groww)
                 .expect_err("empty")
                 .contains("empty")
+        );
+        // A file whose SIZE is fine but whose BYTES are not text. `metadata`
+        // succeeds and the read is what fails, so both refusal arms are real.
+        let raw = std::env::temp_dir().join("brutex-master-notutf8.csv");
+        std::fs::File::create(&raw)
+            .expect("create")
+            .write_all(&[0xFF, 0xFE, 0x00, 0x41])
+            .expect("write");
+        assert!(load(&raw, Vendor::Groww).is_err());
+    }
+
+    #[test]
+    fn a_master_larger_than_this_reader_holds_is_refused_before_it_is_read() {
+        // `read_to_string` on a file this process cannot hold is not an error
+        // it can report -- it is an OOM kill. The size is checked first, and
+        // the refusal names the number so an operator who legitimately outgrows
+        // the bound is told what to raise rather than losing the process.
+        //
+        // Sparse: `set_len` allocates no blocks, so this costs no disk. The
+        // file is never read -- the refusal happens before `read_to_string`,
+        // which is exactly the property under test.
+        let p = std::env::temp_dir().join("brutex-master-toobig.csv");
+        let f = std::fs::File::create(&p).expect("create");
+        f.set_len(MAX_MASTER_BYTES + 1).expect("set_len");
+        drop(f);
+        let err = load(&p, Vendor::Groww).expect_err("refused");
+        assert!(
+            err.contains(&(MAX_MASTER_BYTES + 1).to_string())
+                && err.contains(&MAX_MASTER_BYTES.to_string()),
+            "the refusal names both numbers: {err}"
+        );
+        // Exactly at the bound is not over it.
+        f_at_bound(&p);
+        std::fs::remove_file(&p).expect("cleanup");
+    }
+
+    /// A file of exactly [`MAX_MASTER_BYTES`] is refused for being empty of
+    /// columns, not for its size — the boundary is `>` and not `>=`.
+    fn f_at_bound(p: &std::path::Path) {
+        let f = std::fs::File::create(p).expect("create");
+        f.set_len(MAX_MASTER_BYTES).expect("set_len");
+        drop(f);
+        let err = load(p, Vendor::Groww).expect_err("still refused, for another reason");
+        assert!(
+            !err.contains("this reader holds at most"),
+            "the size arm fired at the bound itself: {err}"
+        );
+    }
+
+    #[test]
+    fn a_row_longer_than_this_reader_splits_is_named_and_never_split() {
+        // `split(',').collect()` allocates one pointer pair per comma, and
+        // `decode_master_row`'s own width gate cannot run until that vector
+        // exists. So the row length is bounded BEFORE the split, and the row is
+        // reported at its line number like any other unreadable row -- never
+        // dropped, never truncated and read anyway.
+        let long = "X".repeat(MAX_ROW_BYTES + 1);
+        let body = format!(
+            "exchange,segment,underlying_symbol,trading_symbol,instrument_type,\
+             series,isin,expiry_date,strike_price\n\
+             NSE,CASH,,{long},EQ,EQ,INE002A01018,,\n\
+             NSE,CASH,,RELIANCE,EQ,EQ,INE002A01018,,\n"
+        );
+        let got = load(&tmp("longrow", &body), Vendor::Groww).expect("loads");
+        assert_eq!(got.kept.len(), 1, "the intact row still decodes");
+        assert_eq!(got.errors.len(), 1);
+        assert_eq!(got.errors[0].0, 2, "the line is named");
+        let reason = &got.errors[0].1;
+        assert!(
+            reason.contains("row is") && reason.contains(&MAX_ROW_BYTES.to_string()),
+            "got {reason}"
+        );
+    }
+
+    #[test]
+    fn a_field_wider_than_core_will_read_is_an_error_and_not_a_silent_keep() {
+        // The row that shipped before D-0033: a legitimate `underlying_symbol`
+        // and an enormous `trading_symbol`, which is scanned by TEST_MARKERS
+        // and then never becomes the identity. It used to be KEPT.
+        let wide = "X".repeat(brutex_core::vendor::MAX_FIELD_BYTES + 1);
+        let body = format!(
+            "exchange,segment,underlying_symbol,trading_symbol,instrument_type,\
+             series,isin,expiry_date,strike_price\n\
+             NSE,CASH,RELIANCE,{wide},EQ,EQ,INE002A01018,,\n"
+        );
+        let got = load(&tmp("widefield", &body), Vendor::Groww).expect("loads");
+        assert!(got.kept.is_empty(), "an over-wide row is never stored");
+        assert_eq!(got.errors.len(), 1);
+        // Bound rather than called inside the failure message: a call there is
+        // a region that only runs when the assertion FAILS, so no passing test
+        // can ever cover it.
+        let reason = &got.errors[0].1;
+        assert!(
+            reason.contains("trading_symbol"),
+            "the offending field is named: {reason}"
         );
     }
 

@@ -1084,14 +1084,168 @@ impl Universe {
 #[must_use]
 pub fn of_equity(symbol: &str) -> Universe {
     let mut u = Universe::NONE;
-    if FNO_UNDERLYINGS.binary_search(&symbol).is_ok() {
+    if FNO_INDEX.contains(symbol) {
         u = u.union(Universe::FNO);
     }
-    if NIFTY_TOTAL_MARKET.binary_search(&symbol).is_ok() {
+    if NTM_INDEX.contains(symbol) {
         u = u.union(Universe::TOTAL_MARKET);
     }
     u
 }
+
+/// An open-addressed membership table, built at compile time.
+///
+/// # Why not `binary_search`
+///
+/// `binary_search` over 750 entries is ~10 comparisons — O(log n) wearing an
+/// O(1) label. It is fast, and it is not constant: doubling the list adds a
+/// comparison. `docs/06-limits.md` recorded it as the one lookup in the engine
+/// that grows with its input.
+///
+/// # Why not a `HashSet`
+///
+/// `core` declares no dependency at all (CI gate 9), so there is no hashing
+/// crate available, and `std::collections::HashSet` cannot be built in a
+/// `const` — it would need lazy initialisation, a lock on first use, and a
+/// runtime allocation for a set whose contents are known when the file is
+/// compiled.
+///
+/// # What this is
+///
+/// A power-of-two table of `Option<&str>` filled by linear probing at compile
+/// time. Lookup hashes once, masks, and probes. The table is sized so it is at
+/// most half full, which bounds the probe length: with 750 entries in 2048
+/// slots the expected probe is under 1.5 and the worst observed is asserted by
+/// a test, so the bound is measured rather than assumed.
+///
+/// Costs one pointer per slot — 32 KiB for the larger table. That is the space
+/// traded for the time, and it is constant rather than growing with the data.
+pub struct MemberIndex<const N: usize> {
+    slots: [Option<&'static str>; N],
+}
+
+impl<const N: usize> MemberIndex<N> {
+    /// Builds the table at compile time from a list of members.
+    ///
+    /// # Panics
+    ///
+    /// At COMPILE time if the table cannot hold the list — a `const` panic is
+    /// a build error, not a runtime one, so an over-full table can never ship.
+    #[must_use]
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "both indices are provably in range: `i` is bounded by the \
+                  loop condition `i < members.len()`, and `at` comes from \
+                  `mask`, which masks to N-1 and so cannot reach N. A `const \
+                  fn` cannot use `.get()` on a slice of references anyway, and \
+                  an out-of-range index here would be a COMPILE error, not a \
+                  runtime panic."
+    )]
+    pub const fn build(members: &[&'static str]) -> Self {
+        assert!(
+            members.len() * 2 <= N,
+            "the table must stay at most half full so probing stays bounded"
+        );
+        let mut slots = [None; N];
+        let mut i = 0;
+        while i < members.len() {
+            let mut at = mask(fnv1a(members[i]), N);
+            // Linear probing. Terminates because the table is at most half
+            // full, which the assert above guarantees.
+            while slots[at].is_some() {
+                at = (at + 1) & (N - 1);
+            }
+            slots[at] = Some(members[i]);
+            i += 1;
+        }
+        Self { slots }
+    }
+
+    /// Whether the table holds this symbol.
+    ///
+    /// Hash, mask, probe. The probe stops at the first empty slot, which exists
+    /// because the table is at most half full.
+    #[must_use]
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "`at` comes from `mask`, which masks to N-1, so it cannot \
+                  reach N. The probe advances by the same mask, so it stays in \
+                  range for every iteration."
+    )]
+    pub fn contains(&self, symbol: &str) -> bool {
+        let mut at = mask(fnv1a(symbol), N);
+        while let Some(held) = self.slots[at] {
+            if held == symbol {
+                return true;
+            }
+            at = (at + 1) & (N - 1);
+        }
+        false
+    }
+
+    /// How many members the table holds.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.slots.iter().filter(|s| s.is_some()).count()
+    }
+
+    /// Whether the table is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Folds a hash into a slot index for a table of `n` slots.
+///
+/// Masks in `u64` and casts afterwards, never the reverse: casting first would
+/// truncate on a 32-bit pointer target before the mask could narrow it. After
+/// the mask the value is at most `n - 1`, which fits any pointer width this
+/// engine builds for.
+const fn mask(hash: u64, n: usize) -> usize {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the mask has already reduced the value to at most n-1, and n \
+                  is a compile-time table size far below u32::MAX, so the cast \
+                  is exact on every target."
+    )]
+    {
+        (hash & (n as u64 - 1)) as usize
+    }
+}
+
+/// FNV-1a over the bytes of a symbol.
+///
+/// Chosen because it is four lines, has no dependency, and is `const` — the
+/// tables below are built by the compiler, not on first use. It is not
+/// collision-resistant and does not need to be: the table stores the full
+/// string and compares it, so a collision costs one extra probe rather than a
+/// wrong answer.
+#[must_use]
+#[expect(
+    clippy::indexing_slicing,
+    reason = "`i` is bounded by the loop condition `i < bytes.len()`. A `const \
+              fn` cannot use an iterator over a slice, and an out-of-range \
+              index in a const context is a COMPILE error rather than a \
+              runtime panic."
+)]
+pub const fn fnv1a(s: &str) -> u64 {
+    let bytes = s.as_bytes();
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut i = 0;
+    while i < bytes.len() {
+        hash ^= bytes[i] as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        i += 1;
+    }
+    hash
+}
+
+/// The F&O underlyings, indexed. 213 members in 1024 slots.
+pub static FNO_INDEX: MemberIndex<1024> = MemberIndex::build(&FNO_UNDERLYINGS);
+
+/// The NIFTY Total Market constituents, indexed. 750 members in 2048 slots.
+pub static NTM_INDEX: MemberIndex<2048> = MemberIndex::build(&NIFTY_TOTAL_MARKET);
 
 /// The universes a merged instrument belongs to.
 ///
@@ -1122,6 +1276,118 @@ pub fn of_instrument(key: &InstrumentKey) -> Universe {
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_table_builder_is_exercised_at_runtime_not_only_at_compile_time() {
+        // `MemberIndex::build` is a `const fn` and the two real tables are
+        // `static`, so the compiler evaluates it and the runtime coverage
+        // instrumentation never sees a single line of it. Code that runs at
+        // build time is code no test can enter — which is the same hole as an
+        // unreachable branch, arriving by a different route.
+        //
+        // Calling it here, in a non-const context, instruments it.
+        let idx: MemberIndex<8> = MemberIndex::build(&["A", "BB", "CCC"]);
+        assert_eq!(idx.len(), 3);
+        assert!(!idx.is_empty());
+        assert!(idx.contains("A") && idx.contains("BB") && idx.contains("CCC"));
+        assert!(!idx.contains("D"));
+
+        // An empty table: every probe hits the first empty slot immediately.
+        let empty: MemberIndex<4> = MemberIndex::build(&[]);
+        assert!(empty.is_empty());
+        assert_eq!(empty.len(), 0);
+        assert!(!empty.contains("anything"));
+
+        // A FULL-to-the-limit table still probes correctly. Two slots of four
+        // is the most `build` permits, and it is where clustering is worst.
+        let tight: MemberIndex<4> = MemberIndex::build(&["X", "Y"]);
+        assert!(tight.contains("X") && tight.contains("Y"));
+        assert!(!tight.contains("Z"));
+    }
+
+    #[test]
+    fn the_index_holds_every_member_and_nothing_else() {
+        // Exhaustive: every one of the 963 members must be found, and the
+        // tables must hold exactly as many as the lists do -- a collision that
+        // silently dropped a member would leave an instrument permanently
+        // outside its own universe.
+        for m in NIFTY_TOTAL_MARKET {
+            assert!(NTM_INDEX.contains(m), "{m} is a Total Market constituent");
+        }
+        for m in FNO_UNDERLYINGS {
+            assert!(FNO_INDEX.contains(m), "{m} is an F&O underlying");
+        }
+        assert_eq!(NTM_INDEX.len(), NIFTY_TOTAL_MARKET.len());
+        assert_eq!(FNO_INDEX.len(), FNO_UNDERLYINGS.len());
+        assert!(!NTM_INDEX.is_empty() && !FNO_INDEX.is_empty());
+
+        for absent in ["", "ZZZZNOTREAL", "NIFT", "RELIANCEX", "  ", "nifty"] {
+            assert!(!NTM_INDEX.contains(absent), "{absent:?} is not a member");
+            assert!(!FNO_INDEX.contains(absent), "{absent:?} is not a member");
+        }
+    }
+
+    #[test]
+    fn the_probe_length_is_bounded_which_is_what_makes_it_o1() {
+        // THE CLAIM UNDER TEST. `binary_search` cost ~10 comparisons and grew
+        // with the list; this must not grow at all. Measured by walking the
+        // table the same way `contains` does and counting the steps.
+        //
+        // The bound is asserted as a NUMBER, not as "small": a probe length
+        // that crept up with a future member would otherwise pass silently.
+        fn worst_probe<const N: usize>(idx: &MemberIndex<N>, members: &[&str]) -> usize {
+            let mut worst = 0;
+            for m in members {
+                let start = mask(fnv1a(m), N);
+                let mut at = start;
+                let mut steps = 1;
+                while let Some(held) = idx.slots[at] {
+                    if held == *m {
+                        break;
+                    }
+                    at = (at + 1) & (N - 1);
+                    steps += 1;
+                }
+                worst = worst.max(steps);
+            }
+            worst
+        }
+
+        let ntm = worst_probe(&NTM_INDEX, &NIFTY_TOTAL_MARKET);
+        let fno = worst_probe(&FNO_INDEX, &FNO_UNDERLYINGS);
+        assert!(
+            ntm <= 8,
+            "750 in 2048 slots must probe at most 8 times, got {ntm}"
+        );
+        assert!(
+            fno <= 8,
+            "213 in 1024 slots must probe at most 8 times, got {fno}"
+        );
+        println!("worst probe: NTM {ntm}, FNO {fno}");
+    }
+
+    #[test]
+    fn the_hash_is_deterministic_and_the_tables_stay_half_empty() {
+        // Determinism: the same symbol must hash the same way in every process,
+        // or a stored result and a fresh one would disagree (§3 rule 5).
+        assert_eq!(fnv1a("RELIANCE"), fnv1a("RELIANCE"));
+        assert_ne!(fnv1a("RELIANCE"), fnv1a("RELIANCF"));
+        assert_ne!(fnv1a(""), fnv1a("A"));
+        // The empty string still hashes -- the FNV offset basis, not zero.
+        assert_ne!(fnv1a(""), 0);
+
+        // Half-empty is what bounds the probe. `build` asserts this at COMPILE
+        // time; asserted again here so the reason is visible where the property
+        // is used rather than only where it is enforced.
+        assert!(NIFTY_TOTAL_MARKET.len() * 2 <= 2048);
+        assert!(FNO_UNDERLYINGS.len() * 4 <= 1024);
+
+        // mask never exceeds the table.
+        for h in [0, 1, u64::MAX, 0xcbf2_9ce4_8422_2325] {
+            assert!(mask(h, 2048) < 2048);
+            assert!(mask(h, 1024) < 1024);
+        }
+    }
 
     #[test]
     fn both_lists_are_sorted_and_unique_so_binary_search_is_valid() {

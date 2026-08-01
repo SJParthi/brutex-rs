@@ -16,7 +16,7 @@ use brutex_core::symbol::{SYMBOL_CAPACITY, Symbol};
 use brutex_core::vendor::Vendor;
 
 use store::block;
-use store::crc::{CHECK_VALUE, crc32c};
+use store::crc::{CHECK_VALUE, crc32c, crc32c_split};
 use store::format::{
     BLOCK_LEN, Bar, FLAG_CHECKSUMS, FORMAT_VERSION, FormatError, HEADER_LEN, MAGIC, MAGIC_FAMILY,
     MAX_SLOT_COUNT, OI_NULL, RECORD_STRIDE, RECORDS_PER_BLOCK, RETIRED_VERSIONS, SLOT_COUNT,
@@ -33,17 +33,148 @@ use store::path::{
 // The checksum
 // ===========================================================================
 
+/// [`BLOCK_LEN`] as a length, for building test inputs of exactly one block.
+const BLOCK_LEN_USIZE: usize = 4088;
+const _: () = assert!(BLOCK_LEN_USIZE as u64 == BLOCK_LEN);
+
 #[test]
 fn the_crc_matches_the_published_check_value() {
     // The check value is published beside the polynomial; this compares the
     // implementation against it, not the other way round.
-    assert_eq!(crc32c(*b"123456789"), CHECK_VALUE);
+    assert_eq!(crc32c(b"123456789"), CHECK_VALUE);
     assert_eq!(CHECK_VALUE, 0xE306_9283);
     // The empty input is the initial value inverted, and one byte differs from
     // it -- so the loop body runs and is not skipped.
-    assert_eq!(crc32c([]), 0);
-    assert_ne!(crc32c([0u8]), 0);
-    assert_ne!(crc32c([0u8]), crc32c([1u8]));
+    assert_eq!(crc32c(&[]), 0);
+    assert_ne!(crc32c(&[0u8]), 0);
+    assert_ne!(crc32c(&[0u8]), crc32c(&[1u8]));
+}
+
+/// `0..n`, the input every ladder vector below is taken over.
+fn seq(n: usize) -> Vec<u8> {
+    (0..n).map(|i| u8::try_from(i % 256).unwrap()).collect()
+}
+
+/// `i % 251` — a stride coprime with 8 and with 256, so no lane of the
+/// slice-by-8 kernel ever sees a repeating byte pattern aligned to its width.
+fn ramp(n: usize) -> Vec<u8> {
+    (0..n).map(|i| u8::try_from(i % 251).unwrap()).collect()
+}
+
+#[test]
+fn the_crc_reproduces_a_hardcoded_value_at_every_length_that_can_break() {
+    // WHY THIS TEST EXISTS. Until D-0032 the only value pinned anywhere in the
+    // repository was `b"123456789"` -- NINE bytes. Every other checksum test is
+    // a round trip (`seal` then `verify`, `reseal` then `decode`), and a round
+    // trip passes under ANY deterministic function. A kernel that consumes
+    // eight bytes at a time and gets the recombination wrong is correct on
+    // every input shorter than its stride, so the old set could not have
+    // detected a wrong fast path on a single real store input: the shortest
+    // thing this store checksums is a 60-byte header domain and the commonest
+    // is a 4,088-byte block.
+    //
+    // The constants below are NOT read out of this implementation. They were
+    // produced independently -- by two engines written from the polynomial's
+    // published normal form 0x1EDC_6F41 and by its reflected 256-entry table --
+    // and they agree with the published check value at 9 bytes. CLAUDE.md S2
+    // forbids a tracked binary fixture, so a Rust constant is the only place a
+    // golden value can live.
+    //
+    // The ladder is chosen at the boundaries a wide kernel breaks on: below
+    // one stride, exactly one stride, the two lengths either side of it, the
+    // header domain, a full block, and a block either side of exact.
+    let cases: [(Vec<u8>, u32); 15] = [
+        (Vec::new(), 0x0000_0000),
+        (b"123456789".to_vec(), 0xE306_9283),
+        (vec![0x00], 0x527D_5351),
+        (vec![0xFF], 0xFF00_0000),
+        (seq(8), 0x8A2C_BC3B),
+        (seq(15), 0x68EF_03F6),
+        (seq(16), 0xD9C9_08EB),
+        (seq(56), 0x01FD_9F28),
+        (seq(60), 0x3F69_148B),
+        (seq(64), 0xFB6D_36EB),
+        (ramp(BLOCK_LEN_USIZE - 1), 0xF723_9185),
+        (ramp(BLOCK_LEN_USIZE), 0x703C_26F3),
+        (ramp(BLOCK_LEN_USIZE + 1), 0x7991_B685),
+        // The lost-write case block.rs exists for: a freshly allocated extent
+        // reads as zeros, and every field in it is "sane".
+        (vec![0x00; BLOCK_LEN_USIZE], 0x07B4_FA1C),
+        (vec![0xFF; BLOCK_LEN_USIZE], 0x8547_5C61),
+    ];
+    for (input, want) in cases {
+        assert_eq!(
+            crc32c(&input),
+            want,
+            "length {} disagrees with its golden value",
+            input.len()
+        );
+    }
+}
+
+/// The bit-by-bit kernel this store ran until D-0032, kept as a reference.
+///
+/// It is deliberately the SLOW shape: one bit at a time, no table, nothing
+/// shared with the implementation it checks. Two kernels that agree on
+/// randomised input for every length across a stride boundary is the evidence
+/// the fast one is not merely fast.
+fn crc32c_reference(bytes: &[u8]) -> u32 {
+    const POLYNOMIAL: u32 = 0x82F6_3B78;
+    let mut crc = u32::MAX;
+    for &byte in bytes {
+        crc ^= u32::from(byte);
+        for _ in 0..8u8 {
+            let mask = 0u32.wrapping_sub(crc & 1);
+            crc = (crc >> 1) ^ (POLYNOMIAL & mask);
+        }
+    }
+    !crc
+}
+
+#[test]
+fn the_fast_kernel_agrees_with_a_bit_by_bit_reference_on_every_length() {
+    // CI runs on x86_64 and the operator's machine is aarch64. This kernel is
+    // ONE body on both -- no `target_arch`, no `target_feature`, no runtime
+    // detection -- so this comparison is the same comparison on both hosts, and
+    // what CI measures is what the operator runs. See D-0032.
+    //
+    // xorshift64 rather than a dependency: the sequence has to be identical on
+    // every machine and every run, or a failure is not reproducible.
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    // Every length from empty to two full strides plus a tail, then a spread of
+    // longer ones including the block size.
+    let lengths = (0..=24usize).chain([55, 56, 57, 59, 60, 61, 63, 64, 65, 4087, 4088, 4089]);
+    for n in lengths {
+        let data: Vec<u8> = (0..n)
+            .map(|_| u8::try_from(next() >> 56).unwrap())
+            .collect();
+        assert_eq!(
+            crc32c(&data),
+            crc32c_reference(&data),
+            "the fast kernel and the reference disagree at length {n}"
+        );
+    }
+}
+
+#[test]
+fn splitting_the_input_anywhere_gives_the_same_checksum() {
+    // What the header slot depends on: its domain is discontiguous, so the
+    // split entry point has to be the same computation as the whole.
+    let whole = ramp(137);
+    for cut in 0..=whole.len() {
+        let (head, tail) = whole.split_at(cut);
+        assert_eq!(
+            crc32c_split(head, tail),
+            crc32c(&whole),
+            "splitting at {cut} changed the answer"
+        );
+    }
 }
 
 // ===========================================================================
@@ -497,14 +628,47 @@ fn commits_alternate_between_the_slots() {
 /// The checksum covers every byte of the slot except the four it occupies, so
 /// this is the same two ranges the decoder reads.
 fn reseal(slot: &mut [u8; SLOT_LEN]) {
-    let crc = crc32c(
-        slot.iter()
-            .take(56)
-            .chain(slot.iter().skip(60))
-            .copied()
-            .collect::<Vec<u8>>(),
-    );
+    let crc = crc32c_split(&slot[..56], &slot[60..]);
     slot[56..60].copy_from_slice(&crc.to_le_bytes());
+}
+
+#[test]
+fn the_covered_domain_is_the_slot_minus_its_checksum() {
+    // WHAT THIS PINS, AND WHY IT IS NOT A ROUND TRIP. The domain is 60 bytes
+    // with a four-byte hole in the middle. The obvious simplification when a
+    // kernel wants one contiguous buffer is to zero the checksum field and
+    // cover all 64 bytes -- a DIFFERENT number over a DIFFERENT domain. Every
+    // round-trip test in this file would still pass, because `reseal`
+    // recomputes with whatever the domain has become; only a hardcoded value
+    // can catch it. D-0032.
+    let slot = genesis_slot();
+    let stored = u32::from_le_bytes(slot[56..60].try_into().unwrap());
+
+    let gathered: Vec<u8> = slot
+        .iter()
+        .take(56)
+        .chain(slot.iter().skip(60))
+        .copied()
+        .collect();
+    assert_eq!(gathered.len(), 60);
+    assert_eq!(
+        crc32c(&gathered),
+        stored,
+        "the header covers 0..56 || 60..64"
+    );
+
+    // The shortcut, spelled out so its answer is on the record as different.
+    let mut filled = slot;
+    filled[56..60].copy_from_slice(&[0u8; 4]);
+    assert_ne!(
+        crc32c(&filled),
+        stored,
+        "covering all 64 bytes with the field zeroed is a different domain"
+    );
+
+    // And an independent value for a 60-byte input, so the domain's LENGTH is
+    // pinned to a constant rather than to whatever the slot happens to hold.
+    assert_eq!(crc32c(&seq(60)), 0x3F69_148B);
 }
 
 fn genesis_slot() -> [u8; SLOT_LEN] {

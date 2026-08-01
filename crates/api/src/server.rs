@@ -715,13 +715,32 @@ fn reported(dir: &Path) -> u8 {
 /// Returns the exit code as a number rather than calling `exit`, so the whole
 /// thing — every arm of it — is callable from a test.
 pub async fn run(args: &[String], shutdown: Shutdown) -> u8 {
-    let dir = masters_dir();
+    run_in(&masters_dir(), args, shutdown).await
+}
+
+/// [`run`], over a directory the caller names.
+///
+/// Split for the same reason [`masters_dir_from`] and [`reported`] are split,
+/// and for a reason found the hard way. With the directory read inside this
+/// function, the only test that could reach the `Report` arm had to call the
+/// real entry point, which read `$HOME/.brutex/masters` — so on the operator's
+/// machine the test parsed 53 MB of real vendor CSV and returned `OK`, and on a
+/// CI runner with an empty `HOME` the same test returned `DEGRADED`. Its
+/// assertions were written to survive both (`assert_ne!(code, FAILED)`,
+/// `assert_ne!(code, MISUSED)`), and since [`reported`] returns only `OK` or
+/// `DEGRADED`, **no input, machine or environment could ever falsify them** —
+/// a mutant pinning `reported` to `OK` survived. CLAUDE.md §4 bans a test that
+/// asserts nothing; §3 rule 5 wants the same inputs to give the same outputs.
+///
+/// Taking the directory as an argument makes the answer a property of the
+/// files, which a test owns, rather than of the machine, which it does not.
+async fn run_in(dir: &Path, args: &[String], shutdown: Shutdown) -> u8 {
     match Command::parse(args) {
-        Ok(Command::Report) => reported(&dir),
+        Ok(Command::Report) => reported(dir),
         Ok(Command::Serve(addr)) => match tokio::net::TcpListener::bind(addr).await {
             Ok(listener) => {
                 println!("brutex-rs api listening on http://{addr}/instruments");
-                stopped(serve(listener, router(Loaded::new(universe(&dir))), shutdown).await)
+                stopped(serve(listener, router(Loaded::new(universe(dir))), shutdown).await)
             }
             Err(e) => {
                 eprintln!("cannot bind {addr}: {e}");
@@ -1497,28 +1516,35 @@ mod tests {
 
     #[tokio::test]
     async fn run_reports_and_refuses_nonsense_with_different_codes() {
-        // `run` reads BRUTEX_MASTERS, and a test cannot set it -- `set_var` is
-        // unsafe under edition 2024 and this crate forbids unsafe.
+        // THE ASSERTIONS HERE USED TO BE UNFALSIFIABLE, and that is worth
+        // spelling out because it looked like caution. `run` read
+        // $HOME/.brutex/masters, which a test cannot set, so its answer was a
+        // property of the machine: OK on an operator's laptop where the real
+        // masters live, DEGRADED on a CI runner where they do not. The
+        // assertions were written to pass under both -- `!= FAILED` and
+        // `!= MISUSED` -- and `reported` returns ONLY OK or DEGRADED, so no
+        // input, machine or environment could ever have failed them. A mutant
+        // pinning `reported` to OK survived. That is a test that asserts
+        // nothing, which CLAUDE.md §4 bans outright.
         //
-        // So this test asserts only what it CONTROLS. It used to assert that
-        // `report` returns DEGRADED, on the premise that the working directory
-        // holds no master; that premise was always a property of the machine
-        // rather than of the code, and it stopped holding the moment the
-        // default moved to $HOME/.brutex/masters, where an operator's real
-        // masters live. A test whose expected value depends on whether the
-        // person running it has downloaded some files is not a test.
-        //
-        // `report` is exercised over a controlled directory by
-        // `a_report_names_every_vendor_and_says_whether_it_is_clean`, and
-        // end-to-end by `tests/binary.rs`, which CAN set the variable because
-        // it spawns a real child process.
-        // Two independent assertions rather than `a == OK || a == DEGRADED`:
-        // whichever side of that `||` is true on this machine, the other never
-        // evaluates, and an expression no test can reach is a region the 100%
-        // gate cannot cover.
-        let reported = run(&argv(&["report"]), fired()).await;
-        assert_ne!(reported, FAILED, "report ran; it did not fail to run");
-        assert_ne!(reported, MISUSED, "`report` is an understood command");
+        // `run_in` takes the directory, so the expected value is a property of
+        // the files, which this test owns. Exact codes, both arms, deterministic
+        // on every host.
+        assert_eq!(
+            run_in(&agreeing("runreport"), &argv(&["report"]), fired()).await,
+            OK,
+            "two masters that agree is a clean universe"
+        );
+        let missing = masters(
+            "runreportmissing",
+            Some(&format!("{GROWW_HEAD}NSE,CASH,,NIFTY,IDX,,NIFTY,,\n")),
+            None,
+        );
+        assert_eq!(
+            run_in(&missing, &argv(&["report"]), fired()).await,
+            DEGRADED,
+            "a vendor that was never read is a refused universe"
+        );
         assert_eq!(run(&argv(&["--wat"]), fired()).await, MISUSED);
         assert_ne!(DEGRADED, OK, "a refused universe is not a success");
         assert_ne!(DEGRADED, FAILED, "the run worked; its ANSWER is refused");

@@ -241,7 +241,16 @@ A file whose `flags` bit 0 is clear carries no sidecar, and a verification
 request against it is **refused** rather than answered — "verified" and "there
 was nothing to verify against" are different answers.
 
-Verification is O(1) per read: one block CRC, not a file scan.
+Verification is O(1) per read: one block CRC, not a file scan. Enforced by
+`docs/04-invariants.md` C-07 — sealing one block costs the same at 1×, 10× and
+100× the file's record count.
+
+**Read "O(1)" precisely.** The *operation* is constant because a block is a
+fixed 4,088 bytes; the CRC inside it still reads every one of them, and always
+will. Measured on an Apple M4 Pro after D-0032: 1,487.5 ns for the checksum,
+1,656.0 ns for `block::seal` end to end, 20.4 ns amortised over the 73 records a
+block covers. Before D-0032 the same seal cost 24,083.0 ns. `docs/06-limits.md`
+§14 carries the full numbers and states what is not claimed.
 
 ---
 

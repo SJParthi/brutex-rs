@@ -104,7 +104,7 @@
 //! returned `Header` is built from, and a copy that caught a write mid-flight
 //! fails that checksum rather than returning half of each.
 
-use crate::crc::crc32c;
+use crate::crc::crc32c_split;
 use crate::format::{FLAG_CHECKSUMS, FormatError, MAGIC_FAMILY, MAX_SLOTS, SLOT_LEN, SLOT_STRIDE};
 use crate::layout::Layout;
 
@@ -433,7 +433,8 @@ impl Header {
             return Err(FormatError::MagicVersionMismatch(format_version));
         }
         let stored = u32::from_le_bytes(le_bytes(&image, OFF_CRC));
-        let computed = crc32c(covered(&image));
+        let (head, tail) = covered(&image);
+        let computed = crc32c_split(&head, &tail);
         if stored != computed {
             return Err(FormatError::SlotChecksum { stored, computed });
         }
@@ -561,7 +562,8 @@ impl Header {
         for (dst, src) in out.iter_mut().zip(body) {
             *dst = src;
         }
-        let crc = crc32c(covered(&out));
+        let (head, tail) = covered(&out);
+        let crc = crc32c_split(&head, &tail);
         for (dst, src) in out.iter_mut().skip(OFF_CRC).zip(crc.to_le_bytes()) {
             *dst = src;
         }
@@ -644,15 +646,30 @@ fn whole_slots(region: &[u8]) -> u64 {
 /// can land in and be called clean. All 512 of them are walked by
 /// `store::fault::a_single_bit_flip_in_any_header_byte_is_detected`.
 ///
-/// Takes an array rather than a slice so the tail needs no length: after
-/// skipping to the reserved bytes there are exactly `SLOT_LEN - OFF_RESERVED`
-/// of them left, and a `take` that can never truncate is arithmetic no test
-/// could ever exercise.
-fn covered(slot: &[u8; SLOT_LEN]) -> impl Iterator<Item = u8> + '_ {
-    slot.iter()
-        .take(OFF_CRC)
-        .chain(slot.iter().skip(OFF_RESERVED))
-        .copied()
+/// **The domain is bytes `0..OFF_CRC` then `OFF_RESERVED..SLOT_LEN` — 60 bytes
+/// with a four-byte hole — and it is frozen.** Zero-filling the hole to get one
+/// contiguous 64-byte buffer is the tempting simplification and it is a
+/// *different number*: every slot already on disk would fail
+/// [`FormatError::SlotChecksum`], and by [`Header::read_region`] a failed slot
+/// checksum condemns the whole file. Because it is a change of domain rather
+/// than of algorithm, no round-trip test and no published check value would
+/// notice. `store::unit::the_covered_domain_is_the_slot_minus_its_checksum`
+/// pins it against a hardcoded constant.
+///
+/// Returns the two runs as owned arrays rather than as sub-slices because this
+/// workspace denies slice indexing, and 60 bytes copied once per header commit
+/// or decode is not on any path that repeats: the per-block checksum is the hot
+/// one, and it takes its bytes directly.
+fn covered(slot: &[u8; SLOT_LEN]) -> ([u8; OFF_CRC], [u8; SLOT_LEN - OFF_RESERVED]) {
+    let mut head = [0u8; OFF_CRC];
+    for (dst, src) in head.iter_mut().zip(slot.iter()) {
+        *dst = *src;
+    }
+    let mut tail = [0u8; SLOT_LEN - OFF_RESERVED];
+    for (dst, src) in tail.iter_mut().zip(slot.iter().skip(OFF_RESERVED)) {
+        *dst = *src;
+    }
+    (head, tail)
 }
 
 /// Reads `N` little-endian bytes at `offset`.
