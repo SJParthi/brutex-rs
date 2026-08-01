@@ -582,6 +582,89 @@ pub fn instruments_html_from(
     })
 }
 
+/// The dashboard.
+///
+/// Every figure is a counter already in memory. Nothing here scans, so the page
+/// costs the same whether the store holds two instruments or two hundred
+/// thousand — which is the whole point of `docs/04-invariants.md` C-01.
+async fn home(
+    axum::extract::State(read): axum::extract::State<Loaded>,
+) -> axum::response::Html<String> {
+    axum::response::Html(dashboard_html(&read))
+}
+
+/// The dashboard, from a universe already loaded.
+#[must_use]
+pub fn dashboard_html(read: &Read) -> String {
+    let tracked = |u: Universe| u.contains(Universe::TOTAL_MARKET) || u.contains(Universe::INDEX);
+    let counts = read
+        .merged
+        .by_key
+        .values()
+        .filter(|e| tracked(e.universe))
+        .fold((0usize, 0usize, 0usize, 0usize), |(a, f, t, i), e| {
+            (
+                a + 1,
+                f + usize::from(e.universe.contains(Universe::FNO)),
+                t + usize::from(e.universe.contains(Universe::TOTAL_MARKET)),
+                i + usize::from(e.universe.contains(Universe::INDEX)),
+            )
+        });
+    let both = read
+        .merged
+        .by_key
+        .values()
+        .filter(|e| {
+            tracked(e.universe)
+                && e.vendors.contains(Vendor::Groww)
+                && e.vendors.contains(Vendor::Dhan)
+        })
+        .count();
+    let disputes = read.merged.conflicts.len() + read.merged.eligibility.len();
+
+    let (all, fno, ntm, idx) = counts;
+    let n = |v: usize| v.to_string();
+    let stats = [
+        render::Stat {
+            label: "Tracked",
+            value: &n(all),
+            note: "NIFTY Total Market + indices",
+            loud: false,
+        },
+        render::Stat {
+            label: "NIFTY Total Market",
+            value: &n(ntm),
+            note: "constituents",
+            loud: false,
+        },
+        render::Stat {
+            label: "F&O underlyings",
+            value: &n(fno),
+            note: "all inside Total Market",
+            loud: false,
+        },
+        render::Stat {
+            label: "Indices",
+            value: &n(idx),
+            note: "NSE index series",
+            loud: false,
+        },
+        render::Stat {
+            label: "Confirmed by both feeds",
+            value: &n(both),
+            note: "cross-checked identity",
+            loud: false,
+        },
+        render::Stat {
+            label: "Disagreements",
+            value: &n(disputes),
+            note: "identity + eligibility",
+            loud: disputes > 0,
+        },
+    ];
+    render::dashboard_page(read.status(), &stats, &read.notes)
+}
+
 /// The instruments page.
 async fn page(
     axum::extract::State(read): axum::extract::State<Loaded>,
@@ -631,7 +714,7 @@ pub type Loaded = std::sync::Arc<Read>;
 /// exists to remove.
 pub fn router(read: Loaded) -> axum::Router {
     axum::Router::new()
-        .route("/", axum::routing::get(page))
+        .route("/", axum::routing::get(home))
         .route("/instruments", axum::routing::get(page))
         .route("/health", axum::routing::get(health))
         .with_state(read)
@@ -1421,8 +1504,25 @@ mod tests {
             "a searched page still carries the notes: {page}"
         );
 
+        // `/` is the DASHBOARD, not a second copy of the instruments page.
+        // It carries the nav, so every other page is one click away, and its
+        // figures are counters rather than a row listing.
         let root = get(addr, "/").await;
-        assert!(root.contains("instruments total"));
+        assert!(root.contains("200 OK"));
+        assert!(root.contains("nav class"), "the dashboard carries the nav");
+        assert!(
+            root.contains("NIFTY Total Market"),
+            "the dashboard names the universes it counts: {root}"
+        );
+        assert!(
+            !root.contains("<tbody>"),
+            "the dashboard counts; it does not list rows"
+        );
+        // And the nav shows what is NOT built, rather than hiding it — a nav
+        // listing only what exists says nothing about what is coming, and one
+        // linking to a page that cannot answer is worse.
+        assert!(root.contains("Ingest"), "unbuilt pages are shown, disabled");
+        assert!(root.contains("lnk off"), "and marked as unbuilt");
 
         let missing = get(addr, "/nope").await;
         assert!(missing.contains("404"), "{missing}");

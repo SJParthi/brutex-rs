@@ -129,6 +129,28 @@ max-width:1180px;padding:0 20px;font-size:13.5px}\
 border:1px solid var(--line);background:var(--panel);transition:all .2s}\
 .pager a:hover{background:linear-gradient(135deg,var(--acc),var(--acc2));color:#fff;border-color:transparent}\
 .pager span{color:var(--dim);font-variant-numeric:tabular-nums}\
+nav.top{position:sticky;top:0;z-index:10;background:color-mix(in srgb,var(--panel) 88%,transparent);\
+backdrop-filter:blur(12px);border-bottom:1px solid var(--line)}\
+nav.top .inner{max-width:1180px;margin:0 auto;padding:0 20px;display:flex;align-items:center;gap:22px;height:56px}\
+nav.top .logo{font-weight:850;font-size:16px;letter-spacing:-.6px;text-decoration:none;color:var(--ink)}\
+nav.top .logo b{color:var(--acc)}\
+nav.top .links{display:flex;gap:4px;flex-wrap:wrap}\
+nav.top .lnk{padding:7px 13px;border-radius:9px;font-size:13.5px;font-weight:650;\
+text-decoration:none;color:var(--dim);transition:all .18s}\
+nav.top a.lnk:hover{color:var(--ink);background:color-mix(in srgb,var(--acc) 9%,transparent)}\
+nav.top .lnk.on{color:#fff;background:linear-gradient(135deg,var(--acc),var(--acc2))}\
+nav.top .lnk.off{opacity:.38;cursor:not-allowed}\
+nav.top .lnk.off:after{content:' ·';font-size:10px}\
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:13px;\
+max-width:1180px;margin:0 auto 18px;padding:0 20px}\
+.card{background:var(--panel);border:1px solid var(--line);border-radius:15px;padding:16px;\
+box-shadow:var(--sh);animation:rise .5s both;transition:transform .22s,box-shadow .22s}\
+.card:hover{transform:translateY(-4px);box-shadow:0 14px 34px rgba(16,24,40,.15)}\
+.card.loud{border-color:color-mix(in srgb,var(--bad) 45%,transparent)}\
+.ck{font-size:10.5px;font-weight:760;letter-spacing:.9px;text-transform:uppercase;color:var(--dim)}\
+.cv{font-size:29px;font-weight:850;letter-spacing:-1.5px;margin:5px 0 4px;font-variant-numeric:tabular-nums}\
+.card.loud .cv{color:var(--bad)}\
+.cn{font-size:11.5px;color:var(--dim)}\
 footer{margin:22px auto 0;max-width:1180px;padding:0 20px;color:var(--dim);font-size:12.5px;line-height:1.9}\
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}";
 
@@ -499,6 +521,116 @@ pub struct View<'a> {
     pub notes: &'a [String],
 }
 
+/// The navigation bar, on every page.
+///
+/// # Why unbuilt pages are shown rather than hidden
+///
+/// A nav that lists only what exists tells you nothing about what is coming;
+/// a nav that links to a page which does not answer is worse. These are
+/// rendered as disabled with the reason, so the shape of the system is visible
+/// and nothing lies about being ready.
+fn nav(current: &str) -> String {
+    let mut out = String::with_capacity(512);
+    out.push_str("<nav class=\"top\"><div class=\"inner\">");
+    out.push_str("<a class=\"logo\" href=\"/\">brutex<b>-rs</b></a><div class=\"links\">");
+    for (href, label, built) in [
+        ("/", "Dashboard", true),
+        ("/instruments", "Instruments", true),
+        ("/pull", "Ingest", false),
+        ("/store", "Store", false),
+        ("/runs", "Runs", false),
+    ] {
+        let on = if href == current { " on" } else { "" };
+        if built {
+            let _ = write!(out, "<a class=\"lnk{on}\" href=\"{href}\">{label}</a>");
+        } else {
+            let _ = write!(
+                out,
+                "<span class=\"lnk off\" title=\"not built yet\">{label}</span>"
+            );
+        }
+    }
+    out.push_str("</div></nav>");
+    out
+}
+
+/// One figure on the dashboard.
+#[derive(Debug, Clone, Copy)]
+pub struct Stat<'a> {
+    /// What it counts.
+    pub label: &'a str,
+    /// The count.
+    pub value: &'a str,
+    /// One line of context under it.
+    pub note: &'a str,
+    /// Whether this figure is a problem.
+    pub loud: bool,
+}
+
+/// The dashboard: what the engine knows, and what it does not.
+///
+/// Every figure is a counter already held in memory — nothing here scans, so
+/// the page costs the same whether the store holds two instruments or two
+/// hundred thousand.
+#[must_use]
+pub fn dashboard_page(status: &str, figures: &[Stat<'_>], notes: &[String]) -> String {
+    let mut body = String::with_capacity(2048);
+    body.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">");
+    body.push_str("<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">");
+    body.push_str("<title>brutex-rs · dashboard</title><style>");
+    body.push_str(STYLE);
+    body.push_str("</style></head><body>");
+    body.push_str(&nav("/"));
+    let _ = write!(
+        body,
+        "<h1>brutex-rs · {}</h1>\
+         <p class=\"sub\">A brute-force backtesting engine for NSE. \
+         Every figure below is a counter, not a scan.</p>",
+        escape(status)
+    );
+
+    body.push_str("<section class=\"cards\">");
+    for s in figures {
+        let cls = if s.loud { " loud" } else { "" };
+        let _ = write!(
+            body,
+            "<div class=\"card{cls}\"><div class=\"ck\">{}</div>\
+             <div class=\"cv\">{}</div><div class=\"cn\">{}</div></div>",
+            escape(s.label),
+            escape(s.value),
+            escape(s.note),
+        );
+    }
+    body.push_str("</section>");
+
+    let loud_count = notes
+        .iter()
+        .filter(|n| LOUD.iter().any(|w| n.contains(w)))
+        .count();
+    let open = if loud_count > 0 { " open" } else { "" };
+    let _ = write!(
+        body,
+        "<details class=\"notes\"{open}><summary>{} note{} · <b>{loud_count}</b> needing attention</summary><ul>",
+        notes.len(),
+        if notes.len() == 1 { "" } else { "s" },
+    );
+    for note in notes {
+        let loud = if LOUD.iter().any(|w| note.contains(w)) {
+            " class=\"loud\""
+        } else {
+            ""
+        };
+        let _ = write!(body, "<li{loud}>{}</li>", escape(note));
+    }
+    body.push_str("</ul></details>");
+
+    body.push_str(
+        "<footer>Rendered on the server. No JavaScript — CLAUDE.md section 2 \
+         does not permit it, and CI gate 1 enforces that.</footer></body></html>",
+    );
+    body
+}
+
 /// Renders a complete instruments page.
 ///
 /// `total` is the size of the whole universe, `rows` is only what this page
@@ -534,6 +666,7 @@ pub fn instruments_page(view: &View<'_>) -> String {
     body.push_str("</title><style>");
     body.push_str(STYLE);
     body.push_str("</style></head><body>");
+    body.push_str(&nav("/instruments"));
 
     // A search form. Method GET so the query lives in the URL and a result is
     // linkable and reloadable -- no JavaScript, no client state.
