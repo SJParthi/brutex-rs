@@ -129,6 +129,35 @@ max-width:1180px;padding:0 20px;font-size:13.5px}\
 border:1px solid var(--line);background:var(--panel);transition:all .2s}\
 .pager a:hover{background:linear-gradient(135deg,var(--acc),var(--acc2));color:#fff;border-color:transparent}\
 .pager span{color:var(--dim);font-variant-numeric:tabular-nums}\
+.hero{position:relative;overflow:hidden;padding:56px 0 46px;color:#fff;margin-bottom:26px;\
+background:linear-gradient(135deg,#1e1b4b 0%,#4338ca 44%,#0891b2 100%)}\
+.hero:before{content:'';position:absolute;inset:-45%;background:\
+radial-gradient(circle at 20% 30%,rgba(255,255,255,.18),transparent 40%),\
+radial-gradient(circle at 78% 68%,rgba(255,255,255,.13),transparent 38%);\
+animation:drift 22s ease-in-out infinite alternate}\
+@keyframes drift{to{transform:translate3d(5%,-5%,0) rotate(8deg)}}\
+.hero .hw{position:relative;max-width:1180px;margin:0 auto;padding:0 20px}\
+.eyebrow{display:flex;align-items:center;gap:10px;font-weight:800;font-size:12px;\
+letter-spacing:1.3px;opacity:.9}\
+.dot{width:9px;height:9px;border-radius:50%;background:#5eead4;animation:pulse 1.9s infinite}\
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(94,234,212,.7)}70%{box-shadow:0 0 0 14px rgba(94,234,212,0)}100%{box-shadow:0 0 0 0 rgba(94,234,212,0)}}\
+.hero h1{font-size:clamp(30px,5.4vw,48px);letter-spacing:-1.8px;font-weight:850;\
+margin:14px 0 12px;line-height:1.05;color:#fff;padding:0;max-width:none;\
+animation:rise .7s cubic-bezier(.2,.8,.2,1) both}\
+.lede{max-width:64ch;opacity:.93;font-size:16.5px;line-height:1.6;\
+animation:rise .7s .08s cubic-bezier(.2,.8,.2,1) both}\
+.badge{display:inline-block;margin-top:16px;padding:7px 16px;border-radius:99px;\
+font-size:12px;font-weight:850;letter-spacing:1px;text-transform:uppercase;\
+background:rgba(255,255,255,.16);backdrop-filter:blur(8px);\
+animation:rise .7s .16s cubic-bezier(.2,.8,.2,1) both}\
+.badge.good{background:rgba(52,211,153,.26);color:#a7f3d0}\
+.badge.bad{background:rgba(251,113,133,.26);color:#fecdd3}\
+.cbar{height:5px;border-radius:99px;background:var(--line);overflow:hidden;margin:8px 0 7px}\
+.cbar>span{display:block;height:100%;border-radius:99px;\
+background:linear-gradient(90deg,var(--acc),var(--acc2));\
+animation:fill 1.1s .3s cubic-bezier(.2,.8,.2,1) both}\
+.card.loud .cbar>span{background:linear-gradient(90deg,var(--bad),#fb7185)}\
+@keyframes fill{from{width:0!important}}\
 nav.top{position:sticky;top:0;z-index:10;background:color-mix(in srgb,var(--panel) 88%,transparent);\
 backdrop-filter:blur(12px);border-bottom:1px solid var(--line)}\
 nav.top .inner{max-width:1180px;margin:0 auto;padding:0 20px;display:flex;align-items:center;gap:22px;height:56px}\
@@ -521,6 +550,31 @@ pub struct View<'a> {
     pub notes: &'a [String],
 }
 
+/// Shortens a note that has become a list.
+///
+/// One note names 31 instruments inline. Rendered whole it fills the screen
+/// above the table in red and reads as wallpaper rather than as a warning —
+/// the opposite of what a loud line is for. The head of the message carries the
+/// fact and the count; the tail is a dump.
+///
+/// Truncates on a boundary the message itself provides rather than at a
+/// character count, so it never cuts a name in half.
+fn clamp(note: &str) -> String {
+    const MAX: usize = 160;
+    if note.len() <= MAX {
+        return note.to_owned();
+    }
+    let head = note
+        .char_indices()
+        .take_while(|(i, _)| *i < MAX)
+        .map(|(i, c)| i + c.len_utf8())
+        .last()
+        .unwrap_or(0);
+    let cut = note[..head].rfind(", ").unwrap_or(head);
+    let rest = note[cut..].matches(", ").count();
+    format!("{}… and {rest} more", &note[..cut])
+}
+
 /// The navigation bar, on every page.
 ///
 /// # Why unbuilt pages are shown rather than hidden
@@ -532,7 +586,7 @@ pub struct View<'a> {
 fn nav(current: &str) -> String {
     let mut out = String::with_capacity(512);
     out.push_str("<nav class=\"top\"><div class=\"inner\">");
-    out.push_str("<a class=\"logo\" href=\"/\">brutex<b>-rs</b></a><div class=\"links\">");
+    out.push_str("<a class=\"logo\" href=\"/\">brutex</a><div class=\"links\">");
     for (href, label, built) in [
         ("/", "Dashboard", true),
         ("/instruments", "Instruments", true),
@@ -577,28 +631,55 @@ pub fn dashboard_page(status: &str, figures: &[Stat<'_>], notes: &[String]) -> S
     let mut body = String::with_capacity(2048);
     body.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">");
     body.push_str("<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">");
-    body.push_str("<title>brutex-rs · dashboard</title><style>");
+    body.push_str("<title>brutex · dashboard</title><style>");
     body.push_str(STYLE);
     body.push_str("</style></head><body>");
     body.push_str(&nav("/"));
     let _ = write!(
         body,
-        "<h1>brutex-rs · {}</h1>\
-         <p class=\"sub\">A brute-force backtesting engine for NSE. \
-         Every figure below is a counter, not a scan.</p>",
-        escape(status)
+        "<header class=\"hero\"><div class=\"hw\">\
+         <div class=\"eyebrow\"><span class=\"dot\"></span>NSE · TWO FEEDS · ONE IDENTITY</div>\
+         <h1>Every instrument,<br>cross&#8209;checked.</h1>\
+         <p class=\"lede\">A brute&#8209;force backtesting engine for Indian indices. \
+         Every figure below is a counter, never a scan — this page costs the same \
+         whether the store holds two instruments or two hundred thousand.</p>\
+         <span class=\"badge {}\">{}</span></div></header>",
+        if status == "ok" { "good" } else { "bad" },
+        escape(status),
     );
 
     body.push_str("<section class=\"cards\">");
-    for s in figures {
-        let cls = if s.loud { " loud" } else { "" };
+    // INTEGER arithmetic, not float. `clippy::float_arithmetic` is denied
+    // workspace-wide so that a price can never touch a float (CLAUDE.md §7),
+    // and a bar width has no business being the first exception — it is a
+    // percentage of a count, which integers express exactly.
+    let peak = figures
+        .iter()
+        .filter_map(|f| f.value.parse::<u64>().ok())
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    for (i, f) in figures.iter().enumerate() {
+        let cls = if f.loud { " loud" } else { "" };
+        // The bar shows each figure against the largest on the page, so the
+        // relationship between the numbers is visible without reading them.
+        // A floor of 3% so a zero still draws something: a bar of no width
+        // reads as "not rendered" rather than as "none", and zero
+        // disagreements is the figure most worth seeing.
+        let pct = f
+            .value
+            .parse::<u64>()
+            .map_or(100, |v| (v.saturating_mul(100) / peak).max(3));
         let _ = write!(
             body,
-            "<div class=\"card{cls}\"><div class=\"ck\">{}</div>\
-             <div class=\"cv\">{}</div><div class=\"cn\">{}</div></div>",
-            escape(s.label),
-            escape(s.value),
-            escape(s.note),
+            "<div class=\"card{cls}\" style=\"animation-delay:{}ms\">\
+             <div class=\"ck\">{}</div><div class=\"cv\">{}</div>\
+             <div class=\"cbar\"><span style=\"width:{pct}%\"></span></div>\
+             <div class=\"cn\">{}</div></div>",
+            i * 60,
+            escape(f.label),
+            escape(f.value),
+            escape(f.note),
         );
     }
     body.push_str("</section>");
@@ -607,10 +688,9 @@ pub fn dashboard_page(status: &str, figures: &[Stat<'_>], notes: &[String]) -> S
         .iter()
         .filter(|n| LOUD.iter().any(|w| n.contains(w)))
         .count();
-    let open = if loud_count > 0 { " open" } else { "" };
     let _ = write!(
         body,
-        "<details class=\"notes\"{open}><summary>{} note{} · <b>{loud_count}</b> needing attention</summary><ul>",
+        "<details class=\"notes\"><summary>{} note{} · <b>{loud_count}</b> needing attention</summary><ul>",
         notes.len(),
         if notes.len() == 1 { "" } else { "s" },
     );
@@ -620,7 +700,7 @@ pub fn dashboard_page(status: &str, figures: &[Stat<'_>], notes: &[String]) -> S
         } else {
             ""
         };
-        let _ = write!(body, "<li{loud}>{}</li>", escape(note));
+        let _ = write!(body, "<li{loud}>{}</li>", escape(&clamp(note)));
     }
     body.push_str("</ul></details>");
 
@@ -716,10 +796,9 @@ pub fn instruments_page(view: &View<'_>) -> String {
         .iter()
         .filter(|n| LOUD.iter().any(|w| n.contains(w)))
         .count();
-    let open = if loud_count > 0 { " open" } else { "" };
     let _ = write!(
         body,
-        "<details class=\"notes\"{open}><summary>{} note{} · <b>{loud_count}</b> needing attention</summary><ul>",
+        "<details class=\"notes\"><summary>{} note{} · <b>{loud_count}</b> needing attention</summary><ul>",
         notes.len(),
         if notes.len() == 1 { "" } else { "s" },
     );
@@ -729,7 +808,7 @@ pub fn instruments_page(view: &View<'_>) -> String {
         } else {
             ""
         };
-        let _ = write!(body, "<li{loud}>{}</li>", escape(note));
+        let _ = write!(body, "<li{loud}>{}</li>", escape(&clamp(note)));
     }
     body.push_str("</ul></details>");
 

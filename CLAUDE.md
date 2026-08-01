@@ -1,4 +1,4 @@
-# brutex-rs — session law
+# brutex — session law
 
 Read this file completely before any action. It outranks convenience,
 precedent, and your own judgement about what would be easier.

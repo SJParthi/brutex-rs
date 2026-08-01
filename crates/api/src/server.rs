@@ -554,14 +554,11 @@ pub fn instruments_html_from(
     // `total` is the whole universe; `matched` is what the filter selected.
     // Reporting the right one keeps the page honest about what it looked at.
     let (title, denominator) = if needle.is_empty() {
-        (
-            format!("brutex-rs · instruments · {}", read.status()),
-            total,
-        )
+        (format!("brutex · instruments · {}", read.status()), total)
     } else {
         (
             format!(
-                "brutex-rs · {} · search {query:?} · {matched} matched",
+                "brutex · {} · search {query:?} · {matched} matched",
                 read.status()
             ),
             matched,
@@ -822,7 +819,7 @@ async fn run_in(dir: &Path, args: &[String], shutdown: Shutdown) -> u8 {
         Ok(Command::Report) => reported(dir),
         Ok(Command::Serve(addr)) => match tokio::net::TcpListener::bind(addr).await {
             Ok(listener) => {
-                println!("brutex-rs api listening on http://{addr}/instruments");
+                println!("brutex api listening on http://{addr}/instruments");
                 stopped(serve(listener, router(Loaded::new(universe(dir))), shutdown).await)
             }
             Err(e) => {
