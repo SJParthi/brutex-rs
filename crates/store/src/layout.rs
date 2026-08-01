@@ -383,12 +383,15 @@ impl Layout {
         }
         // `block < blocks` and `blocks <= n_valid.div_ceil(rpb)`, so the
         // product is at most `n_valid` rounded down and cannot overflow.
-        let before = block * self.records_per_block;
-        let rest = n_valid - before;
-        if rest > self.records_per_block {
-            Ok(self.records_per_block)
+        let remaining = n_valid - block * self.records_per_block;
+        // Asked as "is this the tail block?" rather than "does the remainder
+        // exceed a block?" — the two agree, but the second is a comparison
+        // whose boundary case makes both arms return the same number, so no
+        // test could distinguish it from its own mutation.
+        if block + 1 == blocks {
+            Ok(remaining)
         } else {
-            Ok(rest)
+            Ok(self.records_per_block)
         }
     }
 

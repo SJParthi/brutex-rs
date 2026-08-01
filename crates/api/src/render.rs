@@ -80,15 +80,23 @@ box-shadow:0 5px 16px color-mix(in srgb,var(--acc) 34%,transparent);transition:t
 button:hover{transform:translateY(-2px);box-shadow:0 9px 24px color-mix(in srgb,var(--acc) 42%,transparent)}\
 form a{color:var(--dim);font-size:13px;text-decoration:none}\
 form a:hover{color:var(--acc)}\
-ul.notes{margin:0 auto 16px;max-width:1180px;padding:14px 18px 14px 34px;list-style:none;\
-background:var(--panel);border:1px solid var(--line);border-radius:13px;box-shadow:var(--sh);\
-color:var(--dim);font-size:13.5px}\
-ul.notes li{margin:3px 0;position:relative}\
-ul.notes li:before{content:'';position:absolute;left:-16px;top:8px;width:6px;height:6px;\
+details.notes{margin:0 auto 16px;max-width:1180px;background:var(--panel);\
+border:1px solid var(--line);border-radius:13px;box-shadow:var(--sh);\
+color:var(--dim);font-size:13px;overflow:hidden}\
+details.notes summary{cursor:pointer;padding:11px 18px;font-weight:650;list-style:none;\
+user-select:none;transition:background .18s}\
+details.notes summary::-webkit-details-marker{display:none}\
+details.notes summary:before{content:'▸ ';font-weight:800;color:var(--acc)}\
+details.notes[open] summary:before{content:'▾ '}\
+details.notes summary:hover{background:color-mix(in srgb,var(--acc) 6%,transparent)}\
+details.notes summary b{color:var(--bad);font-variant-numeric:tabular-nums}\
+details.notes ul{list-style:none;padding:2px 18px 14px 34px;margin:0;\
+border-top:1px solid var(--line)}\
+details.notes li{margin:5px 0;position:relative;line-height:1.5}\
+details.notes li:before{content:'';position:absolute;left:-16px;top:7px;width:6px;height:6px;\
 border-radius:50%;background:var(--dim)}\
-ul.notes li.loud{color:var(--bad);font-weight:750}\
-ul.notes li.loud:before{background:var(--bad);animation:blip 1.6s infinite}\
-@keyframes blip{50%{opacity:.25}}\
+details.notes li.loud{color:var(--bad);font-weight:700}\
+details.notes li.loud:before{background:var(--bad)}\
 table{border-collapse:collapse;width:100%;font-size:13.5px;\
 margin:0 auto;background:var(--panel)}\
 thead th{position:sticky;top:0;z-index:2;text-align:left;padding:12px 15px;background:var(--panel);\
@@ -115,6 +123,12 @@ transition:all .22s cubic-bezier(.2,.8,.2,1)}\
 .pills a b{font-variant-numeric:tabular-nums;opacity:.65;margin-left:7px;font-weight:700}\
 .pills a.on{background:linear-gradient(135deg,var(--acc),var(--acc2));border-color:transparent;color:#fff;\
 box-shadow:0 6px 18px color-mix(in srgb,var(--acc) 34%,transparent);transform:translateY(-1px)}\
+.pager{display:flex;gap:12px;align-items:center;justify-content:center;margin:16px auto 0;\
+max-width:1180px;padding:0 20px;font-size:13.5px}\
+.pager a{color:var(--acc);text-decoration:none;font-weight:700;padding:8px 16px;border-radius:10px;\
+border:1px solid var(--line);background:var(--panel);transition:all .2s}\
+.pager a:hover{background:linear-gradient(135deg,var(--acc),var(--acc2));color:#fff;border-color:transparent}\
+.pager span{color:var(--dim);font-variant-numeric:tabular-nums}\
 footer{margin:22px auto 0;max-width:1180px;padding:0 20px;color:var(--dim);font-size:12.5px;line-height:1.9}\
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}";
 
@@ -154,6 +168,50 @@ pub fn escape(raw: &str) -> String {
         }
     }
     out
+}
+
+impl View<'_> {
+    /// The query string every link on the page shares, with optional overrides.
+    ///
+    /// # Why one builder
+    ///
+    /// Each link used to compose its own. The sort headers carried only the
+    /// search, so clicking a column dropped the universe filter; the pills
+    /// carried only the filter, so clicking one dropped the sort. The table
+    /// reordered *and* changed which rows it was ordering, which reads as the
+    /// data having moved under you.
+    ///
+    /// One builder makes forgetting a parameter impossible: a new parameter is
+    /// added here and every link gains it at once.
+    ///
+    /// `None` keeps the current value; `Some` overrides it. Sorting and
+    /// filtering pass `Some(0)` for the page deliberately — page 3 of an ISIN
+    /// ordering is not page 3 of a symbol ordering, so keeping the number would
+    /// land the operator somewhere arbitrary.
+    #[must_use]
+    pub fn link_params(
+        &self,
+        sort: Option<&str>,
+        active: Option<&str>,
+        page: Option<usize>,
+    ) -> String {
+        let mut out = String::with_capacity(64);
+        let _ = write!(
+            out,
+            "q={}&amp;sort={}&amp;u={}",
+            escape(self.query),
+            escape(sort.unwrap_or(self.sort)),
+            escape(active.unwrap_or(self.active)),
+        );
+        if self.all {
+            out.push_str("&amp;all=1");
+        }
+        let page = page.unwrap_or(self.page);
+        if page > 0 {
+            let _ = write!(out, "&amp;page={page}");
+        }
+        out
+    }
 }
 
 /// One row of the instruments table.
@@ -262,7 +320,8 @@ fn isin_cell(row: &Row) -> String {
 ///
 /// Extracted from [`instruments_page`] because that function is at clippy's
 /// 100-line ceiling; the split is a lint, not a design.
-fn filter_pills(counts: UniverseCounts, query: &str, active: &str, all: bool) -> String {
+fn filter_pills(view: &View<'_>) -> String {
+    let counts = view.counts;
     let mut out = String::with_capacity(512);
     // THE PILLS ARE LINKS, NOT A CSS TOGGLE.
     //
@@ -277,11 +336,16 @@ fn filter_pills(counts: UniverseCounts, query: &str, active: &str, all: bool) ->
     //
     // `all` is carried through, so widening to every NSE listing and then
     // filtering by universe compose instead of cancelling.
-    let q = escape(query);
-    let suffix = if all { "&amp;all=1" } else { "" };
     let pill = |slug: &str, label: &str, n: usize| -> String {
-        let on = if active == slug { " class=\"on\"" } else { "" };
-        format!("<a href=\"/instruments?q={q}&amp;u={slug}{suffix}\"{on}>{label}<b>{n}</b></a>")
+        let on = if view.active == slug {
+            " class=\"on\""
+        } else {
+            ""
+        };
+        format!(
+            "<a href=\"/instruments?{}\"{on}>{label}<b>{n}</b></a>",
+            view.link_params(None, Some(slug), Some(0))
+        )
     };
     let _ = write!(
         out,
@@ -315,16 +379,46 @@ pub struct UniverseCounts {
 ///
 /// Split out of [`instruments_page`] to stay under clippy's 100-line ceiling.
 /// The split is a lint, not a design.
-fn table(rows: &[Row], query: &str, sort: &str) -> String {
+fn table(rows: &[Row], view: &View<'_>) -> String {
     let mut body = String::with_capacity(256 + rows.len() * 256);
     // SORTABLE HEADERS. Links, not script: the order is part of the URL, so a
     // sorted view is linkable, reloadable and back-buttonable, and the server
-    // decides it once from data already in memory. The query is carried through
-    // so sorting does not silently clear a search.
-    let q = escape(query);
+    // decides it once from data already in memory.
+    //
+    // The link carries EVERY other parameter. It used to carry only the search,
+    // so clicking a column header silently dropped the universe filter and the
+    // page — the table reordered AND changed which rows it was ordering, which
+    // reads as the data having moved.
+    //
+    // Paging resets to page 1 deliberately: page 3 of an ISIN ordering is not
+    // page 3 of a symbol ordering, and keeping the number would land the
+    // operator somewhere arbitrary.
+    // ASCENDING AND DESCENDING. Clicking the column you are already sorted by
+    // REVERSES it; clicking a different column starts that one ascending.
+    //
+    // The direction is a `-` prefix on the column name, so it needs no second
+    // parameter and an old one-way link still means exactly what it did.
+    let sort = view.sort;
     let sort_link = |col: &str, label: &str| -> String {
-        let mark = if sort == col { " ▾" } else { "" };
-        format!("<th><a href=\"/instruments?q={q}&amp;sort={col}\">{label}{mark}</a></th>")
+        let (active, descending) = match sort.strip_prefix('-') {
+            Some(base) => (base == col, true),
+            None => (sort == col, false),
+        };
+        // Already on this column ascending -> offer descending, and vice versa.
+        let next = if active && !descending {
+            format!("-{col}")
+        } else {
+            col.to_owned()
+        };
+        let mark = match (active, descending) {
+            (true, false) => " ▲",
+            (true, true) => " ▼",
+            _ => "",
+        };
+        format!(
+            "<th><a href=\"/instruments?{}\">{label}{mark}</a></th>",
+            view.link_params(Some(&next), None, Some(0))
+        )
     };
     body.push_str("<table><thead><tr>");
     for (col, label) in [
@@ -397,6 +491,10 @@ pub struct View<'a> {
     pub counts: UniverseCounts,
     /// Which universe pill is selected.
     pub active: &'a str,
+    /// Which page of rows this is, zero-based.
+    pub page: usize,
+    /// The highest page number that has rows.
+    pub last_page: usize,
     /// Every line an operator has to be told.
     pub notes: &'a [String],
 }
@@ -414,16 +512,19 @@ pub struct View<'a> {
 /// existed to say.
 #[must_use]
 pub fn instruments_page(view: &View<'_>) -> String {
+    // `sort`, `counts` and `active` are not bound here: they are read through
+    // `view` by `table`, `filter_pills` and `View::link_params`, which is the
+    // point of routing every link through one builder.
     let View {
         title,
         total,
         rows,
         query,
-        sort,
         all,
-        counts,
-        active,
+        page,
+        last_page,
         notes,
+        ..
     } = *view;
     let mut body = String::with_capacity(1024 + rows.len() * 256);
     body.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">");
@@ -468,7 +569,27 @@ pub fn instruments_page(view: &View<'_>) -> String {
 
     // THE NOTES, ON EVERY PAGE. Not folded into the title, and not conditional
     // on the query being empty.
-    body.push_str("<ul class=\"notes\">");
+    // THE NOTES, COLLAPSED BY DEFAULT.
+    //
+    // They were an always-open panel. With 31 index names in one red line it
+    // filled the screen above the table and read as wallpaper rather than as a
+    // warning — the opposite of the point. A `<details>` element collapses it
+    // with no script at all, and the summary line still states the counts and
+    // how many lines are loud, so nothing is hidden, only folded.
+    //
+    // It opens automatically when something IS loud, because a warning nobody
+    // is told about is a warning nobody reads.
+    let loud_count = notes
+        .iter()
+        .filter(|n| LOUD.iter().any(|w| n.contains(w)))
+        .count();
+    let open = if loud_count > 0 { " open" } else { "" };
+    let _ = write!(
+        body,
+        "<details class=\"notes\"{open}><summary>{} note{} · <b>{loud_count}</b> needing attention</summary><ul>",
+        notes.len(),
+        if notes.len() == 1 { "" } else { "s" },
+    );
     for note in notes {
         let loud = if LOUD.iter().any(|w| note.contains(w)) {
             " class=\"loud\""
@@ -477,11 +598,38 @@ pub fn instruments_page(view: &View<'_>) -> String {
         };
         let _ = write!(body, "<li{loud}>{}</li>", escape(note));
     }
-    body.push_str("</ul>");
+    body.push_str("</ul></details>");
 
-    body.push_str(&filter_pills(counts, query, active, all));
+    body.push_str(&filter_pills(view));
 
-    body.push_str(&table(rows, query, sort));
+    body.push_str(&table(rows, view));
+
+    // PAGING LINKS. Without them the row cap is a wall: the page rendered 200
+    // of 785 and scrolling could not reveal what was never sent. Links rather
+    // than script, so a page is bookmarkable and the browser's back button
+    // works. Every other parameter rides along, so paging does not silently
+    // clear a search, a sort or a filter.
+    if last_page > 0 {
+        let carry = view.link_params(None, None, Some(0));
+        let carry = carry.trim_end_matches("&amp;page=0").to_owned();
+        body.push_str("<nav class=\"pager\">");
+        if page > 0 {
+            let _ = write!(
+                body,
+                "<a href=\"/instruments?{carry}&amp;page={}\">&larr; previous</a>",
+                page - 1
+            );
+        }
+        let _ = write!(body, "<span>page {} of {}</span>", page + 1, last_page + 1);
+        if page < last_page {
+            let _ = write!(
+                body,
+                "<a href=\"/instruments?{carry}&amp;page={}\">next &rarr;</a>",
+                page + 1
+            );
+        }
+        body.push_str("</nav>");
+    }
     body.push_str("</tbody></table></section>");
     body.push_str(
         "<footer>Rendered on the server. No JavaScript — \
@@ -547,8 +695,115 @@ mod tests {
             all: false,
             counts: UniverseCounts::default(),
             active: "",
+            page: 0,
+            last_page: 0,
             notes: &[],
         })
+    }
+
+    #[test]
+    fn one_link_builder_carries_every_parameter_and_overrides_only_what_it_is_told() {
+        // This is the function that fixed the bug where sorting dropped the
+        // universe filter and filtering dropped the sort. It is tested directly
+        // because every link on the page goes through it, so a defect here is a
+        // defect in all of them at once.
+        let v = View {
+            title: "t",
+            total: 0,
+            rows: &[],
+            query: "M&M",
+            sort: "isin",
+            all: true,
+            counts: UniverseCounts::default(),
+            active: "ntm",
+            page: 3,
+            last_page: 9,
+            notes: &[],
+        };
+
+        // No overrides: the current state, verbatim. The ampersand in the
+        // search is escaped, because a symbol really can contain one.
+        let keep = v.link_params(None, None, None);
+        assert!(keep.contains("q=M&amp;M"), "the search is escaped: {keep}");
+        assert!(keep.contains("sort=isin"));
+        assert!(keep.contains("u=ntm"));
+        assert!(keep.contains("&amp;all=1"));
+        assert!(keep.contains("&amp;page=3"), "the page rides along: {keep}");
+
+        // Overriding the sort keeps the filter — the exact bug this replaced.
+        let sorted = v.link_params(Some("kind"), None, Some(0));
+        assert!(sorted.contains("sort=kind"));
+        assert!(sorted.contains("u=ntm"), "sorting must not drop the filter");
+        assert!(!sorted.contains("page="), "a new order starts at page one");
+
+        // Overriding the filter keeps the sort — the same bug, other direction.
+        let filtered = v.link_params(None, Some("idx"), Some(0));
+        assert!(filtered.contains("u=idx"));
+        assert!(
+            filtered.contains("sort=isin"),
+            "filtering must not drop the sort"
+        );
+
+        // Not widened: no all flag anywhere in the link.
+        let narrow = View { all: false, ..v };
+        assert!(!narrow.link_params(None, None, None).contains("all=1"));
+    }
+
+    #[test]
+    fn the_pager_leads_both_ways_and_carries_every_other_parameter() {
+        let r = [row(nifty(), &[Vendor::Groww])];
+        let view = |page: usize, last_page: usize, all: bool| View {
+            title: "t",
+            total: 785,
+            rows: &r,
+            query: "NIF",
+            sort: "isin",
+            all,
+            counts: UniverseCounts::default(),
+            active: "ntm",
+            page,
+            last_page,
+            notes: &[],
+        };
+
+        // A single page shows no pager: navigation that leads nowhere is worse
+        // than none at all.
+        assert!(!instruments_page(&view(0, 0, false)).contains("class=\"pager\""));
+
+        // First page: next only, no previous to nowhere.
+        let first = instruments_page(&view(0, 3, false));
+        assert!(first.contains("next"));
+        assert!(!first.contains("previous"));
+        assert!(first.contains("page 1 of 4"));
+
+        // Middle: both directions.
+        let mid = instruments_page(&view(1, 3, false));
+        assert!(mid.contains("previous") && mid.contains("next"));
+        assert!(mid.contains("page 2 of 4"));
+
+        // Last page: previous only.
+        let last = instruments_page(&view(3, 3, false));
+        assert!(last.contains("previous"));
+        assert!(!last.contains("next"));
+        assert!(last.contains("page 4 of 4"));
+
+        // EVERY other parameter rides along. Paging that silently cleared the
+        // search, the sort or the filter would look like the data changed.
+        assert!(mid.contains("q=NIF"), "the search is carried");
+        assert!(mid.contains("sort=isin"), "the sort is carried");
+        assert!(mid.contains("u=ntm"), "the universe filter is carried");
+        // Scoped to the pager's own carry (`&amp;all=1`), not a bare `all=1`:
+        // the escape-hatch link beside the search box is `?all=1` and is
+        // present on every un-widened page, so a bare match would always hit.
+        assert!(
+            !mid.contains("&amp;all=1"),
+            "not widened, so the pager carries no all flag"
+        );
+
+        // And when widened, the flag rides along too, so paging through every
+        // NSE listing does not silently snap back to the tracked universe.
+        let wide = instruments_page(&view(1, 3, true));
+        assert!(wide.contains("all=1"), "the widened view is carried");
     }
 
     #[test]
@@ -743,6 +998,8 @@ mod tests {
             all: false,
             counts: UniverseCounts::default(),
             active: "",
+            page: 0,
+            last_page: 0,
             notes: &notes,
         });
         for note in &notes {
@@ -763,6 +1020,8 @@ mod tests {
             all: false,
             counts: UniverseCounts::default(),
             active: "",
+            page: 0,
+            last_page: 0,
             notes: &["<b>x</b>".to_owned()],
         });
         assert!(html.contains("&lt;b&gt;x&lt;/b&gt;"));

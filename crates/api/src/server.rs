@@ -304,6 +304,17 @@ pub fn param(raw: &str, name: &str) -> String {
     String::new()
 }
 
+/// The zero-based page number a query string asks for.
+///
+/// Anything unparseable is page one. This is the one parameter that is
+/// defaulted rather than refused, and it is defensible only because a page
+/// number selects a VIEW: it can never change what the data says, so a mangled
+/// bookmark should land on the first page rather than on an error.
+#[must_use]
+pub fn page_number(raw: &str) -> usize {
+    param(raw, "page").parse().unwrap_or(0)
+}
+
 /// Decodes `+` and `%XX` escapes.
 fn percent_decode(s: &str) -> String {
     let b = s.as_bytes();
@@ -364,7 +375,7 @@ fn hex_digit(c: u8) -> Option<u8> {
 /// are now a banner the page always carries, whatever was typed.
 #[must_use]
 pub fn instruments_html(dir: &Path, query: &str) -> String {
-    instruments_html_from(&universe(dir), query, "", false, "")
+    instruments_html_from(&universe(dir), query, "", false, "", 0)
 }
 
 /// The instruments page, rendered from a universe that is **already loaded**.
@@ -391,6 +402,7 @@ pub fn instruments_html_from(
     sort: &str,
     all: bool,
     universe_filter: &str,
+    page: usize,
 ) -> String {
     let needle = query.to_uppercase();
 
@@ -462,7 +474,14 @@ pub fn instruments_html_from(
     // equal ISINs still have one fixed order, and the page is byte-identical
     // between reloads. A HashMap's iteration order is not, which is why this
     // cannot be left to insertion.
-    match sort {
+    // A leading `-` means descending. Sorting the key list ascending and then
+    // reversing keeps ONE ordering rule per column instead of two, so ascending
+    // and descending can never disagree about how ties break.
+    let (column, descending) = match sort.strip_prefix('-') {
+        Some(base) => (base, true),
+        None => (sort, false),
+    };
+    match column {
         "symbol" => keys.sort_unstable_by_key(|(k, _)| (k.underlying, *k)),
         "isin" => keys.sort_unstable_by_key(|(k, e)| (e.isin.map(|(_, i)| i), *k)),
         "universe" => keys.sort_unstable_by_key(|(k, e)| (e.universe.bits(), *k)),
@@ -472,9 +491,25 @@ pub fn instruments_html_from(
         // column is NOT an error -- a stale bookmark should still render.
         _ => keys.sort_unstable_by_key(|(k, _)| (!k.is_sweepable(), *k)),
     }
+    if descending {
+        keys.reverse();
+    }
 
+    // PAGING, so nothing is unreachable.
+    //
+    // The cap alone rendered 200 of 785 and offered no way to the rest —
+    // scrolling cannot reveal rows that were never sent, and the page said
+    // "showing 200" as though that were the whole answer. A bound with no
+    // navigation past it is the same class of defect as a filter with no
+    // escape hatch.
+    //
+    // The offset is clamped to the last page rather than refused: `?page=999`
+    // is a stale bookmark, not an attack, and it should land somewhere real.
+    let last_page = matched.saturating_sub(1) / PAGE_ROWS;
+    let page = page.min(last_page);
     let rows: Vec<render::Row> = keys
         .into_iter()
+        .skip(page * PAGE_ROWS)
         .take(PAGE_ROWS)
         .map(|(key, e)| render::Row {
             key,
@@ -510,6 +545,8 @@ pub fn instruments_html_from(
         all,
         counts,
         active: universe_filter,
+        page,
+        last_page,
         notes: &read.notes,
     })
 }
@@ -524,7 +561,8 @@ async fn page(
     let sort = param(raw, "sort");
     let all = param(raw, "all") == "1";
     let u = param(raw, "u");
-    axum::response::Html(instruments_html_from(&read, &typed, &sort, all, &u))
+    let page = page_number(raw);
+    axum::response::Html(instruments_html_from(&read, &typed, &sort, all, &u, page))
 }
 
 /// The health endpoint.
@@ -957,6 +995,196 @@ mod tests {
         let html = instruments_html(&dir, "");
         assert!(html.contains("ISIN CONFLICT"), "the page says so too");
         assert!(html.contains("clash"), "and the row is marked");
+    }
+
+    #[test]
+    fn a_page_number_that_is_not_a_number_is_page_one() {
+        // `?page=abc` is a mangled bookmark or a hand-typed URL. It must render
+        // the first page, not fail and not 500 -- but note this is the ONE
+        // place a bad parameter is quietly defaulted rather than refused, and
+        // it is defensible only because a page number selects a VIEW and can
+        // never change what the data says.
+        assert_eq!(page_number("page=abc"), 0);
+        assert_eq!(page_number("page="), 0);
+        assert_eq!(page_number("page=-1"), 0);
+        assert_eq!(page_number("page=2"), 2);
+        assert_eq!(page_number(""), 0);
+    }
+
+    #[test]
+    fn the_escape_hatch_reaches_a_listing_the_tracked_universe_excludes() {
+        // RAJESHEXPO is a real-shaped equity row that is in neither NIFTY Total
+        // Market nor the index series, so it is the only kind of instrument the
+        // tracked filter actually removes. Without a row like this the filter
+        // can never be observed doing anything, and `all` can never be observed
+        // undoing it.
+        let dir = masters(
+            "hatchreach",
+            Some(&format!(
+                "{GROWW_HEAD}\
+                 NSE,CASH,,RAJESHEXPO,EQ,EQ,INE343B01030,,\n"
+            )),
+            Some(&format!(
+                "{DHAN_HEAD}\
+                 NSE,E,INE343B01030,EQUITY,RAJESHEXPO,RAJESH EXPORTS,ES,EQ,,,\n"
+            )),
+        );
+        let read = universe(&dir);
+
+        // Tracked view: the gate accepted it as a share, and the universe
+        // filter still excludes it — those are different questions.
+        let tracked = instruments_html_from(&read, "", "", false, "", 0);
+        assert!(
+            !tracked.contains("NSE-RAJESHEXPO"),
+            "not in NIFTY Total Market, so not tracked"
+        );
+        assert!(tracked.contains("0 instruments total"));
+
+        // The escape hatch reaches it. This is the whole reason the hatch
+        // exists: an instrument the filter hides must still be inspectable.
+        let every = instruments_html_from(&read, "", "", true, "", 0);
+        assert!(
+            every.contains("NSE-RAJESHEXPO"),
+            "?all=1 reaches every listing"
+        );
+        assert!(every.contains("1 instruments total"));
+    }
+
+    #[test]
+    fn a_leading_minus_reverses_the_order_without_a_second_comparator() {
+        // Ascending and descending share ONE ordering rule per column: the
+        // keys are sorted ascending and then reversed. Two comparators is how
+        // ties silently break differently in each direction.
+        let read = universe(&agreeing("desc"));
+        let up = instruments_html_from(&read, "", "symbol", false, "", 0);
+        let down = instruments_html_from(&read, "", "-symbol", false, "", 0);
+
+        let first = |html: &str| -> String {
+            html.split("<tr class=")
+                .nth(1)
+                .and_then(|r| r.split("<td>").nth(1))
+                .and_then(|c| c.split("</td>").next())
+                .unwrap_or_default()
+                .to_owned()
+        };
+        assert_ne!(first(&up), first(&down), "the two orders differ");
+        assert!(up.contains("NSE-NIFTY") && up.contains("NSE-RELIANCE"));
+        assert!(down.contains("NSE-NIFTY") && down.contains("NSE-RELIANCE"));
+
+        // An unknown column reverses the DEFAULT order rather than erroring.
+        let stale = instruments_html_from(&read, "", "-no-such-column", false, "", 0);
+        assert!(stale.contains("NSE-NIFTY") && stale.contains("NSE-RELIANCE"));
+    }
+
+    #[test]
+    fn every_row_is_reachable_by_paging_and_a_stale_page_clamps() {
+        // The cap alone was a wall: 200 of 785 rendered and nothing led to the
+        // rest. Scrolling cannot reveal rows that were never sent.
+        let read = universe(&agreeing("paging"));
+
+        // This fixture is smaller than one page, so there is no pager at all --
+        // navigation that leads nowhere is worse than none.
+        let one = instruments_html_from(&read, "", "", false, "", 0);
+        assert!(
+            !one.contains("class=\"pager\""),
+            "no pager for a single page"
+        );
+        assert!(one.contains("NSE-NIFTY") && one.contains("NSE-RELIANCE"));
+
+        // A page beyond the end CLAMPS to the last page rather than rendering
+        // an empty table: `?page=999` is a stale bookmark, not an attack, and
+        // it should land somewhere real.
+        let past = instruments_html_from(&read, "", "", false, "", 999);
+        assert!(
+            past.contains("NSE-NIFTY") && past.contains("NSE-RELIANCE"),
+            "an out-of-range page clamps to the last one, it does not empty out"
+        );
+        assert_eq!(past, one, "clamping lands exactly on the last page");
+    }
+
+    #[test]
+    fn every_sort_column_orders_and_none_of_them_errors() {
+        // Each arm of the sort match is a separate closure; an arm no test
+        // enters is an arm that can be wrong forever. RELIANCE is in NIFTY
+        // Total Market and NIFTY is an index, so the two rows differ on every
+        // column the page can order by.
+        let read = universe(&agreeing("sortcols"));
+        for column in ["key", "symbol", "isin", "universe", "kind", "vendors", ""] {
+            let html = instruments_html_from(&read, "", column, false, "", 0);
+            assert!(
+                html.contains("NSE-NIFTY") && html.contains("NSE-RELIANCE"),
+                "sort={column:?} lost a row"
+            );
+            // Every named column has a header link. The empty column is the
+            // default order and names no column, so it is checked separately
+            // rather than through a short-circuit whose right side never runs.
+            if !column.is_empty() {
+                assert!(
+                    html.contains(&format!("sort={column}")),
+                    "sort={column:?} has no header link"
+                );
+            }
+        }
+        // An unrecognised column is the DEFAULT order, not an error and not an
+        // empty page: a stale bookmark should still render.
+        let stale = instruments_html_from(&read, "", "no-such-column", false, "", 0);
+        assert!(stale.contains("NSE-NIFTY") && stale.contains("NSE-RELIANCE"));
+    }
+
+    #[test]
+    fn the_universe_pill_selects_from_the_whole_set_not_from_the_page() {
+        let read = universe(&agreeing("pills"));
+
+        // Counts are of the tracked set. Both rows are tracked: NIFTY is an
+        // index, RELIANCE is a Total Market constituent.
+        let all = instruments_html_from(&read, "", "", false, "", 0);
+        assert!(all.contains("2 instruments total"));
+
+        // Indices selects the index and drops the equity.
+        let idx = instruments_html_from(&read, "", "", false, "idx", 0);
+        assert!(idx.contains("NSE-NIFTY"), "the index survives");
+        assert!(!idx.contains("NSE-RELIANCE"), "the equity is filtered out");
+
+        // Total Market selects the equity and drops the index.
+        let ntm = instruments_html_from(&read, "", "", false, "ntm", 0);
+        assert!(ntm.contains("NSE-RELIANCE"));
+        assert!(!ntm.contains("NSE-NIFTY"));
+
+        // F&O selects BOTH, because both are F&O underlyings.
+        //
+        // `universe::of_instrument` gives an index `INDEX ∪ of_equity(symbol)`,
+        // so NIFTY carries INDEX **and** FNO — it is an index *and* the
+        // underlying of its options. The universes deliberately overlap; a
+        // filter treating them as disjoint would drop NIFTY from the F&O view,
+        // which is the one instrument that most needs to be there.
+        let fno = instruments_html_from(&read, "", "", false, "fno", 0);
+        assert!(
+            fno.contains("NSE-RELIANCE"),
+            "RELIANCE is an F&O underlying"
+        );
+        assert!(
+            fno.contains("NSE-NIFTY"),
+            "NIFTY is INDEX and FNO both — see universe::of_instrument"
+        );
+
+        // An unrecognised value selects EVERYTHING, so a stale bookmark renders
+        // the page rather than an empty one.
+        let stale = instruments_html_from(&read, "", "", false, "no-such-universe", 0);
+        assert!(stale.contains("NSE-NIFTY") && stale.contains("NSE-RELIANCE"));
+    }
+
+    #[test]
+    fn the_escape_hatch_says_which_direction_it_goes() {
+        let read = universe(&agreeing("hatch"));
+        // Default: the link offers to widen.
+        let tracked = instruments_html_from(&read, "", "", false, "", 0);
+        assert!(tracked.contains("show every NSE listing"));
+        assert!(tracked.contains("all=1"));
+        // Widened: the SAME link offers to narrow again. Without this arm the
+        // page can be widened and never returned from.
+        let every = instruments_html_from(&read, "", "", true, "", 0);
+        assert!(every.contains("show tracked only"));
+        assert!(every.contains("all=0"));
     }
 
     #[test]

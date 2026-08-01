@@ -511,7 +511,7 @@ impl Header {
     /// # Ok::<(), FormatError>(())
     /// ```
     pub fn read_region(region: &[u8], file_len: u64) -> Result<Self, FormatError> {
-        let (mut header, mut layout) = best_candidate(region, None)?;
+        let (header, layout) = best_candidate(region, None)?;
 
         let slots = whole_slots(region);
         if slots < layout.slot_count() {
@@ -521,18 +521,27 @@ impl Header {
             });
         }
 
-        loop {
-            match header.validate(layout, file_len) {
-                Ok(()) => return Ok(header),
-                Err(refusal) => match best_candidate(region, Some(header.generation)) {
-                    Ok((older, older_layout)) => {
-                        header = older;
-                        layout = older_layout;
-                    }
-                    Err(_) => return Err(refusal),
-                },
+        // Newest first, at most one candidate per slot position. Bounded by
+        // the family slot count rather than by the generation strictly
+        // decreasing: a loop that leaned on the comparison would *hang* rather
+        // than fail if that comparison ever stopped being strict, and a hang
+        // is the one failure a test suite cannot report.
+        let mut newest = Some((header, layout));
+        let mut refusal = FormatError::NoValidHeader;
+        for _ in 0..MAX_SLOTS {
+            let Some((candidate, geometry)) = newest else {
+                return Err(refusal);
+            };
+            match candidate.validate(geometry, file_len) {
+                Ok(()) => return Ok(candidate),
+                Err(refused) => refusal = refused,
             }
+            // The "no older candidate" error is dropped on purpose: the
+            // refusal from the newest slot that decoded says more about the
+            // file than "nothing else was there".
+            newest = best_candidate(region, Some(candidate.generation)).ok();
         }
+        Err(refusal)
     }
 
     /// The 64-byte slot image for this header, checksum computed.
@@ -575,32 +584,34 @@ impl Header {
 /// would diagnose an intact file from another version as a destroyed header.
 fn best_candidate(region: &[u8], below: Option<u64>) -> Result<(Header, Layout), FormatError> {
     let mut fault: Option<FormatError> = None;
-    let mut best: Option<(Header, Layout)> = None;
 
-    for (index, chunk) in (0u64..).zip(region.chunks(SLOT_STRIDE_LEN).take(MAX_SLOTS)) {
-        match Header::decode_parts(chunk) {
+    // `max_by_key` rather than a hand-written comparison: two positionally
+    // valid slots can never share a generation, so `>` and `>=` would behave
+    // identically there and no test could tell them apart.
+    let best = (0u64..)
+        .zip(region.chunks(SLOT_STRIDE_LEN).take(MAX_SLOTS))
+        .filter_map(|(index, chunk)| match Header::decode_parts(chunk) {
             Err(refusal) => {
                 if is_specific(refusal) {
                     fault.get_or_insert(refusal);
                 }
+                None
             }
             Ok((header, layout)) => {
                 let expected = header.generation % layout.slot_count();
                 if index == expected {
-                    if below.is_none_or(|limit| header.generation < limit)
-                        && best.is_none_or(|(seen, _)| header.generation > seen.generation)
-                    {
-                        best = Some((header, layout));
-                    }
+                    Some((header, layout))
                 } else {
                     fault.get_or_insert(FormatError::SlotPositionMismatch {
                         expected,
                         found: index,
                     });
+                    None
                 }
             }
-        }
-    }
+        })
+        .filter(|(header, _)| below.is_none_or(|limit| header.generation < limit))
+        .max_by_key(|(header, _)| header.generation);
 
     best.ok_or(fault.unwrap_or(FormatError::NoValidHeader))
 }
@@ -632,10 +643,15 @@ fn whole_slots(region: &[u8]) -> u64 {
 /// *anywhere* in the 64 bytes is detected — there is no window a corruption
 /// can land in and be called clean. All 512 of them are walked by
 /// `store::fault::a_single_bit_flip_in_any_header_byte_is_detected`.
-fn covered(slot: &[u8]) -> impl Iterator<Item = u8> + '_ {
+///
+/// Takes an array rather than a slice so the tail needs no length: after
+/// skipping to the reserved bytes there are exactly `SLOT_LEN - OFF_RESERVED`
+/// of them left, and a `take` that can never truncate is arithmetic no test
+/// could ever exercise.
+fn covered(slot: &[u8; SLOT_LEN]) -> impl Iterator<Item = u8> + '_ {
     slot.iter()
         .take(OFF_CRC)
-        .chain(slot.iter().skip(OFF_RESERVED).take(SLOT_LEN - OFF_RESERVED))
+        .chain(slot.iter().skip(OFF_RESERVED))
         .copied()
 }
 

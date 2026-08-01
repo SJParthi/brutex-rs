@@ -332,6 +332,21 @@ fn a_degenerate_layout_is_refused_at_declaration() {
         bad("magic"),
         "a magic outside the family is not this format",
     );
+    // Every one of the seven family bytes, on its own. A check that only ever
+    // sees a magic differing in several places cannot tell "all seven must
+    // match" from "any one of them may".
+    for position in 0..7usize {
+        let mut magic = *b"BRUTEXB3";
+        magic[position] ^= 0x20; // still ASCII, differs in exactly one byte
+        assert_eq!(
+            Layout::declare(3, magic, 2, 56, 73),
+            bad("magic"),
+            "family byte {position} was not required to match",
+        );
+    }
+    // The eighth byte is the version's own, not the family's, so it is free.
+    assert!(Layout::declare(3, *b"BRUTEXB3", 2, 56, 73).is_ok());
+    assert!(Layout::declare(3, *b"BRUTEXBZ", 2, 56, 73).is_ok());
     assert_eq!(
         Layout::declare(3, MAGIC, 1, 56, 73),
         bad("slot_count"),

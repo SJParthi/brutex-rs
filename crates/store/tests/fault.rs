@@ -556,6 +556,21 @@ fn a_counter_claiming_more_than_the_file_holds_falls_back_to_the_last_supported_
         Header::read_region(&region, file_len(10)),
         Err(FormatError::CounterExceedsFile),
     );
+
+    // The same answer when there is only ONE slot left to fall back from:
+    // damage slot 0 so generation 2 is gone, leaving generation 3 alone and
+    // unsupported. The refusal is still the counter's, not "no header".
+    region[0] ^= 0xFF;
+    assert_eq!(
+        Header::read_region(&region, file_len(200)),
+        Err(FormatError::CounterExceedsFile),
+    );
+    assert_eq!(
+        Header::read_region(&region, file_len(1_000_150))
+            .expect("the surviving slot is supported")
+            .n_valid,
+        1_000_150,
+    );
 }
 
 #[test]

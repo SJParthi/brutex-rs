@@ -108,35 +108,37 @@ pub const MAX_TIMEFRAME_LEN: usize = 4;
 /// destructuring in `longest_vendor` a compile error rather than a silent
 /// drift — which matters, because `crates/core` is not this crate's to watch.
 ///
-/// A `const` block rather than a helper function: a `const fn` is compiled as
-/// a function that nothing ever calls at run time, so coverage reports it as
-/// dead for ever, and `CLAUDE.md` §9 asks for 100% on every touched crate.
-pub const MAX_VENDOR_LEN: usize = {
-    let [groww, dhan] = Vendor::ALL;
-    let (a, b) = (groww.as_str().len(), dhan.as_str().len());
-    if a > b { a } else { b }
-};
+/// It is written down and then **checked against the table**, rather than
+/// computed from it. A computed maximum would silently widen [`MAX_LEN`] the
+/// day a longer vendor appeared; the assertion below is a compile error
+/// instead, at the moment `Vendor::ALL` changes — and `crates/core` is not
+/// this crate's to watch. Adding a vendor also changes the table's length,
+/// which makes the destructuring itself a compile error.
+///
+/// `store::unit::every_vendor_is_a_legal_segment` proves the bound is reached,
+/// so it is tight rather than merely sufficient.
+pub const MAX_VENDOR_LEN: usize = 5;
 
+const _: () = {
+    let [groww, dhan] = Vendor::ALL;
+    assert!(groww.as_str().len() <= MAX_VENDOR_LEN);
+    assert!(dhan.as_str().len() <= MAX_VENDOR_LEN);
+};
 const _: () = assert!(MAX_VENDOR_LEN <= MAX_SEGMENT_LEN);
 
 /// The longest file extension, dot included.
 ///
-/// Derived from [`FileKind::ALL`] by destructuring, so a new sibling file with
-/// a longer extension is a compile error here rather than a path that quietly
-/// exceeds [`MAX_LEN`].
-pub const MAX_EXTENSION_LEN: usize = {
+/// Checked against [`FileKind::ALL`] the same way and for the same reason: a
+/// new sibling file with a longer extension is a compile error here rather
+/// than a path that quietly exceeds [`MAX_LEN`].
+pub const MAX_EXTENSION_LEN: usize = 5;
+
+const _: () = {
     let [bars, checksums, overlay, lock] = FileKind::ALL;
-    let mut best = bars.extension().len();
-    if checksums.extension().len() > best {
-        best = checksums.extension().len();
-    }
-    if overlay.extension().len() > best {
-        best = overlay.extension().len();
-    }
-    if lock.extension().len() > best {
-        best = lock.extension().len();
-    }
-    best
+    assert!(bars.extension().len() <= MAX_EXTENSION_LEN);
+    assert!(checksums.extension().len() <= MAX_EXTENSION_LEN);
+    assert!(overlay.extension().len() <= MAX_EXTENSION_LEN);
+    assert!(lock.extension().len() <= MAX_EXTENSION_LEN);
 };
 
 /// The length of a rendered path, root excluded, when every segment is at its
