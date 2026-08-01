@@ -1278,6 +1278,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_collision_probes_forward_instead_of_overwriting() {
+        // The probe loop inside `build` only runs when two members land on the
+        // same slot. With a tiny table that is easy to force, and it is the one
+        // branch that decides whether a collision costs a step or silently
+        // loses a member.
+        //
+        // "A" and "Q" both hash to slot 12 of 16 — computed against this exact
+        // FNV-1a, not hoped for. A test that merely fills a small table does
+        // not necessarily collide, and then this branch stays unentered while
+        // the test passes.
+        assert_eq!(
+            mask(fnv1a("A"), 16),
+            mask(fnv1a("Q"), 16),
+            "the pair collides"
+        );
+        let members = ["A", "Q", "B", "C", "D", "E", "F", "G"];
+        let idx: MemberIndex<16> = MemberIndex::build(&members);
+        assert_eq!(idx.len(), members.len(), "no member was overwritten");
+        for m in members {
+            assert!(idx.contains(m), "{m} survived the collision");
+        }
+        // And a member that was never inserted is still absent, so probing
+        // forward did not turn the table into a set of everything.
+        assert!(!idx.contains("I"));
+        assert!(!idx.contains("AA"));
+    }
+
+    #[test]
     fn the_table_builder_is_exercised_at_runtime_not_only_at_compile_time() {
         // `MemberIndex::build` is a `const fn` and the two real tables are
         // `static`, so the compiler evaluates it and the runtime coverage

@@ -1019,6 +1019,105 @@ mod tests {
     }
 
     #[test]
+    fn a_note_that_became_a_list_is_clamped_on_a_boundary_it_provides() {
+        // Short notes pass through untouched.
+        let short = "groww: 2750 kept, 0 unreadable";
+        assert_eq!(clamp(short), short);
+
+        // A long one is cut at a ", " boundary, never mid-name, and says how
+        // many it dropped. One note really does name 31 instruments inline.
+        let names: Vec<String> = (0..40).map(|i| format!("NSE-SYMBOL{i:02}")).collect();
+        let long = format!(
+            "UNCHECKED IDENTITY · named by one vendor only: {}",
+            names.join(", ")
+        );
+        let cut = clamp(&long);
+        assert!(cut.len() < long.len(), "it was clamped");
+        assert!(
+            cut.contains("… and "),
+            "it says how many were dropped: {cut}"
+        );
+        assert!(cut.contains("more"));
+        assert!(
+            cut.starts_with("UNCHECKED IDENTITY"),
+            "the head carries the fact: {cut}"
+        );
+        assert!(
+            !cut.contains("NSE-SYMBOL3"),
+            "the tail is dropped, not truncated mid-name: {cut}"
+        );
+
+        // A long note with no separator at all still clamps rather than
+        // panicking on a missing boundary.
+        let unbroken = "X".repeat(400);
+        let clamped = clamp(&unbroken);
+        assert!(clamped.len() < unbroken.len());
+    }
+
+    #[test]
+    fn the_dashboard_counts_and_marks_what_needs_attention() {
+        let figures = [
+            Stat {
+                label: "Tracked",
+                value: "785",
+                note: "both feeds",
+                loud: false,
+            },
+            Stat {
+                label: "Disagreements",
+                value: "0",
+                note: "identity",
+                loud: true,
+            },
+            Stat {
+                label: "Unparseable",
+                value: "n/a",
+                note: "not a number",
+                loud: false,
+            },
+        ];
+        let notes = vec![
+            "groww: 2 kept".to_owned(),
+            "dhan UNREADABLE · malformed identifier ×104".to_owned(),
+        ];
+        let html = dashboard_page("ok", &figures, &notes);
+
+        assert!(
+            html.contains("class=\"hero\""),
+            "the dashboard has a header"
+        );
+        assert!(html.contains("badge good"), "a clean read is badged clean");
+        assert!(html.contains("nav class"), "and carries the nav");
+        assert!(html.contains("785") && html.contains("Tracked"));
+        assert!(html.contains("card loud"), "a loud figure is marked");
+        assert!(
+            !html.contains("<tbody>"),
+            "it counts; it does not list rows"
+        );
+        // The loud NOTE is marked too, and the summary says how many.
+        assert!(html.contains("class=\"loud\">dhan UNREADABLE"));
+        assert!(html.contains("<b>1</b> needing attention"));
+        // A value that is not a number still draws a full bar rather than
+        // vanishing -- "n/a" is information, not an error.
+        assert!(html.contains("width:100%"));
+
+        // A degraded read is badged differently, and the summary reports zero
+        // loud notes when there are none.
+        let clean = dashboard_page("DEGRADED", &figures, &[]);
+        assert!(clean.contains("badge bad"));
+        assert!(clean.contains("0 notes · <b>0</b> needing attention"));
+
+        // Exactly one note is singular. The plural arm is covered by the two-
+        // note case above and the zero case here; without this the singular
+        // branch is a region no test enters, and "1 notes" ships.
+        let one = dashboard_page("ok", &figures, &["only one".to_owned()]);
+        assert!(
+            one.contains("1 note · <b>0</b> needing attention"),
+            "one note is singular, not \"1 notes\""
+        );
+    }
+
+    #[test]
     fn escapes_every_html_significant_character() {
         assert_eq!(escape("a&b"), "a&amp;b");
         assert_eq!(escape("a<b"), "a&lt;b");
