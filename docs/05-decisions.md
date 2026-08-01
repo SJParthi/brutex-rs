@@ -441,6 +441,74 @@ failure mode this repository is organised against.
 
 ---
 
+## D-0019 · 2026-08-01 · The vendor is the first path segment
+
+**Decision.** Every vendor gets its own complete series. The store path gains
+a vendor segment at the front:
+
+```
+bars/<vendor>/<exchange>/<segment>/<symbol>/<timeframe>/<yyyy-mm>.bin
+bars/groww/NSE/INDEX/NIFTY/1min/2024-06.bin
+bars/dhan/NSE/INDEX/NIFTY/1min/2024-06.bin
+```
+
+A vendor can be added, re-pulled, or deleted by touching one directory and
+nothing else. No merge step, no precedence rule, no migration of anyone
+else's data.
+
+**Rejected — one canonical series with a provenance overlay.** Half the
+storage, and it still records where each bar came from. But it needs a
+precedence rule decided *before* any evidence exists about which vendor is
+more accurate, and once merged a vendor cannot be cleanly removed — its bars
+are already interleaved with everyone else's.
+
+**Rejected — one series, first writer wins, no provenance.** Cheapest, and it
+makes a vendor disagreement **invisible**. Two vendors handing over different
+prices for the same minute is exactly the kind of silent failure charter
+prohibition 6 exists to forbid.
+
+**Why the cost is acceptable.** A doubled series doubles storage: NIFTY at
+1-minute over 6.5 years is 34 MB, so two vendors is 68 MB. That is not a
+number worth trading a correctness property for.
+
+**Why O(1) is unaffected.** The path is still the index — one more string
+segment in a join that was already a join. Locating a slice remains a path
+construction and an open; no catalogue, no scan, no lookup. Adding a fifth
+vendor creates a directory and changes no code.
+
+---
+
+## D-0020 · 2026-08-01 · A vendor disagreement refuses the window and names it
+
+**Decision.** Both vendors' bars stay on disk. A cross-verification pass diffs
+the two series bar for bar; any mismatch beyond the tick grid is reported
+**loudly, with the exact timestamp and both values**, and the sweep **refuses
+that window** rather than silently choosing a side.
+
+**Rejected — primary vendor wins, log the difference.** Never blocks a run,
+which is precisely the problem: it lets a sweep produce a ranked result over
+data that another vendor disputes, and the dispute survives only as a log line
+nobody reads. A result that looks clean but rests on contested prices is worse
+than no result.
+
+**Rejected — deciding the rule later.** Tempting, because there is no
+measurement yet of how often the two vendors actually disagree. But the rule
+has to exist before the first sweep runs, and "we will decide when it happens"
+resolves in practice to whatever the code happens to do.
+
+**Why refusal rather than repair.** There is no principled way to pick a
+winner without external evidence. Both vendors claim to relay the same
+exchange feed, so a disagreement means at least one is wrong and nothing on
+this machine can say which. Refusing names the problem; picking hides it.
+
+**Consistent with what is already decided.** This is the same shape as
+D-0018's corporate-action rule — refuse the affected window and name the date
+— and the same shape as `Paisa::from_rupees_half_up` refusing a non-finite
+price rather than substituting one. A refusal is a fact; a substitution is a
+fabrication.
+
+---
+
 ## How to add an entry
 
 Next free ID, today's date, the decision in one sentence, the alternative
