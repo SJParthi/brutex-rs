@@ -509,6 +509,100 @@ fabrication.
 
 ---
 
+## D-0021 · 2026-08-01 · The lake is the source of F&O history; neither broker is
+
+**Decision.** Expired option and future history comes from the **existing lake
+on local disk**. Vendor APIs backfill only what the lake is missing. No
+historical F&O data is purchased.
+
+**Measured, not assumed** — a full survey of `~/.brutex/lake/bars/NSE/FNO`:
+
+| | |
+|---|---|
+| Contract directories | **116,086** — 115,927 options, 159 futures |
+| NIFTY option contracts | **60,996**, expiring **2020-01-02 → 2026-08-25** |
+| BANKNIFTY options | 54,931 |
+| Underlyings | NIFTY and BANKNIFTY only — no single stocks |
+| On disk | **18 GB**, 196,954 parquet files, **zero empty directories** |
+| **Absent from BOTH live vendor masters** | **115,272 — 99.3%** |
+
+Both brokers purge on expiry: the earliest index-option expiry in either live
+master is **2026-08-04**, three days after this measurement. Relying on the
+masters alone would lose 99.3% of the history that is already owned.
+
+**Contract identity is preserved independently of the directory names.**
+`~/.brutex/lake/registry.duckdb` holds a `contracts` table of **169,530 rows**
+(`exch, underlying, expiry_date, contract_symbol, strike, side,
+candle_status`), spanning NIFTY 2020-01-02 → 2026-12-29. **No on-disk
+directory is unknown to the registry.**
+
+**Option bars already carry computed greeks** — `iv, delta, gamma, theta,
+vega, rho, spot_at_bar, t_years_used, rate_used, greeks_provenance_id` — 17
+columns in total. The tick vendor quoted for this data **excludes greeks
+explicitly**.
+
+**Rejected — buying historical F&O.** Two quotes exist, ₹1,15,050 and
+₹3,04,787, for a superset of data already on disk, minus the greeks.
+
+**Rejected — refetching from the brokers.** 116,086 contracts against a rate
+limit, to reproduce what is already local.
+
+**The one real gap.** The registry knows **~15,900 contracts, almost entirely
+expiry-year 2024**, that have no bars on disk. That — and only that — is what
+a vendor backfill is for.
+
+---
+
+## D-0022 · 2026-08-01 · The converter is a numeric boundary, not a copy
+
+**Decision.** The lake→store converter **converts**; it does not transfer
+bytes. Two transformations are mandatory and each is a correctness boundary:
+
+| Lake | Store |
+|---|---|
+| prices as `double` | **`i64` paisa** — `CLAUDE.md` §7 |
+| `timestamp` INT64 µs **UTC** | same, but IST is UTC + 19,800 s at every display |
+
+**Why this is recorded rather than assumed.** The lake stores option OHLC as
+IEEE doubles. `CLAUDE.md` §7 says prices are paisa integers and never a float.
+A converter written as a copy would carry doubles into a store whose entire
+addressing and comparison model assumes integers. The spot survey measured the
+maximum deviation of `x·100` from an integer at **9.3 × 10⁻¹⁰ paisa**, so the
+conversion is exact — but it must actually happen.
+
+**Rejected — widening the store record to hold a float.** D-0002 and D-0011
+fix the 56-byte stride permanently.
+
+---
+
+## D-0023 · 2026-08-01 · Verified vendor capability for expired contracts
+
+**Decision.** Recorded as verified external facts, with the route that
+verified each, because two earlier claims in this session were wrong and were
+corrected only by going to the live source.
+
+| Fact | Route | Lane |
+|---|---|---|
+| Groww `/v1/historical/{expiries,contracts,candles}` exist; FNO **"available from 2020"**; `year` accepts **"2020 - current year"**; `groww_symbol` is constructible as Exchange·Symbol·`DDMmmYY`·Strike·`CE/PE/FUT`; 1-minute window **30 days** | `curl` on `groww.in`, server-rendered, three URLs with three distinct hashes and 24 content markers | verified |
+| The Groww endpoint is live | `curl` → **`401 "Missing token in request."`** — not a 404 | verified |
+| Dhan `/v2/charts/rollingoption`: **45 days** per call, intervals `1/5/15/30/60`, strike enum `ATM, ATM+10, ATM-10`, **last 5 years rolling**, index **and** stock options, returns IV/OI/spot | **live browser** on `docs.dhanhq.co` | verified |
+| **Dhan cannot reach 2020-01.** Five years *rolling* puts the floor at ~2021-08 and moving | live browser | verified |
+| Dhan has **no expired-futures endpoint** | live browser | verified |
+| Rate limits, either vendor · Dhan Data-API pricing · any behaviour with a real token | — | **UNVERIFIED** |
+
+**The method matters, and is part of the decision.** Dhan's documentation is a
+JavaScript application: three different URLs return one byte-identical 33,884
+byte shell to `curl`, containing **zero** content markers. Reading it without a
+browser produced a mangled capture from which a **non-existent `ATM±3` rule**
+was reconstructed and reported as fact. Groww's documentation is
+server-rendered and `curl` receives it intact — but `groww.in` is blocked in
+both browsers by policy, so `curl` is the only route available there.
+
+**No vendor claim enters this repository without naming the route that
+produced it.**
+
+---
+
 ## How to add an entry
 
 Next free ID, today's date, the decision in one sentence, the alternative

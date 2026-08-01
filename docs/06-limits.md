@@ -119,6 +119,30 @@ exactly the mistake the read-only-mapping decision was made to avoid.
 
 ---
 
+## 7b. What a green gate does not prove — measured 2026-08-01
+
+Four adversarial audits ran against a tree where **CI was green, 66 tests
+passed and coverage read 100.00%**. They found 11 CRITICAL and 17 HIGH
+defects. Two are worth keeping here permanently, because they are the shape of
+the mistake rather than an instance of it:
+
+| Defect | Why every gate stayed green |
+|---|---|
+| The decoder could not read **NIFTY**. `underlying_symbol` is empty on all 4,104 Groww cash/index rows, and the test fed a **different column** than the code reads. | Coverage proves lines ran. It cannot prove they ran on data shaped like reality. |
+| **All 200,460 Dhan rows were discarded** and reported as a routine `ForeignSegment` skip, because Dhan writes segments as single letters. | A mapping bug was indistinguishable from a legitimate refusal. |
+
+The rule both produce: **a test built from a hand-written fixture proves the
+code runs; only a test built from a real vendor row proves it is right.**
+
+Ten further findings shared one shape — a guard that silently turns a step into
+a no-op (`[ -d benches ]`, `[ -f crates/web/… ]`, status `—`, `|| true`, a
+non-member crate, a missing `[lints]`). Gate 8 is the live example: it probes
+for a **repository-root** `benches/`, but Cargo benches live at
+`crates/<name>/benches/`, so C-01..C-04 are unenforceable **in perpetuity**,
+not merely until benches are written.
+
+---
+
 ## 8. Open questions, carried forward
 
 | Question | Status |
@@ -127,6 +151,10 @@ exactly the mistake the read-only-mapping decision was made to avoid.
 | Secondary-vendor India VIX candle availability | undocumented — treat as a hard gate |
 | Primary-vendor per-second request cap | undocumented; the production ceiling is a chosen value, not a measured one |
 | ~~Whether a bar timestamp marks the open or the close of its minute~~ | **RESOLVED — open.** See §9. |
+
+| Rate limits for either broker's historical endpoints | documented figures contradict each other across pages; neither measured |
+| Dhan Data-API pricing | "additional charges" stated, amount never published |
+| Whether any historical endpoint works with a real token | never executed — every finding is documentation or an unauthenticated probe |
 
 Each of these is a probe someone must run against a live credential. Until
 then they stay in this table and out of any claim.
