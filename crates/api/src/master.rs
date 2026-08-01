@@ -1,0 +1,593 @@
+//! Reading a vendor instrument master from disk.
+//!
+//! # Columns are found by NAME, never by position
+//!
+//! The primary broker publishes 19 columns and ships **21** — `internal_trading_symbol`
+//! and `is_intraday` are undocumented — and the documented *order* is wrong:
+//! the docs list `lot_size` before `expiry_date`, the file has
+//! `expiry_date,strike_price,lot_size`.
+//!
+//! A positional reader would therefore put a lot size where a strike belongs
+//! and never fail, because both are numbers. Every field here is located by
+//! header name, and a missing header is a refusal rather than a default.
+//!
+//! # Which names, though, is the vendor's business
+//!
+//! The name table itself lives in [`brutex_core::vendor`], reached through
+//! [`Vendor::master_columns`]. It was here, as a `match` on the vendor, and it
+//! could not stay: [`Vendor`] is `#[non_exhaustive]`, so a match on it in this
+//! crate requires a wildcard arm that no test can reach and the coverage gate
+//! can never satisfy. Moving the table to the crate that owns the enum makes
+//! that match exhaustive and provable, and it puts the column names beside the
+//! segment and instrument-type alphabets they belong with — one place to look
+//! when a vendor renames a column, rather than one per reader.
+
+use brutex_core::isin::Isin;
+use brutex_core::vendor::{Decoded, Listing, MasterRow, Skip, Vendor, decode_master_row};
+use std::collections::{BTreeMap, HashMap};
+
+/// What one master file produced.
+#[derive(Debug, Default)]
+pub struct Loaded {
+    /// Rows that decoded into an instrument this engine stores, each with the
+    /// vendor's ISIN beside its key.
+    pub kept: Vec<Listing>,
+    /// Rows declined, counted by reason.
+    pub skipped: HashMap<&'static str, usize>,
+    /// Every declined row that carried a parseable ISIN, and why it was
+    /// declined.
+    ///
+    /// This is what makes an **eligibility** disagreement visible. Before it
+    /// existed a declined row was dropped right here, so the merge could only
+    /// ever compare rows both vendors had already agreed to keep, and it
+    /// printed `0 conflicts` while the two masters disagreed about 62
+    /// instruments that carried the same ISIN in both files. See
+    /// [`crate::merge::Merged::eligibility`].
+    pub declined: Vec<(Isin, Skip)>,
+    /// Rows that could not be understood, with the line number and the reason.
+    ///
+    /// Held rather than dropped: a row we failed to parse is how an instrument
+    /// silently vanishes. [`Loaded::errors_by_reason`] is what actually puts
+    /// them on the page — for a long time this vector was allocated, formatted
+    /// and then read only for its `.len()`, so "104 unreadable" was the whole
+    /// of what an operator was ever told and the reason had to be grepped out
+    /// of the raw CSV by hand.
+    pub errors: Vec<(usize, String)>,
+    /// Every listing class this engine does not recognise, and how often.
+    ///
+    /// Separate from [`Loaded::skipped`] because the count alone does not name
+    /// the code, and the code is the entire diagnostic: "2,438 rows declined
+    /// under `EQX`" says an alphabet moved, while "2,438 not an equity
+    /// listing" says nothing at all. See
+    /// [`brutex_core::vendor::Skip::UnrecognisedListingClass`].
+    pub unrecognised: BTreeMap<String, usize>,
+}
+
+impl Loaded {
+    /// Total rows declined.
+    #[must_use]
+    pub fn skipped_total(&self) -> usize {
+        self.skipped.values().sum()
+    }
+
+    /// The decline reasons and their counts, ordered so a report is stable.
+    #[must_use]
+    pub fn skipped_by_reason(&self) -> Vec<(&'static str, usize)> {
+        let mut v: Vec<(&'static str, usize)> =
+            self.skipped.iter().map(|(&k, &n)| (k, n)).collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// Each distinct parse failure, how many rows hit it, and the first line
+    /// that did.
+    ///
+    /// Grouped rather than listed row by row so the output is bounded without
+    /// being truncated: every *reason* is named, always, and the line number
+    /// is where to look. A bare total is what this replaces.
+    #[must_use]
+    pub fn errors_by_reason(&self) -> Vec<(&str, usize, usize)> {
+        let mut by: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+        for (line, reason) in &self.errors {
+            let e = by.entry(reason.as_str()).or_insert((0, *line));
+            e.0 += 1;
+            e.1 = e.1.min(*line);
+        }
+        by.into_iter()
+            .map(|(reason, (n, first))| (reason, n, first))
+            .collect()
+    }
+}
+
+/// Locates the columns this decoder needs, by name.
+#[derive(Debug, Clone, Copy)]
+struct Columns {
+    exchange: usize,
+    segment: usize,
+    underlying: usize,
+    trading_symbol: usize,
+    instrument_type: usize,
+    listing_class: usize,
+    isin: usize,
+    expiry: usize,
+    strike: usize,
+    option_side: Option<usize>,
+}
+
+impl Columns {
+    /// Finds each required column in the header row.
+    ///
+    /// # Errors
+    ///
+    /// The name of the first column that is absent. A missing column is a
+    /// refusal and never a default: a defaulted column reads an empty string
+    /// for every row, which the decoder would report as thousands of routine
+    /// skips rather than as the mapping bug it is.
+    fn locate(header: &str, vendor: Vendor) -> Result<Self, String> {
+        let idx: HashMap<&str, usize> = header
+            .trim_end()
+            .split(',')
+            .enumerate()
+            .map(|(i, name)| (name.trim(), i))
+            .collect();
+        let need = |n: &str| -> Result<usize, String> {
+            idx.get(n)
+                .copied()
+                .ok_or_else(|| format!("no column {n:?}"))
+        };
+        let names = vendor.master_columns();
+        Ok(Self {
+            exchange: need(names.exchange)?,
+            segment: need(names.segment)?,
+            underlying: need(names.underlying)?,
+            trading_symbol: need(names.trading_symbol)?,
+            instrument_type: need(names.instrument_type)?,
+            listing_class: need(names.listing_class)?,
+            isin: need(names.isin)?,
+            expiry: need(names.expiry)?,
+            strike: need(names.strike)?,
+            option_side: names.option_side.map(need).transpose()?,
+        })
+    }
+
+    /// The highest column index this decoder reads.
+    ///
+    /// A row with fewer fields than this cannot be decoded, and must not be
+    /// *guessed* at — see the shortfall check in [`load`].
+    fn widest(&self) -> usize {
+        // Folded from `exchange` rather than `max()`ed over everything,
+        // because `Iterator::max` returns an `Option` whose `None` arm cannot
+        // happen here — and a branch no test can enter is a branch nobody has
+        // checked. `option_side` chains in only for the vendor that has one.
+        [
+            self.segment,
+            self.underlying,
+            self.trading_symbol,
+            self.instrument_type,
+            self.listing_class,
+            self.isin,
+            self.expiry,
+            self.strike,
+        ]
+        .into_iter()
+        .chain(self.option_side)
+        .fold(self.exchange, usize::max)
+    }
+}
+
+/// Reads a vendor master and decodes every row.
+///
+/// # Errors
+///
+/// A message naming what was wrong with the file itself — unreadable, empty,
+/// or missing a required column.
+pub fn load(path: &std::path::Path, vendor: Vendor) -> Result<Loaded, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut lines = text.lines();
+    let header = lines.next().ok_or_else(|| "file is empty".to_owned())?;
+    let cols = Columns::locate(header, vendor)?;
+
+    let widest = cols.widest();
+    let mut out = Loaded::default();
+    for (n, line) in lines.enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        let f: Vec<&str> = line.split(',').collect();
+        // A ROW TOO SHORT TO HOLD THE COLUMNS IS AN ERROR, NOT A DEFAULT.
+        //
+        // Defaulting a missing field to `""` put the empty string into the
+        // listing class, where the gate read it as a series it does not
+        // recognise and declined a genuine share as routine business, with
+        // `0 unreadable` beside it. `Columns::locate` already refuses a
+        // missing HEADER for exactly this hazard; this is the same hazard one
+        // row at a time, and the real masters are uniform — every Dhan row has
+        // 33 fields and every Groww row has 21 — so a short row is an anomaly
+        // and never the normal case.
+        if f.len() <= widest {
+            out.errors.push((
+                n + 2,
+                format!(
+                    "row has {} field(s); the columns this vendor needs run to {}",
+                    f.len(),
+                    widest + 1
+                ),
+            ));
+            continue;
+        }
+        let get = |i: usize| -> &str { f.get(i).copied().unwrap_or("") };
+        let row = MasterRow {
+            exchange: get(cols.exchange),
+            segment: get(cols.segment),
+            underlying: get(cols.underlying),
+            trading_symbol: get(cols.trading_symbol),
+            instrument_type: get(cols.instrument_type),
+            listing_class: get(cols.listing_class),
+            isin: get(cols.isin),
+            expiry: get(cols.expiry),
+            strike_rupees: get(cols.strike),
+            option_side: cols.option_side.map_or("", get),
+        };
+        match decode_master_row(vendor, row) {
+            Ok(Decoded::Keep(l)) => out.kept.push(l),
+            // The reason text belongs to the Skip variant, in the crate that
+            // owns it. A `match` here would need a wildcard -- Skip is
+            // `#[non_exhaustive]` -- and a wildcard silently files every
+            // variant added later under whatever label it happens to name.
+            Ok(Decoded::Skipped(d)) => {
+                *out.skipped.entry(d.reason.reason()).or_insert(0) += 1;
+                if let Some(isin) = d.isin {
+                    out.declined.push((isin, d.reason));
+                }
+                // The COUNT says an alphabet moved; the CODE says which one.
+                if d.reason == Skip::UnrecognisedListingClass {
+                    *out.unrecognised
+                        .entry(row.listing_class.trim().to_owned())
+                        .or_insert(0) += 1;
+                }
+            }
+            Err(e) => out.errors.push((n + 2, e.to_string())),
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::indexing_slicing,
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic
+)]
+mod tests {
+    use super::*;
+    use std::io::Write as _;
+
+    fn tmp(name: &str, body: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("brutex-master-{name}.csv"));
+        let mut f = std::fs::File::create(&p).expect("create");
+        f.write_all(body.as_bytes()).expect("write");
+        p
+    }
+
+    #[test]
+    fn columns_are_found_by_name_not_position() {
+        // The columns are deliberately in a DIFFERENT order from the docs and
+        // carry two undocumented trailing fields, exactly like the real file.
+        let body = "is_intraday,segment,exchange,instrument_type,trading_symbol,series,\
+                    isin,expiry_date,strike_price,underlying_symbol,internal_trading_symbol\n\
+                    0,CASH,NSE,IDX,NIFTY,,NIFTY,,,,x\n";
+        let p = tmp("byname", body);
+        let got = load(&p, Vendor::Groww).expect("loads");
+        assert_eq!(got.kept.len(), 1);
+        assert_eq!(got.kept[0].key.underlying.as_str(), "NIFTY");
+        assert!(got.kept[0].key.is_sweepable());
+        assert_eq!(got.kept[0].isin, None, "an index has no ISIN");
+        assert!(got.errors.is_empty());
+    }
+
+    #[test]
+    fn a_missing_column_is_refused_and_named() {
+        let p = tmp("missing", "exchange,segment\nNSE,CASH\n");
+        let err = load(&p, Vendor::Groww).expect_err("must refuse");
+        // The FIRST missing column is named, whichever it is -- the point is
+        // that it refuses and says which, never that it defaults.
+        assert!(err.starts_with("no column"), "got {err}");
+        assert!(err.contains("underlying_symbol"), "got {err}");
+    }
+
+    #[test]
+    fn every_column_a_vendor_needs_is_required_and_named_when_absent() {
+        // One case per required column, built by REMOVING that column from an
+        // otherwise complete header. A column that could go missing without a
+        // refusal would be read as an empty string on every row, and the
+        // decoder would report that as thousands of routine skips rather than
+        // as the mapping bug it is.
+        for vendor in [Vendor::Groww, Vendor::Dhan] {
+            let c = vendor.master_columns();
+            let mut all = vec![
+                c.exchange,
+                c.segment,
+                c.underlying,
+                c.trading_symbol,
+                c.instrument_type,
+                c.listing_class,
+                c.isin,
+                c.expiry,
+                c.strike,
+            ];
+            all.extend(c.option_side);
+            // The complete header is accepted, or the cases below prove
+            // nothing about which column was missing.
+            let full = format!("{}\n", all.join(","));
+            assert!(
+                load(&tmp("full", &full), vendor).is_ok(),
+                "the complete header must load"
+            );
+            for missing in &all {
+                let header: Vec<&str> = all.iter().copied().filter(|n| n != missing).collect();
+                let body = format!("{}\n", header.join(","));
+                let err = load(&tmp("dropped", &body), vendor).expect_err("must refuse");
+                assert!(
+                    err.contains(missing),
+                    "dropping {missing} must name it, got {err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_new_class_and_isin_columns_are_required_by_their_own_names() {
+        // Each vendor spells them differently, and a file missing either is a
+        // refusal that NAMES the column -- never a silent empty string, which
+        // the decoder would report as thousands of routine skips.
+        let groww = "exchange,segment,underlying_symbol,trading_symbol,instrument_type,\
+                     expiry_date,strike_price";
+        let err = load(&tmp("noseries", &format!("{groww},isin\n")), Vendor::Groww)
+            .expect_err("must refuse");
+        assert!(err.contains("\"series\""), "got {err}");
+        let err = load(&tmp("noisin", &format!("{groww},series\n")), Vendor::Groww)
+            .expect_err("must refuse");
+        assert!(err.contains("\"isin\""), "got {err}");
+
+        let dhan = "EXCH_ID,SEGMENT,UNDERLYING_SYMBOL,SYMBOL_NAME,INSTRUMENT,\
+                    SM_EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE";
+        let err = load(&tmp("noclass", &format!("{dhan},ISIN\n")), Vendor::Dhan)
+            .expect_err("must refuse");
+        assert!(err.contains("\"SERIES\""), "got {err}");
+        let err = load(
+            &tmp("nodhanisin", &format!("{dhan},SERIES\n")),
+            Vendor::Dhan,
+        )
+        .expect_err("must refuse");
+        assert!(err.contains("\"ISIN\""), "got {err}");
+        // The side column is Dhan's alone, and it is required there.
+        let err = load(
+            &tmp(
+                "noside",
+                "EXCH_ID,SEGMENT,UNDERLYING_SYMBOL,SYMBOL_NAME,INSTRUMENT,SM_EXPIRY_DATE,\
+                 STRIKE_PRICE,ISIN,SERIES\n",
+            ),
+            Vendor::Dhan,
+        )
+        .expect_err("must refuse");
+        assert!(err.contains("\"OPTION_TYPE\""), "got {err}");
+        // And a file WITHOUT `INSTRUMENT_TYPE` loads: it is the measurably
+        // wrong column, so it is neither read nor required. D-0025.
+        assert!(
+            load(
+                &tmp(
+                    "noinstrtype",
+                    "EXCH_ID,SEGMENT,UNDERLYING_SYMBOL,SYMBOL_NAME,INSTRUMENT,SM_EXPIRY_DATE,\
+                     STRIKE_PRICE,ISIN,SERIES,OPTION_TYPE\n",
+                ),
+                Vendor::Dhan,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn the_equity_gate_runs_on_a_real_file_and_the_bond_loses() {
+        // The CHOLAFIN pair, in the order the real Dhan master has them: the
+        // 7.5% NCD FIRST, the share second. Before the gate, insert-if-absent
+        // resolved the ticker to the bond. Both lines are verbatim, and the
+        // column the gate reads is SERIES -- `D1` for the NCD, `EQ` for the
+        // share -- not the INSTRUMENT_TYPE beside it.
+        let body = "EXCH_ID,SEGMENT,ISIN,INSTRUMENT,UNDERLYING_SYMBOL,SYMBOL_NAME,\
+                    INSTRUMENT_TYPE,SERIES,SM_EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE\n\
+                    NSE,E,INE121A08PJ0,EQUITY,CHOLAFIN,CHOLAMANDALAM IN & FIN CO,DEB,D1,,,\n\
+                    NSE,E,INE121A01024,EQUITY,CHOLAFIN,CHOLAMANDALAM IN & FIN CO,ES,EQ,,,\n";
+        let got = load(&tmp("cholafin", body), Vendor::Dhan).expect("loads");
+        assert_eq!(got.kept.len(), 1, "only the share survives");
+        assert_eq!(got.kept[0].key.underlying.as_str(), "CHOLAFIN");
+        assert_eq!(
+            got.kept[0].isin.map(|i| i.to_string()).as_deref(),
+            Some("INE121A01024"),
+            "and it is the SHARE, identified by its own ISIN"
+        );
+        assert_eq!(got.skipped.get("not an equity listing"), Some(&1));
+        assert!(got.errors.is_empty());
+        // The bond's ISIN survives the decline, so another vendor keeping the
+        // same paper can be recognised as a disagreement.
+        assert_eq!(got.declined.len(), 1);
+        assert_eq!(got.declined[0].0.as_str(), "INE121A08PJ0");
+        assert_eq!(got.declined[0].1, Skip::NotEquityListing);
+        assert!(got.unrecognised.is_empty(), "D1 is a series we know");
+    }
+
+    #[test]
+    fn an_unrecognised_series_is_recorded_under_the_code_itself() {
+        // A count under a shared label cannot distinguish "NSE minted a debt
+        // series" from "the vendor renamed the equity series". The CODE can.
+        let body = "EXCH_ID,SEGMENT,ISIN,INSTRUMENT,UNDERLYING_SYMBOL,SYMBOL_NAME,\
+                    INSTRUMENT_TYPE,SERIES,SM_EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE\n\
+                    NSE,E,INE002A01018,EQUITY,RELIANCE,RELIANCE INDUSTRIES,ES,  EQX  ,,,\n\
+                    NSE,E,INE121A01024,EQUITY,CHOLAFIN,CHOLA,ES,EQX,,,\n\
+                    NSE,E,INE775A08105,EQUITY,MOTHERSON,MOTHERSON NCD,DEB,D1,,,\n";
+        let got = load(&tmp("unrecognised", body), Vendor::Dhan).expect("loads");
+        assert_eq!(got.kept.len(), 0);
+        assert_eq!(got.skipped.get("unrecognised listing class"), Some(&2));
+        assert_eq!(got.skipped.get("not an equity listing"), Some(&1));
+        // Trimmed, so the padded and unpadded forms are ONE code and not two.
+        assert_eq!(got.unrecognised.get("EQX"), Some(&2));
+        assert_eq!(got.unrecognised.len(), 1);
+    }
+
+    #[test]
+    fn a_row_with_too_few_fields_is_unreadable_and_names_the_shortfall() {
+        // A defaulted field landed the empty string in the listing class,
+        // where the gate declined a genuine share as routine business with
+        // `0 unreadable` beside it. `Columns::locate` already refuses a
+        // missing HEADER for this hazard; this is the same hazard per row.
+        let body = "exchange,segment,underlying_symbol,trading_symbol,instrument_type,\
+                    series,isin,expiry_date,strike_price\n\
+                    NSE,CASH,,RELIANCE,EQ\n\
+                    NSE,CASH,,CHOLAFIN,EQ,EQ,INE121A01024,,\n";
+        let got = load(&tmp("shortrow", body), Vendor::Groww).expect("loads");
+        assert_eq!(got.kept.len(), 1, "only the intact row decodes");
+        assert_eq!(got.errors.len(), 1);
+        assert_eq!(got.errors[0].0, 2, "the line is named");
+        // Bound rather than called inside the failure message: a call there is
+        // a region that only runs when the assertion FAILS, so no passing test
+        // can ever cover it.
+        let reason = &got.errors[0].1;
+        assert!(
+            reason.contains("row has 5 field(s)") && reason.contains("run to 9"),
+            "got {reason}"
+        );
+        assert!(
+            got.skipped.is_empty(),
+            "a truncated share is not a routine decline: {:?}",
+            got.skipped
+        );
+    }
+
+    #[test]
+    fn unreadable_rows_are_grouped_by_reason_with_the_first_line_that_hit_it() {
+        // `errors` was allocated, formatted and read only for `.len()`, so an
+        // operator was told `104 unreadable` and nothing else. `NIFTY 100` is
+        // a real Dhan index ticker; a space is not a legal Symbol, and 104
+        // rows of the real master are exactly that shape.
+        let body = "exchange,segment,underlying_symbol,trading_symbol,instrument_type,\
+                    series,isin,expiry_date,strike_price\n\
+                    NSE,CASH,,NIFTY 100,IDX,,NIFTY,,\n\
+                    NSE,CASH\n\
+                    NSE,CASH,,NIFTY 200,IDX,,NIFTY,,\n";
+        let got = load(&tmp("grouped", body), Vendor::Groww).expect("loads");
+        let by = got.errors_by_reason();
+        assert_eq!(by.len(), 2, "two distinct reasons: {by:?}");
+        assert_eq!(
+            by,
+            vec![
+                ("malformed instrument identifier", 2, 2),
+                (
+                    "row has 2 field(s); the columns this vendor needs run to 9",
+                    1,
+                    3
+                ),
+            ],
+            "every reason named, with its count and the FIRST line it hit"
+        );
+        assert!(
+            Loaded::default().errors_by_reason().is_empty(),
+            "and nothing to say when nothing failed"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_or_empty_file_is_refused() {
+        let missing = std::env::temp_dir().join("brutex-does-not-exist.csv");
+        assert!(load(&missing, Vendor::Groww).is_err());
+        let p = tmp("empty", "");
+        assert!(
+            load(&p, Vendor::Groww)
+                .expect_err("empty")
+                .contains("empty")
+        );
+    }
+
+    #[test]
+    fn skips_are_counted_by_reason_and_errors_keep_their_line_number() {
+        let body = "exchange,segment,underlying_symbol,trading_symbol,instrument_type,\
+                    series,isin,expiry_date,strike_price\n\
+                    BSE,CASH,,SENSEX,IDX,,,,\n\
+                    NSE,COMMODITY,GOLD,GOLD,FUT,,,2026-08-05,\n\
+                    NSE,FNO,031NSETEST,X,FUT,,,2036-11-27,\n\
+                    NSE,CASH,,SOMEBOND,EQ,N2,INE002A01018,,\n\
+                    NSE,CASH,,SOMESME,EQ,SM,INE002A01018,,\n\
+                    NSE,FNO,NIFTY,X,ZZ,,,2026-08-04,1\n";
+        let p = tmp("skips", body);
+        let got = load(&p, Vendor::Groww).expect("loads");
+        assert_eq!(got.kept.len(), 0);
+        assert_eq!(got.skipped.get("foreign exchange"), Some(&1));
+        assert_eq!(got.skipped.get("segment not stored"), Some(&1));
+        assert_eq!(got.skipped.get("exchange test instrument"), Some(&1));
+        assert_eq!(got.skipped.get("not an equity listing"), Some(&1));
+        assert_eq!(got.skipped.get("SME board"), Some(&1));
+        assert_eq!(got.skipped_total(), 5);
+        assert_eq!(
+            got.skipped_by_reason(),
+            vec![
+                ("SME board", 1),
+                ("exchange test instrument", 1),
+                ("foreign exchange", 1),
+                ("not an equity listing", 1),
+                ("segment not stored", 1),
+            ],
+            "a report needs a stable order, not a hash order"
+        );
+        assert_eq!(got.errors.len(), 1, "the ZZ type is unreadable");
+        assert_eq!(got.errors[0].0, 7, "line numbers count the header");
+    }
+
+    #[test]
+    fn a_short_row_is_an_error_and_never_an_index_panic() {
+        let body = "exchange,segment,underlying_symbol,trading_symbol,instrument_type,\
+                    series,isin,expiry_date,strike_price\n\
+                    NSE,CASH\n";
+        let p = tmp("short", body);
+        let got = load(&p, Vendor::Groww).expect("loads");
+        // Too short to hold the columns -> an error naming the shortfall,
+        // never an index panic and never a defaulted empty field.
+        assert_eq!(got.errors.len(), 1);
+        assert!(got.kept.is_empty() && got.skipped.is_empty());
+    }
+
+    #[test]
+    fn dhan_columns_use_their_own_names() {
+        let body = "EXCH_ID,SEGMENT,SECURITY_ID,ISIN,INSTRUMENT,UNDERLYING_SYMBOL,\
+                    SYMBOL_NAME,SERIES,SM_EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE\n\
+                    NSE,I,13,NA,INDEX,NIFTY,NIFTY,NA,0001-01-01,,\n\
+                    NSE,D,1,,OPTIDX,NIFTY,NIFTY,,2026-08-04,19450.00000,CE\n";
+        let p = tmp("dhan", body);
+        let got = load(&p, Vendor::Dhan).expect("loads");
+        // The INDEX row is kept. The OPTION row is a LIVE contract and is
+        // skipped by design -- backtests run on expired contracts from the
+        // historical endpoints and the lake, never on the live chain.
+        assert_eq!(got.kept.len(), 1, "only the index is stored");
+        assert!(got.errors.is_empty());
+        assert!(
+            got.kept[0].key.is_sweepable(),
+            "NIFTY from Dhan is sweepable"
+        );
+        assert_eq!(
+            got.kept[0].isin, None,
+            "`NA` in the ISIN column is not an ISIN"
+        );
+        assert_eq!(got.skipped_total(), 1, "the live option was declined");
+    }
+
+    #[test]
+    fn blank_lines_are_ignored() {
+        let body = "exchange,segment,underlying_symbol,trading_symbol,instrument_type,\
+                    series,isin,expiry_date,strike_price\n\
+                    \n\
+                    NSE,CASH,,NIFTY,IDX,,NIFTY,,\n\
+                    \n";
+        let p = tmp("blank", body);
+        let got = load(&p, Vendor::Groww).expect("loads");
+        assert_eq!(got.kept.len(), 1);
+        assert_eq!(got.errors.len(), 0);
+    }
+}

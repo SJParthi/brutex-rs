@@ -1,0 +1,31 @@
+[package]
+name         = "store"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+publish      = { workspace = true }
+description  = "The fixed-stride bar file: bytes on disk, addressed by arithmetic."
+
+[dependencies]
+# The lib target is `brutex_core`, and it MUST be referred to by that name.
+# Depending on it under the key `core` shadows the sysroot crate inside
+# rustdoc's generated doc-test harness, which itself references
+# `core::result` and `core::fmt` -- so every doc-test in this crate fails to
+# compile with "cannot find `result` in `core`". Proven twice now: once in
+# crates/core itself, once here.
+brutex_core = { path = "../core", package = "core", version = "0.1.0" }
+
+# ---------------------------------------------------------------------------
+# There is no checksum dependency, on purpose.
+#
+# `crc32c` is listed in the workspace dependency table, but taking it here
+# would add a package to Cargo.lock during a session in which another workflow
+# is editing a second crate's manifest, and CI gate 4 builds `--locked
+# --offline`. The polynomial is four lines of arithmetic (`src/crc.rs`) and is
+# verified against the published check value for `b"123456789"`, so the
+# dependency buys nothing this crate cannot prove about itself.
+# ---------------------------------------------------------------------------
+
+[lints]
+workspace = true
