@@ -91,7 +91,7 @@ pub fn master_paths(dir: &Path) -> Vec<(Vendor, PathBuf)> {
 
 /// The directory the masters are read from.
 ///
-/// `BRUTEX_MASTERS`, or the working directory. This is the only place the
+/// `BRUTEX_MASTERS`, or `$HOME/.brutex/masters`. This is the only place the
 /// environment is consulted; everything below takes the directory as an
 /// argument, so nothing else has to touch process-wide state to be
 /// deterministic — and nothing can, since setting an environment variable is
@@ -107,7 +107,38 @@ pub fn masters_dir() -> PathBuf {
 /// the environment of a process running tests in parallel.
 #[must_use]
 fn masters_dir_from(value: Option<std::ffi::OsString>) -> PathBuf {
-    value.map_or_else(|| PathBuf::from("."), PathBuf::from)
+    value.map_or_else(default_masters_dir, PathBuf::from)
+}
+
+/// Where the masters live when `BRUTEX_MASTERS` says nothing.
+///
+/// `$HOME/.brutex/masters`, not the working directory. The masters are ~50 MB
+/// of vendor CSV and `.csv` is not an allowed tracked extension (CLAUDE.md §2),
+/// so they can never live in the repository — which means "the working
+/// directory" is only ever right when the operator happens to have `cd`-ed
+/// somewhere specific. Launching from anywhere else found no files and rendered
+/// `UNAVAILABLE`, correctly reporting a real absence caused entirely by the
+/// default.
+///
+/// Falls back to `.` only if `HOME` is unset, which is a broken environment
+/// rather than a supported one; the page then says `UNAVAILABLE` and names the
+/// vendor, as it does for any missing file.
+fn default_masters_dir() -> PathBuf {
+    default_masters_dir_from(std::env::var_os("HOME"))
+}
+
+/// The default implied by a value of `HOME`.
+///
+/// Split for the same reason [`masters_dir_from`] is: both outcomes have to be
+/// testable, and a test cannot unset `HOME` — `set_var` is `unsafe` under
+/// edition 2024, this crate forbids `unsafe`, and mutating process-wide state
+/// would race every other test in the binary.
+#[must_use]
+fn default_masters_dir_from(home: Option<std::ffi::OsString>) -> PathBuf {
+    home.map_or_else(
+        || PathBuf::from("."),
+        |home| PathBuf::from(home).join(".brutex").join("masters"),
+    )
 }
 
 /// What one read of the masters produced: the universe, the notes, and whether
@@ -783,15 +814,36 @@ mod tests {
     }
 
     #[test]
-    fn the_masters_directory_comes_from_the_environment_or_is_the_cwd() {
+    fn the_masters_directory_comes_from_the_environment_or_defaults_under_home() {
         // Tested through the value rather than by setting the variable: under
         // edition 2024 `set_var` is unsafe, this crate forbids unsafe, and a
         // test that mutated process-wide state would be racing every other
         // test in the binary anyway.
-        assert_eq!(masters_dir_from(None), PathBuf::from("."));
+        //
+        // The default is asserted by SHAPE, not by a literal: the home
+        // directory differs per machine and per CI runner, and hard-coding one
+        // would pass here and fail everywhere else.
+        // Absent value delegates to the default, exactly. Asserted against the
+        // function rather than against a literal path: the home directory
+        // differs per machine and per CI runner, so a literal would pass here
+        // and fail everywhere else. The default's own two arms are pinned to
+        // literals below, where the input IS controlled.
+        assert_eq!(masters_dir_from(None), default_masters_dir());
         assert_eq!(
             masters_dir_from(Some("/somewhere/else".into())),
             PathBuf::from("/somewhere/else")
+        );
+        // Both arms of the default, driven by value rather than by mutating
+        // the environment.
+        assert_eq!(
+            default_masters_dir_from(Some("/home/who".into())),
+            PathBuf::from("/home/who/.brutex/masters")
+        );
+        assert_eq!(
+            default_masters_dir_from(None),
+            PathBuf::from("."),
+            "no HOME is a broken environment, not a supported one — the page \
+             then says UNAVAILABLE and names the vendor"
         );
     }
 
@@ -1446,16 +1498,27 @@ mod tests {
     #[tokio::test]
     async fn run_reports_and_refuses_nonsense_with_different_codes() {
         // `run` reads BRUTEX_MASTERS, and a test cannot set it -- `set_var` is
-        // unsafe under edition 2024 and this crate forbids unsafe. The working
-        // directory during `cargo test` is the crate root, which holds no
-        // master at all, so this is the both-vendors-unavailable path and the
-        // exit code has to say so. `tests/binary.rs` drives the clean path,
-        // where it CAN set the variable, on a real child process.
-        assert_eq!(
-            run(&argv(&["report"]), fired()).await,
-            DEGRADED,
-            "no master anywhere is not a successful report"
-        );
+        // unsafe under edition 2024 and this crate forbids unsafe.
+        //
+        // So this test asserts only what it CONTROLS. It used to assert that
+        // `report` returns DEGRADED, on the premise that the working directory
+        // holds no master; that premise was always a property of the machine
+        // rather than of the code, and it stopped holding the moment the
+        // default moved to $HOME/.brutex/masters, where an operator's real
+        // masters live. A test whose expected value depends on whether the
+        // person running it has downloaded some files is not a test.
+        //
+        // `report` is exercised over a controlled directory by
+        // `a_report_names_every_vendor_and_says_whether_it_is_clean`, and
+        // end-to-end by `tests/binary.rs`, which CAN set the variable because
+        // it spawns a real child process.
+        // Two independent assertions rather than `a == OK || a == DEGRADED`:
+        // whichever side of that `||` is true on this machine, the other never
+        // evaluates, and an expression no test can reach is a region the 100%
+        // gate cannot cover.
+        let reported = run(&argv(&["report"]), fired()).await;
+        assert_ne!(reported, FAILED, "report ran; it did not fail to run");
+        assert_ne!(reported, MISUSED, "`report` is an understood command");
         assert_eq!(run(&argv(&["--wat"]), fired()).await, MISUSED);
         assert_ne!(DEGRADED, OK, "a refused universe is not a success");
         assert_ne!(DEGRADED, FAILED, "the run worked; its ANSWER is refused");
