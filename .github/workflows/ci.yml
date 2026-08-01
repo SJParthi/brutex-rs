@@ -267,8 +267,11 @@ jobs:
           # This is a CI tool version, not a workspace dependency: it adds
           # nothing to the dependency graph and needs no ledger entry. The
           # constraint stays bounded rather than floating, so a future breaking
-          # change is a visible edit here.
-          cargo install cargo-deny --locked --version ^0.18
+          # 0.18.9 needs rustc 1.88 and rust-toolchain.toml pins 1.85.0, so the
+          # version is pinned EXACTLY at 0.18.3 -- the newest release cargo
+          # itself reports as supporting 1.85.0. A caret range would silently
+          # re-break the moment a newer cargo-deny raises its MSRV again.
+          cargo install cargo-deny --locked --version =0.18.3
           cargo deny check
 
       - name: Tests
