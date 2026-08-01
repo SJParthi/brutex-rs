@@ -23,7 +23,7 @@ pub const PAISA_PER_RUPEE: i64 = 100;
 ///
 /// Ordering is numeric ordering, so a `Paisa` can be compared, sorted and used
 /// as a map key without a comparator. Arithmetic is deliberately *not*
-/// implemented through [`core::ops`]: a bare `+` on two prices silently
+/// implemented through [`std::ops`]: a bare `+` on two prices silently
 /// produces a meaningless value when one of them is a difference and the other
 /// is a level, and the checked constructors below make the intent explicit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -76,9 +76,9 @@ impl Paisa {
     /// # Examples
     ///
     /// ```
-    /// use core::price::Paisa;
+    /// use brutex_core::price::Paisa;
     /// assert_eq!(Paisa::from_rupees_half_up(23_109.55)?.raw(), 2_310_955);
-    /// # Ok::<(), core::error::PriceError>(())
+    /// # Ok::<(), brutex_core::error::PriceError>(())
     /// ```
     // This is the ONLY function in the workspace permitted to do floating-point
     // arithmetic, and the allow is written here rather than relaxed at the

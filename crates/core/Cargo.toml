@@ -23,3 +23,12 @@ description  = "Types, errors, the frozen condition table, and the trading calen
 
 [lints]
 workspace = true
+
+[lib]
+# The PACKAGE is `core` — docs/01-architecture.md names it that, and gates 7
+# and 9 match on the dependency key `core`. But the LIB TARGET cannot be
+# `core`: it lands in the extern prelude and shadows the sysroot crate.
+# Rustdoc's own generated doc-test harness references `core::result` and
+# `core::fmt`, so a crate named `core` breaks rustdoc itself. Proven, not
+# assumed: doc-tests failed with "cannot find `result` in `core`".
+name = "brutex_core"

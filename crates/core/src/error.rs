@@ -5,10 +5,13 @@
 //! name the reason, or refuse — never silently. An error variant that means
 //! "something was wrong, here is a default anyway" does not exist here.
 //!
-//! These are plain enums with a hand-written [`core::fmt::Display`]. A derive
+//! These are plain enums with a hand-written [`std::fmt::Display`]. A derive
 //! macro would be a dependency, and this crate has none.
 
-use core::fmt;
+// Leading `::` is load-bearing. This package is NAMED `core`, so inside a
+// doc-test it is passed as `--extern core` and shadows the sysroot crate;
+// a bare `core::fmt` then resolves to THIS crate and fails to compile.
+use std::fmt;
 
 /// A price could not be represented.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -39,7 +42,7 @@ impl fmt::Display for PriceError {
     }
 }
 
-impl core::error::Error for PriceError {}
+impl std::error::Error for PriceError {}
 
 /// An instrument could not be parsed or is not one this engine accepts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -72,7 +75,7 @@ impl fmt::Display for InstrumentError {
     }
 }
 
-impl core::error::Error for InstrumentError {}
+impl std::error::Error for InstrumentError {}
 
 /// A calendar question could not be answered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -98,7 +101,7 @@ impl fmt::Display for CalendarError {
     }
 }
 
-impl core::error::Error for CalendarError {}
+impl std::error::Error for CalendarError {}
 
 #[cfg(test)]
 #[allow(
@@ -157,7 +160,7 @@ mod tests {
 
     #[test]
     fn errors_are_std_errors() {
-        fn assert_error<E: core::error::Error>(_: &E) {}
+        fn assert_error<E: std::error::Error>(_: &E) {}
         assert_error(&PriceError::NotFinite);
         assert_error(&InstrumentError::Malformed);
         assert_error(&CalendarError::NotADate);
