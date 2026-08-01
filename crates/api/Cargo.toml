@@ -1,0 +1,20 @@
+[package]
+name         = "api"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+publish      = { workspace = true }
+description  = "HTTP surface. Server-rendered HTML; no JavaScript anywhere."
+
+# docs/01-architecture.md gives api `core`, `store` and `engine` as its
+# permitted dependencies. That is a MAXIMUM, not a requirement -- store and
+# engine do not exist yet, so today it depends on core alone and will gain the
+# others when they land.
+[dependencies]
+core   = { path = "../core", package = "core" }
+axum   = { workspace = true }
+tokio  = { workspace = true }
+
+[lints]
+workspace = true
