@@ -1,0 +1,27 @@
+[package]
+name         = "api"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+publish      = { workspace = true }
+description  = "HTTP surface. Server-rendered HTML; no JavaScript anywhere."
+
+# docs/01-architecture.md gives api `core`, `store` and `engine` as its
+# permitted dependencies. That is a MAXIMUM, not a requirement -- store and
+# engine do not exist yet, so today it depends on core alone and will gain the
+# others when they land.
+[dependencies]
+# A version is required alongside the path: deny.toml sets
+# wildcards = "deny", and a path dependency with no version IS a wildcard.
+# Relaxing the ban was rejected -- it protects registry crates too.
+# `package` is an explicit rename: the PACKAGE is `core` but its lib target
+# is `brutex_core` (a lib named `core` shadows the sysroot crate and breaks
+# rustdoc). This restores `use core::...` here while keeping the dependency
+# KEY as `core`, which is what gates 7 and 9 match on.
+core   = { path = "../core", package = "core", version = "0.1.0" }
+axum   = { workspace = true }
+tokio  = { workspace = true }
+
+[lints]
+workspace = true

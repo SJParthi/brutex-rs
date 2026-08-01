@@ -223,6 +223,16 @@ jobs:
         if: steps.probe.outputs.has_crates == 'true'
         run: cargo fmt --all --check
 
+      # `--offline` only succeeds if every crate is already in CARGO_HOME.
+      # A newly added dependency has never been downloaded on a runner, so
+      # gate 4 structurally rejected the FIRST dependency the workspace ever
+      # gained -- it passed until now only because there were none. Fetching
+      # with --locked first preserves the whole point of the gate (build the
+      # EXACT locked versions, resolve nothing) while letting it actually run.
+      - name: Gate 4a — fetch exactly what the lock names
+        if: steps.probe.outputs.has_crates == 'true'
+        run: cargo fetch --locked
+
       - name: Gate 4 — locked, offline
         if: steps.probe.outputs.has_crates == 'true'
         run: cargo build --workspace --locked --offline --all-targets
