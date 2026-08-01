@@ -29,3 +29,11 @@ brutex_core = { path = "../core", package = "core", version = "0.1.0" }
 
 [lints]
 workspace = true
+
+# ---------------------------------------------------------------------------
+# GATE 8 — see crates/core/Cargo.toml for why this shape.
+# ---------------------------------------------------------------------------
+[[bench]]
+name    = "ratio"
+harness = false
+test    = false

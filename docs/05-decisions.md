@@ -1046,3 +1046,293 @@ records why it was narrow.
 Next free ID, today's date, the decision in one sentence, the alternative
 rejected, and the reason. If you cannot name what was rejected, the decision
 is not yet made — it is a default, and defaults do not belong in this file.
+
+---
+
+## D-0031 · 2026-08-01 · The on-disk format is version 2, and version 1 is refused rather than read
+
+**Decision — the store format is `BRUTEXB2`, `FORMAT_VERSION = 2`.
+`Layout::KNOWN` contains version 2 alone, so a version 1 file is refused by
+name. Version 1's geometry is left exactly as D-0002 and D-0005 describe it and
+is not redefined.**
+
+The hardening in this change altered the on-disk geometry in three ways:
+
+| | v1 (D-0002, D-0005) | v2 |
+|---|---|---|
+| Header | 64 bytes, one copy | 32,768 = 2 slots × 16,384 stride |
+| Block | 4,096 bytes | **4,088 = 56 × 73** |
+| Commit | 3 fields rewritten in place | double-buffered slot, highest valid generation wins |
+
+The block size is the load-bearing one. 4,096 is not a multiple of 56, so
+4096/56 = 73.14 and a record could span two blocks — 23 of the first 2,000 did.
+A record that straddles cannot be verified against one checksum, and verifying
+it against only the block it starts in checks part of its bytes and calls that
+a pass. 56 × 73 = 4,088 makes straddling **unrepresentable** rather than
+handled, which is why the geometry moved rather than the verifier gaining a
+second block lookup.
+
+**The first attempt mutated version 1 in place** — it changed `HEADER_LEN` and
+`BLOCK_LEN`, moved every field offset and inserted `generation`, while leaving
+`MAGIC = b"BRUTEXB1"` and `FORMAT_VERSION = 1`. That is exactly what §3 rule 8
+and §4 forbid, and it defeated the version dispatch built in the same change:
+the one geometry change that had actually happened was invisible to it, because
+both geometries answered version 1. An old file was then detected only by
+accident — the checksum had moved, so the header failed to decode and the
+operator was told "the header is unreadable", a loud refusal naming the wrong
+reason. Had the checksum domains happened to agree, the file would have been
+read at a 64-byte offset shift and returned plausible integers.
+
+**Version 1 is not in `KNOWN`.** No v1 file exists anywhere: the version shipped
+in PR #10 as format and offset arithmetic with no writer, so nothing has ever
+been written in it. A v1 file therefore cannot be encountered, and supporting a
+geometry no file uses would be untestable code guarding an impossible case.
+Should one ever appear it is refused with its version number named — never
+guessed at, never read at the current stride.
+
+**Cost of getting this wrong later.** One line today: a new magic, a new version
+constant, a second row in `KNOWN`. Once bars are on disk it is a migration of
+every file, and the failure mode in the meantime is silently plausible numbers.
+
+Supersedes the geometry halves of D-0002 (64-byte header) and D-0005 (4 KiB
+block) for version 2 onward. Both remain the correct description of version 1.
+
+---
+
+## D-0032 · 2026-08-01 · The checksum is a compile-time table, not a bit loop and not an intrinsic
+
+**Decision — `store::crc` computes CRC-32C with a slice-by-8 lookup table built
+by a `const fn` at compile time. One body, on every target. No `unsafe`, no
+`core::arch` intrinsic, no `#[cfg(target_arch)]` selection, no dependency.
+`crc32c` takes `&[u8]`; the header's discontiguous domain is served by a second
+entry point, `crc32c_split`.**
+
+The kernel was bit-by-bit: eight shift-and-mask iterations per byte, no table.
+Measured on an Apple M4 Pro, `rustc` 1.97.1, release profile, minimum of 201
+trials × 200 reps with `black_box` on both sides, over one full 4,088-byte
+block:
+
+| kernel | ns / block | ns / byte | ns / record (73 per block) |
+|---|---|---|---|
+| bit-by-bit — what shipped | 13,952.5 | 3.413 | 191.1 |
+| 256-entry table | 6,868.3 | 1.680 | 94.1 |
+| **slice-by-8 — this decision** | **1,487.5** | **0.364** | **20.4** |
+| slice-by-16 | 1,632.7 | 0.399 | 22.4 |
+
+`block::seal`, which is what a verifier actually calls, was measured before and
+after through the same harness — `crates/store/benches/ratio.rs`, run against a
+worktree pinned at the pre-fix commit and against this one, three runs each,
+minimum taken:
+
+| | before (min of 3) | after (min of 3) | factor |
+|---|---|---|---|
+| `crc32c`, one block | 13,512.1 ns | 1,491.3 ns | 9.06× |
+| `block::seal`, one block | 15,291.0 ns | 1,485.0 ns | **10.30×** |
+| `Header::read_region`, 1× region | 194.6 ns | 17.1 ns | 11.39× |
+
+The gap between the two rows is the second scan. `byte_count` folded one
+`saturating_add` per byte to compute a length `bytes.len()` gives in O(1), so
+every seal walked the block twice: seal minus checksum was 1,779 ns before and
+is inside the noise band after. It is retired in the same change, because a CRC
+fix alone would have left it costing more than the checksum beside it.
+
+`read_region` was never touched; it got 11× faster because decoding a header
+slot is a 60-byte checksum, and it decodes several.
+
+**Why the signature had to move.** `crc32c` took `IntoIterator<Item = u8>`,
+justified by the header slot needing to skip the four bytes holding its own
+checksum without a copy. That signature *structurally* forbids reading eight
+bytes at a time, so a four-byte hole in a 64-byte header was costing every
+4,088-byte data block an order of magnitude, forever. The hole is now served by
+`crc32c_split(head, tail)`, which threads one register through two runs.
+
+**Why not the hardware instruction.** `is_aarch64_feature_detected!("crc")` is
+true on the operator's machine and the ARMv8 CRC32C instruction is roughly 41×
+the bit loop by an earlier probe's measurement — a number this decision does not
+claim, because this session did not take it. Two things rule it out anyway.
+Every crate here carries `#![forbid(unsafe_code)]`, which an `#[allow]` cannot
+re-open, so an intrinsic needs a whole new crate to hold one `unsafe`
+expression. And CI runs on `ubuntu-24.04`, `x86_64`, on every job: an
+`aarch64`-gated body would never be compiled, linted, tested or covered there,
+while `--fail-under-regions 100` would still report 100% because the body does
+not exist in that build. That is a gate reporting success without taking the
+measurement — §3 rule 6. One body on both hosts means what CI measures is what
+the operator runs.
+
+**Why not `crc32c = "0.6"`**, which is already in the workspace dependency
+table. It would work and it carries its `unsafe` internally. It was rejected for
+the reason `crates/store/Cargo.toml` already records — a new package in
+`Cargo.lock` while a concurrent workflow edits a second crate's manifest, against
+a CI gate that builds `--locked --offline` — and because the table kernel gets
+within about 4× of a hardware path for zero dependencies and zero exceptions.
+
+**Why not slice-by-16.** Measured beside slice-by-8 above. It is slower at both
+lengths this store actually checksums and wants twice the table; it wins only
+past 64 KiB.
+
+**The covered domain of a header slot is frozen at bytes `0..56 ‖ 60..64`.**
+Zero-filling the hole to get one contiguous 64-byte buffer is the obvious
+simplification and it computes a different number: on a sample slot, 0x3AB11682
+against 0x1AF1D503. Every slot already on disk would fail its checksum, and a
+failed slot checksum condemns the whole file. Because it is a change of *domain*
+rather than of algorithm, no round-trip test and no published check value would
+have noticed.
+
+**What was missing that let this ship.** The only checksum VALUE pinned anywhere
+was `b"123456789"` — nine bytes. Everything else was a round trip, which passes
+under any deterministic function. A wide kernel is correct on every input
+shorter than its stride, so the old suite could not have detected a wrong fast
+path on a single real store input. `store::unit::the_crc_reproduces_a_hardcoded_value_at_every_length_that_can_break`
+pins fifteen values across the boundaries a wide kernel breaks on, and
+`store::unit::the_fast_kernel_agrees_with_a_bit_by_bit_reference_on_every_length`
+runs the retired kernel beside the new one. §2's extension allowlist forbids a
+tracked binary fixture, so a Rust constant is the only place a golden value can
+live.
+
+**What is not claimed.** A CRC is O(n) in the bytes it covers and this does not
+change that. See `docs/06-limits.md` §14.
+
+---
+
+## D-0033 · 2026-08-01 · A vendor master field is bounded before it is read, not a hundred lines after
+
+**Decision — `MasterRow` fields are bounded at `core::vendor::MAX_FIELD_BYTES`
+= 64, checked as the first statement of `decode_master_row` and refused with
+`InstrumentError::FieldTooWide { field, len }`. The reader bounds what feeds it
+too: `api::master::MAX_MASTER_BYTES` = 256 MiB before the file is read at all,
+and `api::master::MAX_ROW_BYTES` = 4,096 before a row is split.**
+
+`crates/core/src/symbol.rs` opens by arguing this exact failure must not happen:
+*"A vendor that one day emits a 4 KiB identifier would silently make every dedup
+probe 200× more expensive, and no test would notice because nothing would be
+wrong, only slow."* The `TEST_MARKERS` scan reintroduced it one layer **above**
+the 24-byte guard written to prevent it —
+`TEST_MARKERS.iter().any(|m| row.underlying.contains(m) || row.trading_symbol.contains(m))`
+searched two raw vendor `&str` with no bound anywhere in front of it.
+
+Measured, with `underlying` pinned to `RELIANCE` so the verdict is identical at
+every length and only the scanned-but-unused `trading_symbol` grows:
+
+| `trading_symbol` | cost | verdict |
+|---|---|---|
+| 8 B | 56.4 ns | `Ok(Keep(RELIANCE))` |
+| 1 KiB | 102.0 ns | `Ok(Keep(RELIANCE))` |
+| 16 KiB | 997.8 ns | `Ok(Keep(RELIANCE))` |
+| 4 MiB | 245,839.2 ns | `Ok(Keep(RELIANCE))` |
+
+Re-measured through `crates/core/benches/ratio.rs`, run three times against a
+worktree pinned at the pre-fix commit and three times against this one, minimum
+taken:
+
+| `trading_symbol` | before | after | |
+|---|---|---|---|
+| 28 B — the widest real value | 46.9 ns, kept | 51.1 ns, kept | **9% slower**, and that is the price |
+| 6.4 KB — 100× the bound | 356.6 ns, kept | 7.6 ns, refused | 46.9× |
+| 4 MiB | 229,517.3 ns, **kept** | 7.7 ns, **refused** | 29,858× |
+
+The first row is the honest cost of the fix: ten `str::len` reads on every row,
+about 4 ns. It buys the other two.
+
+Linear over four orders of magnitude — and **worse than the cost**: the 4 MiB
+row was accepted and stored. `Symbol::new` only ever saw whichever field became
+the identity, and `trading_symbol` becomes the identity only when `underlying`
+is empty. Even the rows the guard did refuse, it refused *after* paying the
+scan: a declined 4 MiB option contract returned `Err` after 274,766 ns, so an
+attacker paid nothing to burn a quarter of a millisecond per row. §4 wants a
+loud refusal; an unbounded refusal is not one.
+
+**Why 64.** Measured across both real masters on 2026-08-01 — 33,990,514 B of
+`dhan_scrip.csv`, 19,224,497 B of `groww_instruments.csv` — the widest value in
+any column this decoder reads is **28 bytes**: `MCX_MCXBULLDEX28AUG2632100CE`
+in Groww's `isin`, `NIFTYNXT50-Aug2026-101500-CE` in Dhan's `SYMBOL_NAME`. 64 is
+2.28× that. The widest value in *any* column of either file, including ones
+never read, is 80 bytes — a fund name — so a vendor moving a prose column into a
+column we read is refused rather than scanned, which is the case worth catching.
+
+**Why not reuse `SYMBOL_CAPACITY` (24).** That bound is what an *identity* may
+be. This is what this engine is willing to *look at*. A 40-byte strike or
+expiry string is not a symbol and never will be, and refusing it would refuse
+rows that decode correctly today.
+
+**Why a new error variant rather than `Malformed`.** `Malformed` is a claim
+about content — the vendor sent nonsense. An over-wide field may be perfectly
+well-formed; the refusal is about how much of it this engine will read. The
+operator needs to tell those apart, so the variant carries the field name and
+the actual length and the message prints both.
+
+**Why the reader is bounded as well.** `load` read the whole file with
+`read_to_string` and split every row with `split(',').collect()` before any
+field was examined, so the decoder's own gate could not run until an unbounded
+allocation had already happened. A file this process cannot hold is not an error
+`read_to_string` can report — it is an OOM kill — so the size is checked from
+`metadata` first. Real files are 34 MB and 19 MB; the bound is 256 MiB. Real
+rows are at most 486 B; the bound is 4,096 B. Both refusals name the number, so
+an operator who legitimately outgrows one is told what to raise.
+
+---
+
+## D-0034 · 2026-08-01 · Gate 8 measures, or it fails; and every gate's tool version is pinned
+
+**Decision — the gate 8 workflow step looks for benches at
+`crates/*/benches/*.rs` and treats an empty set as a FAILURE, never a skip.
+Two harnesses exist, both `harness = false` and `test = false`, both
+dependency-free. `cargo-deny` and `cargo-llvm-cov` are installed at exact
+versions.**
+
+`CLAUDE.md` §3 rule 4 names this gate as the enforcement mechanism for constant
+per-operation cost: *"A change that makes one of them scan fails the bench
+gate."* That sentence was false for the whole life of the repository. The step
+began `[ -d benches ] || { echo "skip — no benches yet"; exit 0; }`, which tests
+for a directory at the repository **root**; Cargo benches live at
+`crates/<name>/benches`, so the probe could never have found one even after they
+were written. `ci-ok` went green on it every time. Both defects D-0032 and
+D-0033 repair merged through it. `docs/06-limits.md` §7b had already recorded
+that this made C-01..C-04 unenforceable "in perpetuity"; this is the repair.
+
+**A skip that reports success is the fallback §4 bans.** An empty bench set now
+fails and says what to do about it.
+
+**The gate was checked against the tree it failed to catch.** Both harnesses
+were run, unchanged except for the pre-fix API spelling, against a worktree
+pinned at the commit before this change. They **fail** there: C-08 reports the
+checksum at 0.995× the bit loop (because it *was* the bit loop), C-09 reports
+4,898× at a 4 MiB field, and C-10 reports `refused=false`. A gate that has never
+been observed failing is a gate nobody has tested.
+
+**Why no benchmarking framework.** A harness would add a dependency tree to take
+a handful of `Instant` readings. `harness = false` makes each bench an ordinary
+binary that prints every number it took and exits non-zero on a breach; nothing
+is reported as passing that was not measured. `test = false` keeps `cargo test`
+and the coverage gate out of a timing loop.
+
+**What they assert.** `docs/04-invariants.md` C-01 and C-07..C-10. The ceiling
+is that file's shared-CI number, 3.0×, in integer thousandths —
+`clippy::float_arithmetic` is a workspace lint and a ratio is the one place it
+would be tempting. The statistic is the **minimum** over 60 trials: a shared
+runner's scheduler can only ever make a sample slower. Measured during this
+session against a foreign process at 686% CPU, the minimum moved 0.2% across
+three runs while the median moved 78%.
+
+**C-08 is a ratio, not a nanosecond ceiling.** An absolute threshold would have
+to be guessed for hardware this repository has never measured on — CI is
+`x86_64`, the operator's machine is `aarch64` — and a guessed threshold is
+either red for no reason or green for every regression. The bench carries the
+retired bit-by-bit kernel and requires the shipped one to beat it by at least
+3× in the same process, under the same load. Measured here: 8.9×.
+
+**Tool versions.** Gate 3 said in prose that `cargo-deny` was "pinned EXACTLY at
+0.18.3" while the command was `cargo install cargo-deny --locked` — and
+`--locked` pins the tool's own dependency graph, never the tool version. The
+coverage gate had the same shape. `--fail-under-regions 100` is the threshold
+most sensitive to how a given `cargo-llvm-cov`/LLVM pair enumerates regions: a
+version that splits one region into two turns the gate red with no source
+change, and one that stops instrumenting a construct turns it green while
+uncovered code exists. Neither is distinguishable from a real regression in the
+log. Both are now exact — `cargo-deny 0.19.0`, `cargo-llvm-cov 0.8.4`, the
+versions the operator's machine measures with. The advisory database is still
+fetched fresh, which is the part that is supposed to move.
+
+**What this gate still does not cover.** C-02, C-03 and C-04 name `engine::`
+tests and `crates/engine` does not exist; their status stays `—`. Gate 8 now
+enforces over what exists rather than over nothing, which is a different claim
+from enforcing over everything. See `docs/06-limits.md` §7c.

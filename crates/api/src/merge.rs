@@ -247,7 +247,30 @@ pub fn merge(sources: &[Source]) -> Merged {
         }
     }
 
-    let mut out = Merged::default();
+    // PRE-SIZED, so a probe is O(1) in the WORST case and not merely on
+    // average.
+    //
+    // A `HashMap` that grows reallocates and rehashes every key it holds. That
+    // is amortised O(1) per insert, which is the honest description — but it
+    // means one insert in every doubling costs O(n), and the spike lands
+    // wherever the doubling lands rather than anywhere predictable. With 200,000
+    // rows arriving from two vendors that is roughly eighteen rehashes, the last
+    // of which moves every key.
+    //
+    // The upper bound is known exactly before the loop starts: no more distinct
+    // keys can exist than there are kept listings. Reserving that much means the
+    // map never grows, so no rehash can occur at all and the amortised
+    // qualifier disappears from the guarantee.
+    //
+    // It over-reserves when two vendors name the same instrument — which is the
+    // common case, and the point of merging. That is bounded waste (one entry
+    // per duplicate, freed when the map is dropped) traded for a bound that
+    // holds in the worst case rather than on average.
+    let capacity = sources.iter().map(|s| s.kept.len()).sum();
+    let mut out = Merged {
+        by_key: HashMap::with_capacity(capacity),
+        ..Merged::default()
+    };
     for s in sources {
         let vendor = s.vendor;
         for l in &s.kept {

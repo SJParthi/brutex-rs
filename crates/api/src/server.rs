@@ -91,7 +91,7 @@ pub fn master_paths(dir: &Path) -> Vec<(Vendor, PathBuf)> {
 
 /// The directory the masters are read from.
 ///
-/// `BRUTEX_MASTERS`, or the working directory. This is the only place the
+/// `BRUTEX_MASTERS`, or `$HOME/.brutex/masters`. This is the only place the
 /// environment is consulted; everything below takes the directory as an
 /// argument, so nothing else has to touch process-wide state to be
 /// deterministic — and nothing can, since setting an environment variable is
@@ -107,7 +107,38 @@ pub fn masters_dir() -> PathBuf {
 /// the environment of a process running tests in parallel.
 #[must_use]
 fn masters_dir_from(value: Option<std::ffi::OsString>) -> PathBuf {
-    value.map_or_else(|| PathBuf::from("."), PathBuf::from)
+    value.map_or_else(default_masters_dir, PathBuf::from)
+}
+
+/// Where the masters live when `BRUTEX_MASTERS` says nothing.
+///
+/// `$HOME/.brutex/masters`, not the working directory. The masters are ~50 MB
+/// of vendor CSV and `.csv` is not an allowed tracked extension (CLAUDE.md §2),
+/// so they can never live in the repository — which means "the working
+/// directory" is only ever right when the operator happens to have `cd`-ed
+/// somewhere specific. Launching from anywhere else found no files and rendered
+/// `UNAVAILABLE`, correctly reporting a real absence caused entirely by the
+/// default.
+///
+/// Falls back to `.` only if `HOME` is unset, which is a broken environment
+/// rather than a supported one; the page then says `UNAVAILABLE` and names the
+/// vendor, as it does for any missing file.
+fn default_masters_dir() -> PathBuf {
+    default_masters_dir_from(std::env::var_os("HOME"))
+}
+
+/// The default implied by a value of `HOME`.
+///
+/// Split for the same reason [`masters_dir_from`] is: both outcomes have to be
+/// testable, and a test cannot unset `HOME` — `set_var` is `unsafe` under
+/// edition 2024, this crate forbids `unsafe`, and mutating process-wide state
+/// would race every other test in the binary.
+#[must_use]
+fn default_masters_dir_from(home: Option<std::ffi::OsString>) -> PathBuf {
+    home.map_or_else(
+        || PathBuf::from("."),
+        |home| PathBuf::from(home).join(".brutex").join("masters"),
+    )
 }
 
 /// What one read of the masters produced: the universe, the notes, and whether
@@ -523,14 +554,11 @@ pub fn instruments_html_from(
     // `total` is the whole universe; `matched` is what the filter selected.
     // Reporting the right one keeps the page honest about what it looked at.
     let (title, denominator) = if needle.is_empty() {
-        (
-            format!("brutex-rs · instruments · {}", read.status()),
-            total,
-        )
+        (format!("brutex · instruments · {}", read.status()), total)
     } else {
         (
             format!(
-                "brutex-rs · {} · search {query:?} · {matched} matched",
+                "brutex · {} · search {query:?} · {matched} matched",
                 read.status()
             ),
             matched,
@@ -549,6 +577,89 @@ pub fn instruments_html_from(
         last_page,
         notes: &read.notes,
     })
+}
+
+/// The dashboard.
+///
+/// Every figure is a counter already in memory. Nothing here scans, so the page
+/// costs the same whether the store holds two instruments or two hundred
+/// thousand — which is the whole point of `docs/04-invariants.md` C-01.
+async fn home(
+    axum::extract::State(read): axum::extract::State<Loaded>,
+) -> axum::response::Html<String> {
+    axum::response::Html(dashboard_html(&read))
+}
+
+/// The dashboard, from a universe already loaded.
+#[must_use]
+pub fn dashboard_html(read: &Read) -> String {
+    let tracked = |u: Universe| u.contains(Universe::TOTAL_MARKET) || u.contains(Universe::INDEX);
+    let counts = read
+        .merged
+        .by_key
+        .values()
+        .filter(|e| tracked(e.universe))
+        .fold((0usize, 0usize, 0usize, 0usize), |(a, f, t, i), e| {
+            (
+                a + 1,
+                f + usize::from(e.universe.contains(Universe::FNO)),
+                t + usize::from(e.universe.contains(Universe::TOTAL_MARKET)),
+                i + usize::from(e.universe.contains(Universe::INDEX)),
+            )
+        });
+    let both = read
+        .merged
+        .by_key
+        .values()
+        .filter(|e| {
+            tracked(e.universe)
+                && e.vendors.contains(Vendor::Groww)
+                && e.vendors.contains(Vendor::Dhan)
+        })
+        .count();
+    let disputes = read.merged.conflicts.len() + read.merged.eligibility.len();
+
+    let (all, fno, ntm, idx) = counts;
+    let n = |v: usize| v.to_string();
+    let stats = [
+        render::Stat {
+            label: "Tracked",
+            value: &n(all),
+            note: "NIFTY Total Market + indices",
+            loud: false,
+        },
+        render::Stat {
+            label: "NIFTY Total Market",
+            value: &n(ntm),
+            note: "constituents",
+            loud: false,
+        },
+        render::Stat {
+            label: "F&O underlyings",
+            value: &n(fno),
+            note: "all inside Total Market",
+            loud: false,
+        },
+        render::Stat {
+            label: "Indices",
+            value: &n(idx),
+            note: "NSE index series",
+            loud: false,
+        },
+        render::Stat {
+            label: "Confirmed by both feeds",
+            value: &n(both),
+            note: "cross-checked identity",
+            loud: false,
+        },
+        render::Stat {
+            label: "Disagreements",
+            value: &n(disputes),
+            note: "identity + eligibility",
+            loud: disputes > 0,
+        },
+    ];
+    render::dashboard_page(read.status(), &stats, &read.notes)
 }
 
 /// The instruments page.
@@ -600,7 +711,7 @@ pub type Loaded = std::sync::Arc<Read>;
 /// exists to remove.
 pub fn router(read: Loaded) -> axum::Router {
     axum::Router::new()
-        .route("/", axum::routing::get(page))
+        .route("/", axum::routing::get(home))
         .route("/instruments", axum::routing::get(page))
         .route("/health", axum::routing::get(health))
         .with_state(read)
@@ -684,13 +795,32 @@ fn reported(dir: &Path) -> u8 {
 /// Returns the exit code as a number rather than calling `exit`, so the whole
 /// thing — every arm of it — is callable from a test.
 pub async fn run(args: &[String], shutdown: Shutdown) -> u8 {
-    let dir = masters_dir();
+    run_in(&masters_dir(), args, shutdown).await
+}
+
+/// [`run`], over a directory the caller names.
+///
+/// Split for the same reason [`masters_dir_from`] and [`reported`] are split,
+/// and for a reason found the hard way. With the directory read inside this
+/// function, the only test that could reach the `Report` arm had to call the
+/// real entry point, which read `$HOME/.brutex/masters` — so on the operator's
+/// machine the test parsed 53 MB of real vendor CSV and returned `OK`, and on a
+/// CI runner with an empty `HOME` the same test returned `DEGRADED`. Its
+/// assertions were written to survive both (`assert_ne!(code, FAILED)`,
+/// `assert_ne!(code, MISUSED)`), and since [`reported`] returns only `OK` or
+/// `DEGRADED`, **no input, machine or environment could ever falsify them** —
+/// a mutant pinning `reported` to `OK` survived. CLAUDE.md §4 bans a test that
+/// asserts nothing; §3 rule 5 wants the same inputs to give the same outputs.
+///
+/// Taking the directory as an argument makes the answer a property of the
+/// files, which a test owns, rather than of the machine, which it does not.
+async fn run_in(dir: &Path, args: &[String], shutdown: Shutdown) -> u8 {
     match Command::parse(args) {
-        Ok(Command::Report) => reported(&dir),
+        Ok(Command::Report) => reported(dir),
         Ok(Command::Serve(addr)) => match tokio::net::TcpListener::bind(addr).await {
             Ok(listener) => {
-                println!("brutex-rs api listening on http://{addr}/instruments");
-                stopped(serve(listener, router(Loaded::new(universe(&dir))), shutdown).await)
+                println!("brutex api listening on http://{addr}/instruments");
+                stopped(serve(listener, router(Loaded::new(universe(dir))), shutdown).await)
             }
             Err(e) => {
                 eprintln!("cannot bind {addr}: {e}");
@@ -783,15 +913,36 @@ mod tests {
     }
 
     #[test]
-    fn the_masters_directory_comes_from_the_environment_or_is_the_cwd() {
+    fn the_masters_directory_comes_from_the_environment_or_defaults_under_home() {
         // Tested through the value rather than by setting the variable: under
         // edition 2024 `set_var` is unsafe, this crate forbids unsafe, and a
         // test that mutated process-wide state would be racing every other
         // test in the binary anyway.
-        assert_eq!(masters_dir_from(None), PathBuf::from("."));
+        //
+        // The default is asserted by SHAPE, not by a literal: the home
+        // directory differs per machine and per CI runner, and hard-coding one
+        // would pass here and fail everywhere else.
+        // Absent value delegates to the default, exactly. Asserted against the
+        // function rather than against a literal path: the home directory
+        // differs per machine and per CI runner, so a literal would pass here
+        // and fail everywhere else. The default's own two arms are pinned to
+        // literals below, where the input IS controlled.
+        assert_eq!(masters_dir_from(None), default_masters_dir());
         assert_eq!(
             masters_dir_from(Some("/somewhere/else".into())),
             PathBuf::from("/somewhere/else")
+        );
+        // Both arms of the default, driven by value rather than by mutating
+        // the environment.
+        assert_eq!(
+            default_masters_dir_from(Some("/home/who".into())),
+            PathBuf::from("/home/who/.brutex/masters")
+        );
+        assert_eq!(
+            default_masters_dir_from(None),
+            PathBuf::from("."),
+            "no HOME is a broken environment, not a supported one — the page \
+             then says UNAVAILABLE and names the vendor"
         );
     }
 
@@ -1350,8 +1501,25 @@ mod tests {
             "a searched page still carries the notes: {page}"
         );
 
+        // `/` is the DASHBOARD, not a second copy of the instruments page.
+        // It carries the nav, so every other page is one click away, and its
+        // figures are counters rather than a row listing.
         let root = get(addr, "/").await;
-        assert!(root.contains("instruments total"));
+        assert!(root.contains("200 OK"));
+        assert!(root.contains("nav class"), "the dashboard carries the nav");
+        assert!(
+            root.contains("NIFTY Total Market"),
+            "the dashboard names the universes it counts: {root}"
+        );
+        assert!(
+            !root.contains("<tbody>"),
+            "the dashboard counts; it does not list rows"
+        );
+        // And the nav shows what is NOT built, rather than hiding it — a nav
+        // listing only what exists says nothing about what is coming, and one
+        // linking to a page that cannot answer is worse.
+        assert!(root.contains("Ingest"), "unbuilt pages are shown, disabled");
+        assert!(root.contains("lnk off"), "and marked as unbuilt");
 
         let missing = get(addr, "/nope").await;
         assert!(missing.contains("404"), "{missing}");
@@ -1445,16 +1613,34 @@ mod tests {
 
     #[tokio::test]
     async fn run_reports_and_refuses_nonsense_with_different_codes() {
-        // `run` reads BRUTEX_MASTERS, and a test cannot set it -- `set_var` is
-        // unsafe under edition 2024 and this crate forbids unsafe. The working
-        // directory during `cargo test` is the crate root, which holds no
-        // master at all, so this is the both-vendors-unavailable path and the
-        // exit code has to say so. `tests/binary.rs` drives the clean path,
-        // where it CAN set the variable, on a real child process.
+        // THE ASSERTIONS HERE USED TO BE UNFALSIFIABLE, and that is worth
+        // spelling out because it looked like caution. `run` read
+        // $HOME/.brutex/masters, which a test cannot set, so its answer was a
+        // property of the machine: OK on an operator's laptop where the real
+        // masters live, DEGRADED on a CI runner where they do not. The
+        // assertions were written to pass under both -- `!= FAILED` and
+        // `!= MISUSED` -- and `reported` returns ONLY OK or DEGRADED, so no
+        // input, machine or environment could ever have failed them. A mutant
+        // pinning `reported` to OK survived. That is a test that asserts
+        // nothing, which CLAUDE.md §4 bans outright.
+        //
+        // `run_in` takes the directory, so the expected value is a property of
+        // the files, which this test owns. Exact codes, both arms, deterministic
+        // on every host.
         assert_eq!(
-            run(&argv(&["report"]), fired()).await,
+            run_in(&agreeing("runreport"), &argv(&["report"]), fired()).await,
+            OK,
+            "two masters that agree is a clean universe"
+        );
+        let missing = masters(
+            "runreportmissing",
+            Some(&format!("{GROWW_HEAD}NSE,CASH,,NIFTY,IDX,,NIFTY,,\n")),
+            None,
+        );
+        assert_eq!(
+            run_in(&missing, &argv(&["report"]), fired()).await,
             DEGRADED,
-            "no master anywhere is not a successful report"
+            "a vendor that was never read is a refused universe"
         );
         assert_eq!(run(&argv(&["--wat"]), fired()).await, MISUSED);
         assert_ne!(DEGRADED, OK, "a refused universe is not a success");

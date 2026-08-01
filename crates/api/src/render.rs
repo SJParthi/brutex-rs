@@ -129,6 +129,57 @@ max-width:1180px;padding:0 20px;font-size:13.5px}\
 border:1px solid var(--line);background:var(--panel);transition:all .2s}\
 .pager a:hover{background:linear-gradient(135deg,var(--acc),var(--acc2));color:#fff;border-color:transparent}\
 .pager span{color:var(--dim);font-variant-numeric:tabular-nums}\
+.hero{position:relative;overflow:hidden;padding:56px 0 46px;color:#fff;margin-bottom:26px;\
+background:linear-gradient(135deg,#1e1b4b 0%,#4338ca 44%,#0891b2 100%)}\
+.hero:before{content:'';position:absolute;inset:-45%;background:\
+radial-gradient(circle at 20% 30%,rgba(255,255,255,.18),transparent 40%),\
+radial-gradient(circle at 78% 68%,rgba(255,255,255,.13),transparent 38%);\
+animation:drift 22s ease-in-out infinite alternate}\
+@keyframes drift{to{transform:translate3d(5%,-5%,0) rotate(8deg)}}\
+.hero .hw{position:relative;max-width:1180px;margin:0 auto;padding:0 20px}\
+.eyebrow{display:flex;align-items:center;gap:10px;font-weight:800;font-size:12px;\
+letter-spacing:1.3px;opacity:.9}\
+.dot{width:9px;height:9px;border-radius:50%;background:#5eead4;animation:pulse 1.9s infinite}\
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(94,234,212,.7)}70%{box-shadow:0 0 0 14px rgba(94,234,212,0)}100%{box-shadow:0 0 0 0 rgba(94,234,212,0)}}\
+.hero h1{font-size:clamp(30px,5.4vw,48px);letter-spacing:-1.8px;font-weight:850;\
+margin:14px 0 12px;line-height:1.05;color:#fff;padding:0;max-width:none;\
+animation:rise .7s cubic-bezier(.2,.8,.2,1) both}\
+.lede{max-width:64ch;opacity:.93;font-size:16.5px;line-height:1.6;\
+animation:rise .7s .08s cubic-bezier(.2,.8,.2,1) both}\
+.badge{display:inline-block;margin-top:16px;padding:7px 16px;border-radius:99px;\
+font-size:12px;font-weight:850;letter-spacing:1px;text-transform:uppercase;\
+background:rgba(255,255,255,.16);backdrop-filter:blur(8px);\
+animation:rise .7s .16s cubic-bezier(.2,.8,.2,1) both}\
+.badge.good{background:rgba(52,211,153,.26);color:#a7f3d0}\
+.badge.bad{background:rgba(251,113,133,.26);color:#fecdd3}\
+.cbar{height:5px;border-radius:99px;background:var(--line);overflow:hidden;margin:8px 0 7px}\
+.cbar>span{display:block;height:100%;border-radius:99px;\
+background:linear-gradient(90deg,var(--acc),var(--acc2));\
+animation:fill 1.1s .3s cubic-bezier(.2,.8,.2,1) both}\
+.card.loud .cbar>span{background:linear-gradient(90deg,var(--bad),#fb7185)}\
+@keyframes fill{from{width:0!important}}\
+nav.top{position:sticky;top:0;z-index:10;background:color-mix(in srgb,var(--panel) 88%,transparent);\
+backdrop-filter:blur(12px);border-bottom:1px solid var(--line)}\
+nav.top .inner{max-width:1180px;margin:0 auto;padding:0 20px;display:flex;align-items:center;gap:22px;height:56px}\
+nav.top .logo{font-weight:850;font-size:16px;letter-spacing:-.6px;text-decoration:none;color:var(--ink)}\
+nav.top .logo b{color:var(--acc)}\
+nav.top .links{display:flex;gap:4px;flex-wrap:wrap}\
+nav.top .lnk{padding:7px 13px;border-radius:9px;font-size:13.5px;font-weight:650;\
+text-decoration:none;color:var(--dim);transition:all .18s}\
+nav.top a.lnk:hover{color:var(--ink);background:color-mix(in srgb,var(--acc) 9%,transparent)}\
+nav.top .lnk.on{color:#fff;background:linear-gradient(135deg,var(--acc),var(--acc2))}\
+nav.top .lnk.off{opacity:.38;cursor:not-allowed}\
+nav.top .lnk.off:after{content:' ·';font-size:10px}\
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:13px;\
+max-width:1180px;margin:0 auto 18px;padding:0 20px}\
+.card{background:var(--panel);border:1px solid var(--line);border-radius:15px;padding:16px;\
+box-shadow:var(--sh);animation:rise .5s both;transition:transform .22s,box-shadow .22s}\
+.card:hover{transform:translateY(-4px);box-shadow:0 14px 34px rgba(16,24,40,.15)}\
+.card.loud{border-color:color-mix(in srgb,var(--bad) 45%,transparent)}\
+.ck{font-size:10.5px;font-weight:760;letter-spacing:.9px;text-transform:uppercase;color:var(--dim)}\
+.cv{font-size:29px;font-weight:850;letter-spacing:-1.5px;margin:5px 0 4px;font-variant-numeric:tabular-nums}\
+.card.loud .cv{color:var(--bad)}\
+.cn{font-size:11.5px;color:var(--dim)}\
 footer{margin:22px auto 0;max-width:1180px;padding:0 20px;color:var(--dim);font-size:12.5px;line-height:1.9}\
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}";
 
@@ -499,6 +550,167 @@ pub struct View<'a> {
     pub notes: &'a [String],
 }
 
+/// Shortens a note that has become a list.
+///
+/// One note names 31 instruments inline. Rendered whole it fills the screen
+/// above the table in red and reads as wallpaper rather than as a warning —
+/// the opposite of what a loud line is for. The head of the message carries the
+/// fact and the count; the tail is a dump.
+///
+/// Truncates on a boundary the message itself provides rather than at a
+/// character count, so it never cuts a name in half.
+fn clamp(note: &str) -> String {
+    const MAX: usize = 160;
+    if note.len() <= MAX {
+        return note.to_owned();
+    }
+    let head = note
+        .char_indices()
+        .take_while(|(i, _)| *i < MAX)
+        .map(|(i, c)| i + c.len_utf8())
+        .last()
+        .unwrap_or(0);
+    let cut = note[..head].rfind(", ").unwrap_or(head);
+    let rest = note[cut..].matches(", ").count();
+    format!("{}… and {rest} more", &note[..cut])
+}
+
+/// The navigation bar, on every page.
+///
+/// # Why unbuilt pages are shown rather than hidden
+///
+/// A nav that lists only what exists tells you nothing about what is coming;
+/// a nav that links to a page which does not answer is worse. These are
+/// rendered as disabled with the reason, so the shape of the system is visible
+/// and nothing lies about being ready.
+fn nav(current: &str) -> String {
+    let mut out = String::with_capacity(512);
+    out.push_str("<nav class=\"top\"><div class=\"inner\">");
+    out.push_str("<a class=\"logo\" href=\"/\">brutex</a><div class=\"links\">");
+    for (href, label, built) in [
+        ("/", "Dashboard", true),
+        ("/instruments", "Instruments", true),
+        ("/pull", "Ingest", false),
+        ("/store", "Store", false),
+        ("/runs", "Runs", false),
+    ] {
+        let on = if href == current { " on" } else { "" };
+        if built {
+            let _ = write!(out, "<a class=\"lnk{on}\" href=\"{href}\">{label}</a>");
+        } else {
+            let _ = write!(
+                out,
+                "<span class=\"lnk off\" title=\"not built yet\">{label}</span>"
+            );
+        }
+    }
+    out.push_str("</div></nav>");
+    out
+}
+
+/// One figure on the dashboard.
+#[derive(Debug, Clone, Copy)]
+pub struct Stat<'a> {
+    /// What it counts.
+    pub label: &'a str,
+    /// The count.
+    pub value: &'a str,
+    /// One line of context under it.
+    pub note: &'a str,
+    /// Whether this figure is a problem.
+    pub loud: bool,
+}
+
+/// The dashboard: what the engine knows, and what it does not.
+///
+/// Every figure is a counter already held in memory — nothing here scans, so
+/// the page costs the same whether the store holds two instruments or two
+/// hundred thousand.
+#[must_use]
+pub fn dashboard_page(status: &str, figures: &[Stat<'_>], notes: &[String]) -> String {
+    let mut body = String::with_capacity(2048);
+    body.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">");
+    body.push_str("<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">");
+    body.push_str("<title>brutex · dashboard</title><style>");
+    body.push_str(STYLE);
+    body.push_str("</style></head><body>");
+    body.push_str(&nav("/"));
+    let _ = write!(
+        body,
+        "<header class=\"hero\"><div class=\"hw\">\
+         <div class=\"eyebrow\"><span class=\"dot\"></span>NSE · TWO FEEDS · ONE IDENTITY</div>\
+         <h1>Every instrument,<br>cross&#8209;checked.</h1>\
+         <p class=\"lede\">A brute&#8209;force backtesting engine for Indian indices. \
+         Every figure below is a counter, never a scan — this page costs the same \
+         whether the store holds two instruments or two hundred thousand.</p>\
+         <span class=\"badge {}\">{}</span></div></header>",
+        if status == "ok" { "good" } else { "bad" },
+        escape(status),
+    );
+
+    body.push_str("<section class=\"cards\">");
+    // INTEGER arithmetic, not float. `clippy::float_arithmetic` is denied
+    // workspace-wide so that a price can never touch a float (CLAUDE.md §7),
+    // and a bar width has no business being the first exception — it is a
+    // percentage of a count, which integers express exactly.
+    let peak = figures
+        .iter()
+        .filter_map(|f| f.value.parse::<u64>().ok())
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    for (i, f) in figures.iter().enumerate() {
+        let cls = if f.loud { " loud" } else { "" };
+        // The bar shows each figure against the largest on the page, so the
+        // relationship between the numbers is visible without reading them.
+        // A floor of 3% so a zero still draws something: a bar of no width
+        // reads as "not rendered" rather than as "none", and zero
+        // disagreements is the figure most worth seeing.
+        let pct = f
+            .value
+            .parse::<u64>()
+            .map_or(100, |v| (v.saturating_mul(100) / peak).max(3));
+        let _ = write!(
+            body,
+            "<div class=\"card{cls}\" style=\"animation-delay:{}ms\">\
+             <div class=\"ck\">{}</div><div class=\"cv\">{}</div>\
+             <div class=\"cbar\"><span style=\"width:{pct}%\"></span></div>\
+             <div class=\"cn\">{}</div></div>",
+            i * 60,
+            escape(f.label),
+            escape(f.value),
+            escape(f.note),
+        );
+    }
+    body.push_str("</section>");
+
+    let loud_count = notes
+        .iter()
+        .filter(|n| LOUD.iter().any(|w| n.contains(w)))
+        .count();
+    let _ = write!(
+        body,
+        "<details class=\"notes\"><summary>{} note{} · <b>{loud_count}</b> needing attention</summary><ul>",
+        notes.len(),
+        if notes.len() == 1 { "" } else { "s" },
+    );
+    for note in notes {
+        let loud = if LOUD.iter().any(|w| note.contains(w)) {
+            " class=\"loud\""
+        } else {
+            ""
+        };
+        let _ = write!(body, "<li{loud}>{}</li>", escape(&clamp(note)));
+    }
+    body.push_str("</ul></details>");
+
+    body.push_str(
+        "<footer>Rendered on the server. No JavaScript — CLAUDE.md section 2 \
+         does not permit it, and CI gate 1 enforces that.</footer></body></html>",
+    );
+    body
+}
+
 /// Renders a complete instruments page.
 ///
 /// `total` is the size of the whole universe, `rows` is only what this page
@@ -534,6 +746,7 @@ pub fn instruments_page(view: &View<'_>) -> String {
     body.push_str("</title><style>");
     body.push_str(STYLE);
     body.push_str("</style></head><body>");
+    body.push_str(&nav("/instruments"));
 
     // A search form. Method GET so the query lives in the URL and a result is
     // linkable and reloadable -- no JavaScript, no client state.
@@ -583,10 +796,9 @@ pub fn instruments_page(view: &View<'_>) -> String {
         .iter()
         .filter(|n| LOUD.iter().any(|w| n.contains(w)))
         .count();
-    let open = if loud_count > 0 { " open" } else { "" };
     let _ = write!(
         body,
-        "<details class=\"notes\"{open}><summary>{} note{} · <b>{loud_count}</b> needing attention</summary><ul>",
+        "<details class=\"notes\"><summary>{} note{} · <b>{loud_count}</b> needing attention</summary><ul>",
         notes.len(),
         if notes.len() == 1 { "" } else { "s" },
     );
@@ -596,7 +808,7 @@ pub fn instruments_page(view: &View<'_>) -> String {
         } else {
             ""
         };
-        let _ = write!(body, "<li{loud}>{}</li>", escape(note));
+        let _ = write!(body, "<li{loud}>{}</li>", escape(&clamp(note)));
     }
     body.push_str("</ul></details>");
 
@@ -804,6 +1016,105 @@ mod tests {
         // NSE listing does not silently snap back to the tracked universe.
         let wide = instruments_page(&view(1, 3, true));
         assert!(wide.contains("all=1"), "the widened view is carried");
+    }
+
+    #[test]
+    fn a_note_that_became_a_list_is_clamped_on_a_boundary_it_provides() {
+        // Short notes pass through untouched.
+        let short = "groww: 2750 kept, 0 unreadable";
+        assert_eq!(clamp(short), short);
+
+        // A long one is cut at a ", " boundary, never mid-name, and says how
+        // many it dropped. One note really does name 31 instruments inline.
+        let names: Vec<String> = (0..40).map(|i| format!("NSE-SYMBOL{i:02}")).collect();
+        let long = format!(
+            "UNCHECKED IDENTITY · named by one vendor only: {}",
+            names.join(", ")
+        );
+        let cut = clamp(&long);
+        assert!(cut.len() < long.len(), "it was clamped");
+        assert!(
+            cut.contains("… and "),
+            "it says how many were dropped: {cut}"
+        );
+        assert!(cut.contains("more"));
+        assert!(
+            cut.starts_with("UNCHECKED IDENTITY"),
+            "the head carries the fact: {cut}"
+        );
+        assert!(
+            !cut.contains("NSE-SYMBOL3"),
+            "the tail is dropped, not truncated mid-name: {cut}"
+        );
+
+        // A long note with no separator at all still clamps rather than
+        // panicking on a missing boundary.
+        let unbroken = "X".repeat(400);
+        let clamped = clamp(&unbroken);
+        assert!(clamped.len() < unbroken.len());
+    }
+
+    #[test]
+    fn the_dashboard_counts_and_marks_what_needs_attention() {
+        let figures = [
+            Stat {
+                label: "Tracked",
+                value: "785",
+                note: "both feeds",
+                loud: false,
+            },
+            Stat {
+                label: "Disagreements",
+                value: "0",
+                note: "identity",
+                loud: true,
+            },
+            Stat {
+                label: "Unparseable",
+                value: "n/a",
+                note: "not a number",
+                loud: false,
+            },
+        ];
+        let notes = vec![
+            "groww: 2 kept".to_owned(),
+            "dhan UNREADABLE · malformed identifier ×104".to_owned(),
+        ];
+        let html = dashboard_page("ok", &figures, &notes);
+
+        assert!(
+            html.contains("class=\"hero\""),
+            "the dashboard has a header"
+        );
+        assert!(html.contains("badge good"), "a clean read is badged clean");
+        assert!(html.contains("nav class"), "and carries the nav");
+        assert!(html.contains("785") && html.contains("Tracked"));
+        assert!(html.contains("card loud"), "a loud figure is marked");
+        assert!(
+            !html.contains("<tbody>"),
+            "it counts; it does not list rows"
+        );
+        // The loud NOTE is marked too, and the summary says how many.
+        assert!(html.contains("class=\"loud\">dhan UNREADABLE"));
+        assert!(html.contains("<b>1</b> needing attention"));
+        // A value that is not a number still draws a full bar rather than
+        // vanishing -- "n/a" is information, not an error.
+        assert!(html.contains("width:100%"));
+
+        // A degraded read is badged differently, and the summary reports zero
+        // loud notes when there are none.
+        let clean = dashboard_page("DEGRADED", &figures, &[]);
+        assert!(clean.contains("badge bad"));
+        assert!(clean.contains("0 notes · <b>0</b> needing attention"));
+
+        // Exactly one note is singular. The plural arm is covered by the two-
+        // note case above and the zero case here; without this the singular
+        // branch is a region no test enters, and "1 notes" ships.
+        let one = dashboard_page("ok", &figures, &["only one".to_owned()]);
+        assert!(
+            one.contains("1 note · <b>0</b> needing attention"),
+            "one note is singular, not \"1 notes\""
+        );
     }
 
     #[test]

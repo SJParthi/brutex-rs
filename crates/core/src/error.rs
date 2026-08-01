@@ -60,18 +60,41 @@ pub enum InstrumentError {
     NotSweepable,
     /// The identifier was empty or malformed.
     Malformed,
+    /// A vendor master field was wider than
+    /// [`crate::vendor::MAX_FIELD_BYTES`], so the row was refused before
+    /// anything read it.
+    ///
+    /// Separate from [`Self::Malformed`] because it is not a claim about the
+    /// field's *content* — the bytes may be a perfectly well-formed identifier.
+    /// It is a refusal to spend unbounded time deciding, and the operator needs
+    /// to see that distinction: `Malformed` means the vendor sent nonsense,
+    /// this means the vendor sent something bigger than this engine is willing
+    /// to look at. D-0033.
+    FieldTooWide {
+        /// Which [`crate::vendor::MasterRow`] field was too wide, by its name
+        /// in that struct — not the vendor's column heading, which differs
+        /// between vendors for the same fact.
+        field: &'static str,
+        /// How many bytes it actually held, so the operator can see whether the
+        /// vendor drifted by two bytes or by four megabytes.
+        len: usize,
+    },
 }
 
 impl fmt::Display for InstrumentError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let msg = match self {
-            Self::UnknownExchange => "unknown exchange",
-            Self::NotSweepable => {
-                "instrument is storable but not sweepable; the engine surface is fixed at three"
-            }
-            Self::Malformed => "malformed instrument identifier",
-        };
-        f.write_str(msg)
+        match self {
+            Self::UnknownExchange => f.write_str("unknown exchange"),
+            Self::NotSweepable => f.write_str(
+                "instrument is storable but not sweepable; the engine surface is fixed at three",
+            ),
+            Self::Malformed => f.write_str("malformed instrument identifier"),
+            Self::FieldTooWide { field, len } => write!(
+                f,
+                "vendor master field `{field}` is {len} bytes; the bound is {}",
+                crate::vendor::MAX_FIELD_BYTES
+            ),
+        }
     }
 }
 
@@ -137,6 +160,10 @@ mod tests {
             InstrumentError::UnknownExchange,
             InstrumentError::NotSweepable,
             InstrumentError::Malformed,
+            InstrumentError::FieldTooWide {
+                field: "trading_symbol",
+                len: 4_194_304,
+            },
         ];
         let rendered: Vec<String> = all.iter().map(ToString::to_string).collect();
         for (i, a) in rendered.iter().enumerate() {

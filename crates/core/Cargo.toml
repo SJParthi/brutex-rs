@@ -32,3 +32,14 @@ workspace = true
 # `core::fmt`, so a crate named `core` breaks rustdoc itself. Proven, not
 # assumed: doc-tests failed with "cannot find `result` in `core`".
 name = "brutex_core"
+
+# ---------------------------------------------------------------------------
+# GATE 8 — the O(1) ratio harness. `harness = false` so it is a plain binary
+# with no benchmarking framework and therefore no dependency; `test = false`
+# because `cargo test` must not run a timing loop, and the coverage gate must
+# not measure one. See D-0034 and crates/core/benches/ratio.rs.
+# ---------------------------------------------------------------------------
+[[bench]]
+name    = "ratio"
+harness = false
+test    = false

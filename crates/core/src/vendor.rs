@@ -158,6 +158,86 @@ pub struct MasterRow<'a> {
     pub option_side: &'a str,
 }
 
+impl MasterRow<'_> {
+    /// The first field wider than [`MAX_FIELD_BYTES`], with its width.
+    ///
+    /// Every check is `str::len`, which is a field read on a fat pointer — the
+    /// cost is the same ten reads whether a field holds two bytes or two
+    /// gigabytes, which is the entire point. Returned rather than raised so the
+    /// caller decides what an over-wide field means; [`decode_master_row`]
+    /// treats it as a refusal.
+    #[must_use]
+    pub const fn over_wide(&self) -> Option<(&'static str, usize)> {
+        // Written out rather than iterated because a `[( &str, &str ); 10]`
+        // array would be built on every row -- ten pointer pairs written to the
+        // stack to answer a question that is ten comparisons. Order follows the
+        // struct.
+        let checks: [(&'static str, usize); 10] = [
+            ("exchange", self.exchange.len()),
+            ("segment", self.segment.len()),
+            ("underlying", self.underlying.len()),
+            ("trading_symbol", self.trading_symbol.len()),
+            ("instrument_type", self.instrument_type.len()),
+            ("listing_class", self.listing_class.len()),
+            ("isin", self.isin.len()),
+            ("expiry", self.expiry.len()),
+            ("strike_rupees", self.strike_rupees.len()),
+            ("option_side", self.option_side.len()),
+        ];
+        let mut i = 0;
+        while i < checks.len() {
+            // `const fn` cannot call `<[T]>::get`, and the index is bounded by
+            // the array's own length one line above; const evaluation of the
+            // bound is not possible here, but the loop condition is the bound.
+            #[allow(clippy::indexing_slicing)]
+            let (name, len) = checks[i];
+            if len > MAX_FIELD_BYTES {
+                return Some((name, len));
+            }
+            i += 1;
+        }
+        None
+    }
+}
+
+/// The widest a single vendor master field may be before the row is refused.
+///
+/// # Why a bound exists at all — D-0033
+///
+/// [`crate::symbol::Symbol`] opens by arguing that an unbounded identifier must
+/// never reach a hot path: *"A vendor that one day emits a 4 KiB identifier
+/// would silently make every dedup probe 200× more expensive, and no test would
+/// notice because nothing would be wrong, only slow."* The `TEST_MARKERS`
+/// substring scan in [`decode_master_row`] reintroduced exactly that, one layer
+/// **above** the 24-byte guard written to prevent it: it searched two raw
+/// vendor `&str` before anything had bounded them.
+///
+/// Measured on this machine before the bound, with `underlying` pinned to
+/// `RELIANCE` so only the scanned-but-unused `trading_symbol` grew: 8 B →
+/// 56.4 ns, 1 KiB → 102.0 ns, 16 KiB → 997.8 ns, 4 MiB → 245,839.2 ns. Linear
+/// over four orders of magnitude. And worse than the cost: the 4 MiB row was
+/// **accepted and stored**, because `trading_symbol` only becomes the identity
+/// when `underlying` is empty, so the width guard never saw it.
+///
+/// # Why 64
+///
+/// Measured across both real masters on 2026-08-01 — 33,990,514 B of
+/// `dhan_scrip.csv` and 19,224,497 B of `groww_instruments.csv` — the widest
+/// value in any column this decoder reads is **28 bytes**
+/// (`MCX_MCXBULLDEX28AUG2632100CE` in Groww's `isin`,
+/// `NIFTYNXT50-Aug2026-101500-CE` in Dhan's `SYMBOL_NAME`). 64 is 2.28× that,
+/// so ordinary vendor drift does not trip it. The widest value in *any* column
+/// of either file, including ones this decoder never reads, is 80 bytes — a
+/// fund name — so a vendor moving a prose column into a column we read is
+/// refused, loudly, which is the case worth catching.
+///
+/// This is not [`crate::symbol::SYMBOL_CAPACITY`] and must not be collapsed
+/// into it. That bound is what an *identity* may be; this is what this engine
+/// is willing to *look at*. A 40-byte expiry string is not a symbol and never
+/// will be, but refusing to read it would refuse rows that decode correctly
+/// today.
+pub const MAX_FIELD_BYTES: usize = 64;
+
 /// Which of a vendor's master columns fill a [`MasterRow`], by header name.
 ///
 /// This lives beside the rest of the per-vendor knowledge rather than in the
@@ -676,6 +756,24 @@ impl Vendor {
 /// *validly* not ours, and quietly dropping a row we failed to understand is
 /// how an instrument silently vanishes from a universe.
 pub fn decode_master_row(vendor: Vendor, row: MasterRow<'_>) -> Result<Decoded, InstrumentError> {
+    // THE WIDTH GATE IS FIRST, AND THAT POSITION IS THE WHOLE FIX.
+    //
+    // Everything below this line reads a vendor field: the ISIN parse in
+    // `declined`, the exchange parse, and — the one that made this a defect
+    // rather than a worry — the `TEST_MARKERS` substring scan, which searches
+    // TWO raw fields with a seven-byte needle. Before D-0033 the only width
+    // bound in the pipeline was `Symbol::new`, about a HUNDRED lines further
+    // down, and it saw only whichever field became the identity. A 4 MiB
+    // `trading_symbol` on a row with a populated `underlying` was scanned in
+    // full, cost 246 us, and was then ACCEPTED. Even the rows it did refuse, it
+    // refused only after paying the scan.
+    //
+    // `str::len` is a field read. Ten of them is a constant, whatever the
+    // vendor sent. CLAUDE.md §3 rule 4.
+    if let Some((field, len)) = row.over_wide() {
+        return Err(InstrumentError::FieldTooWide { field, len });
+    }
+
     // A declined row's ISIN is EVIDENCE, never identity, so it is parsed
     // leniently and only ever used to compare two vendors' verdicts. Computed
     // once here rather than at each of the seven decline sites below.
@@ -1884,5 +1982,134 @@ mod tests {
         let only_dhan = VendorSet::EMPTY.with(Vendor::Dhan);
         assert!(only_dhan.contains(Vendor::Dhan));
         assert!(!only_dhan.contains(Vendor::Groww));
+    }
+
+    // =======================================================================
+    // The field-width gate — D-0033
+    // =======================================================================
+
+    /// The row from the defect: a legitimate `underlying`, and one enormous
+    /// field that is scanned but never becomes the identity.
+    fn wide_row<'a>(field: &str, wide: &'a str) -> MasterRow<'a> {
+        let mut r = MasterRow {
+            exchange: "NSE",
+            segment: "CASH",
+            underlying: "RELIANCE",
+            trading_symbol: "RELIANCE",
+            instrument_type: "EQ",
+            listing_class: "EQ",
+            isin: REAL_ISIN,
+            expiry: "",
+            strike_rupees: "",
+            option_side: "",
+        };
+        match field {
+            "exchange" => r.exchange = wide,
+            "segment" => r.segment = wide,
+            "underlying" => r.underlying = wide,
+            "trading_symbol" => r.trading_symbol = wide,
+            "instrument_type" => r.instrument_type = wide,
+            "listing_class" => r.listing_class = wide,
+            "isin" => r.isin = wide,
+            "expiry" => r.expiry = wide,
+            "strike_rupees" => r.strike_rupees = wide,
+            _ => r.option_side = wide,
+        }
+        r
+    }
+
+    /// Every field name `over_wide` can report, in struct order.
+    const FIELD_NAMES: [&str; 10] = [
+        "exchange",
+        "segment",
+        "underlying",
+        "trading_symbol",
+        "instrument_type",
+        "listing_class",
+        "isin",
+        "expiry",
+        "strike_rupees",
+        "option_side",
+    ];
+
+    #[test]
+    fn an_over_wide_field_is_refused_whichever_field_it_is() {
+        // THE DEFECT THIS PINS. `trading_symbol` only becomes the identity when
+        // `underlying` is empty, so a 4 MiB `trading_symbol` beside a populated
+        // `underlying` was scanned twice by TEST_MARKERS and then ACCEPTED AND
+        // STORED -- the width guard in `Symbol::new` never saw it. Every field
+        // is checked here, not just the two the scan reads, because the next
+        // reader added below the gate must not have to remember to add a bound.
+        // Bound rather than computed inside a failure message: an expression
+        // there is a region only a FAILING assertion reaches, so no passing
+        // test can cover it.
+        let over = MAX_FIELD_BYTES + 1;
+        let wide = "X".repeat(over);
+        for name in FIELD_NAMES {
+            let row = wide_row(name, &wide);
+            assert_eq!(
+                row.over_wide(),
+                Some((name, over)),
+                "{name} was not reported"
+            );
+            assert_eq!(
+                decode_master_row(Vendor::Groww, row),
+                Err(InstrumentError::FieldTooWide {
+                    field: name,
+                    len: over,
+                }),
+                "{name} at {over} bytes was not refused"
+            );
+        }
+    }
+
+    #[test]
+    fn the_bound_is_the_first_byte_that_is_too_many_and_not_one_before() {
+        // An off-by-one here refuses rows that decode correctly today, so the
+        // exact boundary is pinned rather than the general shape.
+        let at = "X".repeat(MAX_FIELD_BYTES);
+        let over = "X".repeat(MAX_FIELD_BYTES + 1);
+        assert_eq!(wide_row("expiry", &at).over_wide(), None);
+        assert_eq!(
+            wide_row("expiry", &over).over_wide(),
+            Some(("expiry", MAX_FIELD_BYTES + 1))
+        );
+        // 64 bytes in `expiry` is still refused -- but for its CONTENT, by the
+        // expiry parser, which is the bound that belongs there. The width gate
+        // is not a substitute for any of the parsers below it.
+        let mut r = wide_row("expiry", &at);
+        r.instrument_type = "FUT";
+        assert_eq!(
+            decode_master_row(Vendor::Groww, r),
+            Err(InstrumentError::Malformed)
+        );
+    }
+
+    #[test]
+    fn a_row_of_ordinary_width_passes_the_gate_untouched() {
+        // The widest value in either real master, in the column it was measured
+        // in: 28 bytes. If this ever fails the bound has been set below what
+        // the vendors actually emit.
+        const WIDEST_MEASURED: &str = "NIFTYNXT50-Aug2026-101500-CE";
+        assert_eq!(WIDEST_MEASURED.len(), 28);
+        assert!(WIDEST_MEASURED.len() <= MAX_FIELD_BYTES);
+        let row = wide_row("trading_symbol", WIDEST_MEASURED);
+        assert_eq!(row.over_wide(), None);
+        assert_eq!(
+            kept(decode_master_row(Vendor::Groww, row).expect("decodes"))
+                .map(|k| k.underlying.as_str().to_owned()),
+            Some("RELIANCE".to_owned())
+        );
+    }
+
+    #[test]
+    fn the_test_marker_scan_still_declines_a_real_test_listing() {
+        // The gate runs BEFORE the scan, so this proves the gate did not
+        // shadow it. `031NSETEST` is verbatim from the primary broker's master.
+        let row = wide_row("underlying", "031NSETEST");
+        assert_eq!(
+            decode_master_row(Vendor::Groww, row).map(Decoded::skip),
+            Ok(Some(Skip::TestInstrument))
+        );
     }
 }

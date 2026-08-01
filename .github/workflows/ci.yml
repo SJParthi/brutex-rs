@@ -281,7 +281,17 @@ jobs:
           # version is pinned EXACTLY at 0.18.3 -- the newest release cargo
           # itself reports as supporting 1.85.0. A caret range would silently
           # re-break the moment a newer cargo-deny raises its MSRV again.
-          cargo install cargo-deny --locked
+          #
+          # THE VERSION IS PINNED, AND UNTIL D-0034 IT WAS NOT. The paragraph
+          # above said "pinned EXACTLY at 0.18.3" while the command below said
+          # `cargo install cargo-deny --locked` -- and `--locked` pins the
+          # tool's own dependency graph, never the tool version. So every run
+          # installed whatever was newest that day, and a security gate whose
+          # verdict can change with no commit is a verdict nobody can read.
+          # 0.19.0 is the version this repository is measured against; the
+          # advisory database is still fetched fresh on every run, which is the
+          # part that is supposed to move.
+          cargo install cargo-deny --version 0.19.0 --locked
           cargo deny check
 
       - name: Tests
@@ -315,7 +325,18 @@ jobs:
           See docs/06-limits.md section 7."
             exit 0
           fi
-          cargo install cargo-llvm-cov --locked
+          # THE MEASURING INSTRUMENT IS PINNED. `--locked` pins the tool's own
+          # dependency graph, not the tool version, so this used to install
+          # whatever cargo-llvm-cov was newest that day. `--fail-under-regions
+          # 100` is the threshold most sensitive to how a given cargo-llvm-cov
+          # and LLVM pair enumerates regions: a version that splits one region
+          # into two turns the gate red with no source change, and one that
+          # starts skipping a construct turns it green while uncovered code
+          # exists. Neither is distinguishable from a real regression in the
+          # log. 0.8.4 is the version the operator's machine measures with, so
+          # "CI is green" and "my machine is green" are now the same statement.
+          # D-0034.
+          cargo install cargo-llvm-cov --version 0.8.4 --locked
           cargo llvm-cov --workspace --locked \
             --fail-under-lines 100 --fail-under-regions 100 \
             --summary-only
@@ -333,10 +354,31 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Per-operation cost at 1x / 10x / 100x
         run: |
-          [ -d benches ] || { echo "skip — no benches yet"; exit 0; }
-          cargo bench --workspace --locked -- --save-baseline ci
-          # The harness itself asserts the ratio ceiling and exits non-zero on
-          # breach; see docs/04-invariants.md C-01 through C-04.
+          set -euo pipefail
+          # THIS GATE WAS A NO-OP FOR THE WHOLE LIFE OF THE REPOSITORY, and
+          # both defects fixed in D-0032 and D-0033 merged through it green.
+          # The guard was `[ -d benches ] || { echo skip; exit 0; }`, which
+          # tests for a directory at the repository ROOT. Cargo benches live at
+          # `crates/<name>/benches`, so the probe could never have found one
+          # even after they were written, and a skip that reports success is
+          # exactly the fallback CLAUDE.md section 4 bans.
+          #
+          # It now looks where benches live, and an empty set is a FAILURE
+          # rather than a pass: CLAUDE.md section 3 rule 4 makes this gate the
+          # enforcement mechanism for constant per-operation cost, and a gate
+          # cannot enforce over nothing. See D-0034.
+          n=$(git ls-files 'crates/*/benches/*.rs' | wc -l | tr -d ' ')
+          if [ "$n" -eq 0 ]; then
+            echo "GATE 8 MEASURED NOTHING — no crate carries a bench."
+            echo "Write one, or record abandoning the invariant in"
+            echo "docs/05-decisions.md. This step does not skip."
+            exit 1
+          fi
+          echo "$n bench source file(s) tracked."
+          # Each harness is `harness = false`: it prints every number it took
+          # and exits non-zero on a breach. See docs/04-invariants.md C-01,
+          # C-07 through C-10 for the ratios and the ceiling.
+          cargo bench --workspace --locked
 
   # ==========================================================================
   # Aggregate — this is the only required check on the branch rule.

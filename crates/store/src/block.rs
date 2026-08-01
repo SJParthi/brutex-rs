@@ -74,7 +74,7 @@ pub fn seal(layout: Layout, n_valid: u64, block: u64, bytes: &[u8]) -> Result<u3
             need,
         });
     }
-    Ok(crc32c(bytes.iter().copied()))
+    Ok(crc32c(bytes))
 }
 
 /// Verifies one block's committed bytes against its stored checksum.
@@ -132,9 +132,19 @@ fn covered_len(layout: Layout, n_valid: u64, block: u64) -> Result<u64, FormatEr
 
 /// The length of `bytes` as a `u64`, without a cast this workspace denies.
 ///
-/// Counted rather than converted: `usize`→`u64` is a widening cast on every
-/// target this builds for, so a checked conversion would carry a failure arm
-/// no test could ever reach, and coverage would never close.
+/// This **counted** the bytes one at a time until D-0032, to dodge a `usize`→
+/// `u64` conversion whose failure arm no test could reach. That reasoning was
+/// backwards: it bought a covered branch by walking the block a second time,
+/// beside a checksum that walks it once. Measured before the change, on a full
+/// 4,088-byte block, the fold cost 0.65 ns/byte — 2,625 ns, against 1,487 ns
+/// for the whole checksum after D-0032. Retiring it is most of what makes
+/// [`seal`] fast.
+///
+/// `unwrap_or(u64::MAX)` is not a fallback that hides anything: the conversion
+/// can only fail on a target where `usize` is wider than 64 bits, and there the
+/// answer `u64::MAX` is a length no block covers, so [`seal`] refuses with
+/// [`FormatError::BlockLengthMismatch`] naming the real length. It is the same
+/// loud refusal by a different route, never a silent pass.
 fn byte_count(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0u64, |seen, _| seen.saturating_add(1))
+    u64::try_from(bytes.len()).unwrap_or(u64::MAX)
 }

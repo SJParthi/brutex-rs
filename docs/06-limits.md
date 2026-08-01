@@ -138,10 +138,55 @@ code runs; only a test built from a real vendor row proves it is right.**
 
 Ten further findings shared one shape — a guard that silently turns a step into
 a no-op (`[ -d benches ]`, `[ -f crates/web/… ]`, status `—`, `|| true`, a
-non-member crate, a missing `[lints]`). Gate 8 is the live example: it probes
+non-member crate, a missing `[lints]`). Gate 8 was the live example: it probed
 for a **repository-root** `benches/`, but Cargo benches live at
-`crates/<name>/benches/`, so C-01..C-04 are unenforceable **in perpetuity**,
-not merely until benches are written.
+`crates/<name>/benches/`, so C-01..C-04 were unenforceable **in perpetuity**,
+not merely until benches were written. ~~That remains unrepaired.~~ **CLOSED by
+D-0034** on 2026-08-01 — see §7c for what the repaired gate does and does not
+cover.
+
+---
+
+## 7c. What gate 8 covers now — 2026-08-01, D-0034
+
+Gate 8 ran for the first time on 2026-08-01. Before that it had never executed
+a benchmark in the life of the repository, and both defects D-0032 and D-0033
+repair merged through it green. What it enforces today, honestly bounded:
+
+| Row | Enforced | Over |
+|---|---|---|
+| C-01 | yes | `Header::read_region` at 1×, 10×, 100× the region offered |
+| C-07 | yes | one block's `seal` at 1×, 10×, 100× the file's record count |
+| C-08 | yes | the block checksum against the bit-by-bit kernel it replaced |
+| C-09 | yes | one vendor row's decode at a 28-byte, 64-byte, 6.4 KB and 4 MiB field |
+| C-10 | yes | that the 4 MiB row is **refused**, not merely fast |
+| C-02, C-03, C-04 | **no** | `crates/engine` does not exist |
+
+Four things it still does not prove.
+
+**Absolute speed.** Every row but C-08 is a *ratio*. A change that made every
+operation uniformly ten times slower would pass all of them. C-08 is the one
+absolute-ish assertion and it is deliberately relative too — the retired kernel
+is measured in the same process, on the same machine, under the same load,
+because a nanosecond threshold would have to be guessed for hardware this
+repository has never run on.
+
+**Bar read cost.** C-01 used to claim it and name `store::bench::read_ratio`,
+which did not exist; there is no bar reader in `crates/store` at all. Any
+statement about the cost of verifying one randomly addressed bar is a
+projection about code not yet written. The per-block cost is measured; the
+per-bar ratio is not.
+
+**Anything on `aarch64` in CI.** Every CI job runs `ubuntu-24.04`, `x86_64`.
+The numbers in D-0032 and D-0033 were taken on an Apple M4 Pro. The kernels
+contain no target-specific code, so the *behaviour* is identical by
+construction and `store::unit::the_fast_kernel_agrees_with_a_bit_by_bit_reference_on_every_length`
+checks it on whichever host runs — but the *timings* on `x86_64` are
+**UNMEASURED**. Every ns figure in this repository is an aarch64 figure.
+
+**That a bench is a good bench.** A harness measuring the wrong thing passes
+just as loudly as one measuring the right thing. These measure what two
+specific defects did; they are not a general proof of constancy.
 
 ---
 
@@ -335,3 +380,66 @@ name containing a comma, the row's field count changes — which the shortfall
 check in `api::master::load` catches when the row gets *shorter*, and does not
 catch when it gets longer. A longer row would misread the columns after the
 quoted field. This is not fixed; it is measured, bounded and written down.
+
+---
+
+## 14. The checksum is O(n) in the bytes it covers, and always will be
+
+D-0032 made it 9.4× faster over one block. It did not make it constant, and
+nothing can: a CRC has to read every byte it protects.
+
+What is claimed, and what the numbers are — Apple M4 Pro, `rustc` 1.97.1,
+release profile, `black_box` on both sides. The first row is the standalone
+harness (min of 201 trials × 200 reps); the rest are
+`crates/store/benches/ratio.rs` run three times against a worktree pinned at the
+pre-fix commit and three times against this one, minimum taken:
+
+| | before D-0032 | after | factor |
+|---|---|---|---|
+| one 4,088-byte block, standalone harness | 13,952.5 ns (3.413 ns/B) | 1,487.5 ns (0.364 ns/B) | 9.38× |
+| `crc32c`, one block, gate 8 harness | 13,512.1 ns | 1,491.3 ns | 9.06× |
+| `block::seal` of the same block | 15,291.0 ns | 1,485.0 ns | 10.30× |
+| `Header::read_region`, 1× region | 194.6 ns | 17.1 ns | 11.39× |
+| amortised per record, 73 per block | 209.5 ns | 20.3 ns | 10.30× |
+
+**Per *operation* — one block — the cost is constant**, because a block is a
+fixed 4,088 bytes. That is the claim `docs/02-store-format.md` §6 makes and it
+is the one enforced, by C-07. Per *byte* it is linear and stays linear.
+
+**The whole lake, once, is an EXTRAPOLATION.** 1,706,290 bars ÷ 73 records per
+block × 1,485.0 ns = 0.035 s, against 0.357 s before. That is arithmetic on a
+per-block measurement, not an end-to-end run; no such run has been made, because
+no bar reader exists. Labelled as required by §3 rule 6.
+
+**A hardware kernel would be faster and is not used.** An earlier probe measured
+the ARMv8 CRC32C instruction at 381.9 ns for the same block — roughly 3.9× this
+table kernel, 41× the bit loop. **This session did not take that measurement**
+and neither confirms nor disputes it. D-0032 records why it is not used: every
+crate carries `#![forbid(unsafe_code)]`, and a `#[cfg(target_arch)]`-gated body
+would be invisible to a CI that runs only `x86_64` while the coverage gate
+still reported 100%.
+
+**`x86_64` timings are UNMEASURED.** Every number above is aarch64. The kernel
+is one body on both targets so the *values* are identical by construction and
+checked by S-12 on whichever host runs; the *speeds* on the machine CI actually
+uses have never been taken here.
+
+---
+
+## 15. The vendor field bound is a refusal, not a repair
+
+D-0033 bounds a master field at 64 bytes and a row at 4,096. Three things that
+does not do.
+
+**It does not make the pull O(1).** §2 still holds. It makes one row's *decode*
+constant, which is a different and smaller claim.
+
+**It does not validate content.** A 64-byte field of garbage still reaches the
+parsers below it and is still refused by them, on their own terms. The width
+gate is a bound on effort, not a schema.
+
+**It is calibrated to two masters as they were on 2026-08-01.** The widest read
+field measured 28 bytes across 333,840 rows of real data. If a vendor
+legitimately grows past 64, this refuses real rows — loudly, naming the field
+and the length, which is the intended failure. It is a number to revisit, not a
+law.
