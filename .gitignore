@@ -1,0 +1,20 @@
+# Build output. Never committed, always regenerated.
+/target
+**/*.rs.bk
+
+# The generated WebAssembly loader (docs/06-limits.md §3). It is build output:
+# not committed, not edited, regenerated on every build.
+/crates/web/pkg
+/crates/web/dist
+
+# Credential path configuration (D-0013). The canonical location is outside the
+# repository at ~/.brutex/credentials.toml; these entries exist so that a copy
+# made inside the working tree for convenience still cannot be committed.
+/credentials.toml
+/.brutex-credentials.toml
+
+# Criterion output.
+/target/criterion
+
+# macOS.
+.DS_Store

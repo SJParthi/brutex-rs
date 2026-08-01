@@ -1,0 +1,76 @@
+[workspace]
+resolver = "3"
+
+# One line per crate that EXISTS. A member is added by the pull request that
+# creates the crate, never before it — a manifest that names a directory which
+# is not there fails `cargo build --workspace` outright, and CI gate 4 is not
+# something to be red while waiting for later work.
+#
+# The intended final graph is in docs/01-architecture.md §1, in the order the
+# crates are built:
+#   core → store → vocab → indicators → engine → pull → api → web → cli
+members = []
+
+[workspace.package]
+version      = "0.1.0"
+edition      = "2024"
+rust-version = "1.85"
+license      = "UNLICENSED"
+publish      = false
+
+# ---------------------------------------------------------------------------
+# Lints apply to every member. A crate that needs an exception writes an
+# explicit `#[allow]` at the narrowest possible scope with a comment saying
+# why — never by relaxing the workspace level.
+# ---------------------------------------------------------------------------
+[workspace.lints.rust]
+unsafe_code            = "deny"
+missing_docs           = "warn"
+unreachable_pub        = "warn"
+rust_2024_compatibility = "warn"
+
+[workspace.lints.clippy]
+all                 = { level = "deny", priority = -1 }
+pedantic            = { level = "warn", priority = -1 }
+unwrap_used         = "deny"
+expect_used         = "deny"
+panic               = "deny"
+indexing_slicing    = "deny"
+float_arithmetic    = "warn"   # prices are integers; a float is a smell
+cast_possible_truncation = "deny"
+cast_sign_loss      = "deny"
+todo                = "deny"
+unimplemented       = "deny"
+dbg_macro           = "deny"
+
+[workspace.dependencies]
+# Kept here so every member shares one version. Add nothing without an entry
+# in docs/05-decisions.md naming what it replaces.
+memmap2  = "0.9"
+thiserror = "2"
+blake3   = "1"
+crc32c   = "0.6"
+rayon    = "1"
+tracing  = "0.1"
+tokio    = { version = "1", features = ["rt-multi-thread", "macros", "fs", "signal"] }
+axum     = "0.8"
+reqwest  = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde    = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap     = { version = "4", features = ["derive"] }
+hmac     = "0.12"
+sha1     = "0.10"
+governor = "0.7"
+aws-config  = "1"
+aws-sdk-ssm = "1"
+
+[profile.release]
+opt-level     = 3
+lto           = "fat"
+codegen-units = 1
+panic         = "abort"
+debug         = 1        # keep symbols; profiles are worthless without them
+
+[profile.bench]
+inherits      = "release"
+debug         = true

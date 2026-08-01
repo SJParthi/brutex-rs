@@ -1,0 +1,43 @@
+[graph]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "wasm32-unknown-unknown",
+]
+
+[advisories]
+version = 2
+yanked  = "deny"
+
+[licenses]
+version = 2
+allow = ["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.0", "Zlib"]
+confidence-threshold = 0.93
+
+[bans]
+multiple-versions = "warn"
+wildcards         = "deny"
+
+# Crates that embed or bind another language runtime. Adding any of these
+# defeats the whole point of this repository. The list is not exhaustive by
+# design — `unknown-registry = "deny"` plus the workspace dependency table in
+# Cargo.toml is the real control, and every new dependency needs an entry in
+# docs/05-decisions.md before it lands.
+deny = [
+    { name = "pyo3" },
+    { name = "mlua" },
+    { name = "rlua" },
+    { name = "deno_core" },
+    { name = "v8" },
+    { name = "rusty_v8" },
+    { name = "quickjs-rs" },
+    { name = "boa_engine" },
+    { name = "node-bindgen" },
+    { name = "neon" },
+    { name = "jni" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git      = "deny"
+allow-registry   = ["https://github.com/rust-lang/crates.io-index"]
