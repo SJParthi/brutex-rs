@@ -9,7 +9,7 @@ resolver = "3"
 # The intended final graph is in docs/01-architecture.md §1, in the order the
 # crates are built:
 #   core → store → vocab → indicators → engine → pull → api → web → cli
-members = ["crates/core", "crates/store", "crates/api"]
+members = ["crates/core", "crates/store", "crates/pull", "crates/api"]
 
 [workspace.package]
 version      = "0.1.0"

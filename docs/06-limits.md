@@ -443,3 +443,79 @@ field measured 28 bytes across 333,840 rows of real data. If a vendor
 legitimately grows past 64, this refuses real rows — loudly, naming the field
 and the length, which is the intended failure. It is a number to revisit, not a
 law.
+
+---
+
+## 16. The pasted-secret check is a backstop, not a detector
+
+D-0035. `pull::config::check_segment` refuses a path segment that is 24 or more
+undelimited alphanumerics containing at least one digit. Three things that is
+not.
+
+**It is not a proof about entropy.** It is a rule about a *shape*: names people
+choose are short, or they carry a `-` or a `_`. A secret that happens to be
+short, lower case, alphanumeric and delimited — `ab-12` — passes it, and would
+also pass a human reading the file.
+
+**It is not what does the work.** The length bound (32 bytes) and the byte set
+(`[a-z0-9_-]`, upper case refused separately) are. Every credential shape this
+repository has had in front of it is refused by one of those first: an AWS
+access key by its upper case, a JWT by its `.`, a base64 blob by its `+` or `/`,
+an opaque bearer token by its length. `pull::unit::credential_config_rejects_secret_value`
+drives all four. The backstop exists for the residue.
+
+**It cannot see a secret that is a legal segment.** If an operator's real path
+segment and their real credential were both `k7f2p9q1w8e3-5t6y0u4i2o9`, nothing
+here would tell them apart, and nothing could. The control that actually holds
+is `CLAUDE.md` §8: the value is read from Parameter Store and from nowhere else,
+and the configuration file carries paths only. This check makes the commonest
+mistake loud; it does not make the file safe to put a secret in.
+
+---
+
+## 17. What the manifest makes O(1), and what it does not
+
+D-0035, layer 13 of `docs/07-o1-architecture.md`.
+
+**O(1), and measured.** "How many entries / distinct months / rows does this
+vendor hold" is a field read of the manifest header —
+`pull::bench::census_beats_the_scan_it_replaces` measured it at **193,449×** and
+**402,568×** on two runs of the same tree, against re-deriving the same number
+from 10,000 entries in the same process on an Apple M4 Pro. The spread is the
+counter side: a field read sits at the clock's resolution floor, while the scan
+holds at ~152 µs across both. The gate asserts 100×, three orders of magnitude
+below the worse observation, so it detects a regression rather than reporting a
+scheduler. "What do I hold for this month" is one hash probe into a map reserved
+from a count known before the load walk begins, flat to within 1.05× at 100× the
+census (`pull::bench::entry_lookup_is_flat`).
+
+**NOT O(1), and not claimed to be.**
+
+*A filtered census.* "How many expired option series" walks the manifest's own
+entries. That is a sequential read of one file instead of ~248,000 directory
+operations, which is the difference the layer is about — but it is O(entries).
+Making it a read means a per-segment counter in the header, which is a **new
+field at a new format version**, never a dynamic schema (`CLAUDE.md` §4).
+
+*The load.* `Manifest::load` decodes and checksum-verifies every committed
+entry, recomputes the distinct-key count and the row total, and refuses a header
+that disagrees with them. That is O(entries) by construction and it is the price
+of the counter being trustworthy afterwards. It is paid once per process.
+
+*The directory walk itself.* The alternative the manifest replaces —
+`stat` on every bar file — has **never been measured here.** It depends on a
+filesystem, a page cache and a device the bench harness does not control, and
+timing it would report the state of one machine's cache rather than a property
+of the code. Every statement in this repository about that saving is an
+**EXTRAPOLATION** from the in-memory entry scan, and is labelled one.
+
+*The writer's index.* A manifest built from `Manifest::genesis` reserves
+nothing, because nothing is yet known to reserve from, so its map grows as the
+first keys are recorded. Layer 3's no-rehash guarantee is about the **loaded**
+index — the one a query touches — and it holds there because the reservation
+comes from the entry count known before the walk. The writer pays one rehash per
+doubling, once, on a path that is already doing I/O.
+
+**Unmeasured: `x86_64`.** Every number above is aarch64. CI runs on `x86_64` and
+the ratios are asserted there against the shared-hardware ceiling, but the
+absolute picoseconds on that host have never been recorded here.

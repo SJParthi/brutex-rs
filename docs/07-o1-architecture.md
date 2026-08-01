@@ -46,7 +46,7 @@ arrives from outside.
 | 10 | Parallelism | Work-stealing, never static | 10 P-cores. A static split stalls waiting on the 4 efficiency cores | ○ |
 | 11 | Blocks | Whole records only | `BLOCK_LEN` is a whole multiple of the stride, so straddling is **unrepresentable** rather than handled | ✓ |
 | 12 | Rendering | Bounded page, never the set | A fixed row cap with paging. Never O(universe) | ✓ |
-| 13 | Counting | Counters, never scans | A manifest per vendor. One read, not a walk of every file | ○ |
+| 13 | Counting | Counters, never scans | A manifest per vendor. One read, not a walk of every file | ◐ |
 
 ---
 
@@ -75,10 +75,21 @@ Measured on an Apple M4 Pro, 48 GB, macOS 26.5.2, rustc 1.97.1.
 | Checksum per block | **~7,050 ns** table, from 15,622 ns bitwise | The hardware instruction reaches 381.9 ns; see `docs/06-limits.md` |
 | GPU vs all 14 cores | **66 ms vs 142 ms — 2.1×** | Compute-bound: 1,219 GB/s effective, 5.3× measured DRAM bandwidth |
 | Bar read past RAM | ~100 ns → **61,566 ns** | 616×. Physics. Layer 7 exists because of it |
+| Manifest census vs deriving it | **193,449×** and **402,568×** on two runs | Layer 13. The counter against decoding 10,000 entries, same process. The spread is the counter side at the clock's floor; the scan holds at ~152 µs. D-0035 |
+| Manifest entry lookup, 1→100× census | **0.994–1.049×** | Layer 3 in the layer-13 file: reserved from a known bound, so no rehash |
 
 **Not O(1), and never claimed to be:** the sweep. Apriori over the vocabulary is
 combinatorial — each *step* is 0.2 ns, the number of steps is not constant.
 `CLAUDE.md` §3 rule 4 says "constant **per-operation** cost" for that reason.
+
+**Layer 13 is `◐`, not `✓`.** The manifest exists, its three totals are
+maintained on write and checked against the entries on load, and both bounds
+above are measured. What is *not* built is a **filtered** census — "how many
+expired option series" still walks the manifest's own entries, which is one
+sequential file read instead of ~248,000 directory operations but is not a
+counter read. And the directory walk the file replaces has never been measured
+here at all; every statement about that saving is an **EXTRAPOLATION**. See
+`docs/06-limits.md` §17.
 
 ---
 

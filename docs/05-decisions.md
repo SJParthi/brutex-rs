@@ -1336,3 +1336,202 @@ fetched fresh, which is the part that is supposed to move.
 tests and `crates/engine` does not exist; their status stays `—`. Gate 8 now
 enforces over what exists rather than over nothing, which is a different claim
 from enforcing over everything. See `docs/06-limits.md` §7c.
+
+---
+
+## D-0035 · 2026-08-01 · `crates/pull` is three things and no vendor call: the path configuration, the read-only secret port, and the manifest
+
+**Decision — `crates/pull` ships with (1) a strict reader for the untracked
+credential *path* configuration, (2) a one-method secret source with an SSM
+adapter over a port and no AWS SDK dependency, and (3) a fixed-stride per-vendor
+manifest. It ships with no vendor HTTP call and no `/pull` page.**
+
+### Why the page is not in this change
+
+A control panel for a downloader that cannot download is a dashboard reporting
+on nothing, which is the shape this repository refuses everywhere else — the
+same argument that made gate 8's skip arm unacceptable in D-0034. The page ships
+with the fetch logic, in one change, so that the first thing it renders is a
+real result.
+
+### Part 1 — the configuration reads path segments, and halts on everything else
+
+`CLAUDE.md` §8 and D-0013: no literal parameter path appears in any tracked
+file, because this repository is public and a path names an account, an
+environment and a vendor relationship. `crates/pull/src/config.rs` therefore
+holds four *names of segments* and the renderer that joins them. Every segment
+in its code, its tests and its doc examples is invented — `orgone`, `testenv`,
+`vendorone`, `fieldone`. CI gate 1c was run against this tree and is green.
+
+**Checked, not assumed.** The `org` and `env` values in the operator's own
+`~/.brutex/credentials.toml` were searched for as whole words across every
+tracked file: `org` appears nowhere, and `env` appears once — inside gate 1c's
+own `envs=` alphabet in `.github/workflows/ci.yml`, which is the gate's search
+pattern rather than a path, and which predates this change.
+
+**One honest caveat.** The *vendor table name* is `Vendor::as_str()` — a public
+broker name that has been tracked in `crates/core` since its first commit and is
+in the README, the charter, and every store path. The vendor's **parameter path
+segment** is the `vendor` key inside that table, and `crates/pull` never writes
+one down: every such value in this repository is invented. If an operator sets
+the key to the same text as the table name, the two coincide in *their* file —
+which is their choice and which nothing here can see. The key exists rather than
+the segment being derived from `Vendor::as_str()` for exactly that reason:
+deriving it would make the path segment a tracked literal by construction, for
+every deployment, permanently.
+
+**Every refusal is a halt, and none of them defaults.** A missing file, a
+missing key, a missing vendor table, an empty segment, a separator inside a
+segment, a wrong region, or a line the grammar does not cover: each names the
+line and stops. P-07.
+
+**Nothing from the file is echoed back.** Errors carry the line number and, for
+keys this reader defines, a `&'static str` key. They never quote the file's
+text. An operator who pastes a token where a field name belongs would otherwise
+have it copied into a log line by the very check that caught the mistake. The
+two exceptions are one offending byte and a length.
+
+**Rejected — a TOML crate.** The grammar needed is four keys, one table shape,
+quoted strings and a one-line array. A general parser accepts a great deal more
+and would then have to be told which of it to refuse, which is the same work in
+a less obvious place, plus a dependency and a `serde` derive to read eleven
+lines. The reader here refuses **every** line it does not recognise, which is
+the property that matters: a typo'd key is a halt, not a silent absence that
+becomes a default one layer up.
+
+**Rejected — reading `HOME` inside the crate.** `config::default_config_path`
+takes the home directory. Two reasons, and the second is the load-bearing one:
+process-global state makes two configurations in two tests impossible, and the
+absent-`HOME` arm is a branch no test on any real machine could enter —
+`std::env::set_var` is `unsafe` under edition 2024 and every crate here carries
+`#![forbid(unsafe_code)]`, so it could not even be forced. An unreachable arm
+behind a gate reporting 100% is the false green `docs/07-o1-architecture.md`
+records twice.
+
+**The pasted-secret check is a backstop and is labelled one.** The checks that
+do the work are the length bound (32 bytes) and the byte set (`[a-z0-9_-]`);
+every credential shape this repository has had in front of it — an access key, a
+JWT, a base64 blob — is refused by one of those first, and
+`pull::unit::credential_config_rejects_secret_value` drives all four. The
+backstop catches the residue: 24 or more undelimited alphanumerics with a digit
+in them. It is a heuristic over a shape and **not** a proof about entropy;
+`docs/06-limits.md` §16 says what it does not catch.
+
+### Part 2 — one read method, proved against a double that panics on a write
+
+`SecretSource` has exactly one method and it reads. `ParameterStore` — the port
+an SDK plugs into — has exactly one method and it reads. There is no `write`,
+no `put`, no `rotate` and no `mint` anywhere in the crate's surface, so a token
+cannot be minted by code that does not exist, and adding the method would be a
+diff a reviewer sees rather than a call buried in an SDK builder. That is P-05's
+structural half.
+
+The behavioural half is `pull::unit::readonly_credentials`. It drives a whole
+credential read through a double whose `put_parameter` **panics**, asserts one
+read and zero writes, and then calls that write directly under
+`catch_unwind` and requires it to fail. A double that would not have failed
+proves nothing about the code that did not call it.
+
+**A dead token is re-read once and then the pull stops.** `CLAUDE.md` §8 in one
+function: `reread_after_rejection` takes the value the vendor just rejected,
+reads the parameter again, returns the fresh value if it differs, and halts with
+`DeadToken` if it does not. No third read, no backoff, no mint — a local mint
+would invalidate the token another system shares. P-09.
+
+**Rejected — taking `aws-config` and `aws-sdk-ssm` in this change.** They sit in
+the workspace dependency table, unused. Taking them here adds roughly a hundred
+transitive crates to `Cargo.lock` in support of no call at all, and `cargo deny
+check` would then be verifying a licence and advisory surface nothing exercises.
+The port is one method with the two arguments the real API takes; the adapter
+over it is fully exercised against a double, and the change that first makes a
+live call writes one `impl ParameterStore`, takes the dependency, and states the
+`cargo deny check` result at that point. **No AWS SDK dependency was added and
+no live call was made in this change.**
+
+**`with_decryption` is always `true`.** The real API defaults it to false, which
+returns the ciphertext of a SecureString — a perfectly ordinary string that
+every vendor rejects as a bad credential. That failure looks exactly like an
+expired token and is not one, so the argument has one value in this repository
+and `pull::unit::the_adapter_always_asks_for_a_decrypted_value` pins it.
+
+### Part 3 — the manifest is a counter file, and the counter is checked
+
+`docs/07-o1-architecture.md` layer 13. One file per vendor,
+`manifest/<vendor>.man`, recording per `(instrument, timeframe, month)` the row
+count and the first and last timestamp, with three totals in the header:
+entries written, distinct keys, rows held. All three are field reads.
+
+**Geometry.** A 32,768-byte header region of two 64-byte slots at 16,384-byte
+spacing, then 64-byte entries. `HEADER_LEN + i·64` is an add and a multiply.
+Both the slot and the entry carry a CRC-32C over their first 60 bytes.
+
+**Reused from `crates/store`, as code:** `crc::crc32c` — a second checksum
+implementation is the one duplication that fails silently, because two kernels
+that disagree produce two files each of which verifies only against itself;
+`path::Timeframe` and `path::YearMonth` — the manifest key must be the tuple
+that names a bar file; and `format::SLOT_LEN`, `SLOT_STRIDE` and
+`MAX_SLOT_COUNT` — the 16,384-byte spacing is D-0031's measured failure-unit
+argument, unchanged.
+
+**Reused as reasoning, not code:** the commit counter as the authority (D-0004),
+one write of one self-checked unit, and alternating slots.
+
+**Deliberately not reused: `store::header::Header`.** Its fields are a bar
+file's. Widening it to serve both would make one `format_version` describe two
+geometries, which is what `store::layout`'s dispatch exists to make impossible.
+Its discontiguous checksum domain is not reused either: that shape exists
+because a bar slot has a reserved field *after* its checksum, and this one does
+not.
+
+**A torn write is detectable rather than believed**, by four mechanisms that
+each cover what the others cannot: `n_valid` makes a torn tail unobservable, an
+entry's own CRC catches damage below it, a slot's own CRC plus the other slot
+catches a torn header, and `validate` against the region catches a header that
+became durable before its entries — falling back a generation rather than
+condemning the file.
+
+**And the counter is checked against the thing it counts.** `Manifest::load`
+recomputes the distinct-key count and the row total from the entries and refuses
+a header that disagrees. A counter that is never checked is a number, not a
+measurement — and this module exists so that number can be trusted without a
+walk. The check runs once, on load, where a walk is already being paid. M-06.
+
+**Rejected — checking the multiplication instead of bounding the ordinal.**
+`MAX_ENTRIES` is 2,097,152 and `MAX_ENTRIES · 64 + HEADER_LEN` is 134 MB, so
+past the bound the arithmetic cannot overflow and no offset needs a failure arm.
+The earlier shape had `checked_mul` and `checked_add` behind a `?` in
+`Manifest::record` whose error arms no input could reach — a branch nobody has
+checked, sitting behind a gate that would still report 100%. The same reasoning
+moved the vendor lookup in `CredentialConfig::path_for` from `?` to `and_then`.
+
+**What layer 13 does not buy, said plainly.** A *filtered* census — "how many
+expired option series" — is still a walk of the manifest's entries. It is a
+sequential read of one file instead of ~248,000 directory operations, which is
+the difference the layer is about, but it is not O(1) and is not claimed to be.
+A per-segment counter would make it one and would be a new field at a new format
+version, never a dynamic schema. `docs/06-limits.md` §17.
+
+### What was measured
+
+`crates/pull/benches/ratio.rs`, on an Apple M4 Pro, release profile, minimum of
+60 trials:
+
+| | measured |
+|---|---|
+| C-11 census counter vs decoding 10,000 entries | 789 ps vs 152,631,250 ps — **193,449×** (378 ps / 402,568× on an earlier run) |
+| C-12 entry lookup, 10× census | 1.013× |
+| C-12 entry lookup, 100× census | 1.027× |
+| C-12 absent lookup, 10× / 100× census | 0.994× / 1.049× |
+
+The C-11 spread across runs is the counter side, not the scan side: a field read
+sits at the clock's resolution floor, so its measured picoseconds move by a
+factor of two between runs while the scan holds at ~152 µs. **The floor asserted
+is 100×**, three orders of magnitude below the worse of the two observations, so
+the gate is a regression detector rather than a reading of one afternoon's
+scheduler.
+
+The directory walk the manifest actually replaces is **NOT** measured: it
+depends on a filesystem, a page cache and a device the harness does not control,
+and timing it would report the state of one machine's cache rather than a
+property of the code. Any statement about that saving is an **EXTRAPOLATION**
+from the entry scan above.
