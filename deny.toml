@@ -24,6 +24,18 @@ confidence-threshold = 0.93
 # becomes a rubber stamp.
 unused-allowed-license = "allow"
 
+# The workspace crates are `publish = false` and carry `license = "UNLICENSED"`,
+# which is NOT a valid SPDX identifier — cargo-deny cannot parse it and reports
+# `core = 0.1.0 is unlicensed`. This is the mechanism cargo-deny provides for
+# exactly that case: skip the licence check for crates that are never
+# published, because a licence expression only means something for a crate
+# someone else can consume.
+#
+# It does NOT weaken the check that matters. Every THIRD-PARTY dependency is
+# still held to the `allow` list above; this exemption reaches only crates in
+# this workspace, which are ours and are not distributed.
+private = { ignore = true }
+
 [bans]
 multiple-versions = "warn"
 wildcards         = "deny"
