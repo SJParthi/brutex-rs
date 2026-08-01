@@ -106,6 +106,66 @@ jobs:
           fi
           echo "OK — no build script invokes an external process."
 
+      - name: Gate 9 — core depends on nothing
+        run: |
+          set -euo pipefail
+          # docs/01-architecture.md gives core "May depend on: nothing". Gate 7
+          # guards crates/web, but web's single allowed dependency IS core --
+          # so a dependency added to core is silently forced into a wasm32
+          # build where the filesystem does not exist. Without this gate the
+          # architecture's most load-bearing arrow is a convention.
+          f=crates/core/Cargo.toml
+          [ -f "$f" ] || { echo "skip — crate not created yet"; exit 0; }
+          deps=$(awk '/^\[dependencies\]/{f=1;next} /^\[/{f=0} f && /=/ {print $1}' "$f" \
+                 | grep -v '^$' || true)
+          if [ -n "$deps" ]; then
+            printf 'crates/core MUST DEPEND ON NOTHING. Found:\n%s\n' "$deps"
+            echo "core is compiled to wasm32 through crates/web. See D-0009."
+            exit 1
+          fi
+          echo "OK — core depends on nothing."
+
+      - name: Gate 10 — every invariant names a test that exists
+        run: |
+          set -euo pipefail
+          # docs/04-invariants.md asserts: "A consistency check in CI fails if
+          # a row's test does not exist." Until this gate existed that sentence
+          # was false, which is precisely the decay the file was written to
+          # prevent -- a row pointing at nothing is what turns the file into a
+          # wish list.
+          #
+          # A row is checked when its "Proven by" cell names a Rust test in
+          # `crate::module::test_name` form AND its status is not "—" (not yet
+          # reachable, because the crate does not exist). Rows proven by a CI
+          # gate or a const assertion are not Rust tests and are skipped.
+          f=docs/04-invariants.md
+          missing=0; checked=0
+          while IFS= read -r line; do
+            case "$line" in \|*) ;; *) continue ;; esac
+            # Status is the last non-empty cell on the row.
+            st=$(printf '%s\n' "$line" | awk -F'|' '{print $(NF-1)}' | tr -d ' ')
+            [ "$st" = "—" ] && continue
+            # Pull every `crate::module::name` token out of the row.
+            for t in $(printf '%s\n' "$line" \
+                       | grep -oE '`[a-z_]+::[a-z_]+::[a-z_0-9]+`' \
+                       | tr -d '`' || true); do
+              fn="${t##*::}"
+              checked=$((checked + 1))
+              if ! git ls-files '*.rs' | xargs -r grep -qE "fn ${fn}\b"; then
+                echo "INVARIANT POINTS AT A TEST THAT DOES NOT EXIST: ${t}"
+                missing=$((missing + 1))
+              fi
+            done
+          done < "$f"
+          echo "checked ${checked} named test(s); ${missing} missing"
+          if [ "$missing" -ne 0 ]; then
+            echo
+            echo "Either write the test, or record abandoning the invariant in"
+            echo "docs/05-decisions.md. Rows are never deleted to go green."
+            exit 1
+          fi
+          echo "OK — every reachable invariant names a test that exists."
+
       - name: Gate 7 — the browser crate depends on core alone
         run: |
           set -euo pipefail

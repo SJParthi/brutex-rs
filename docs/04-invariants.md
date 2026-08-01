@@ -88,6 +88,9 @@ dedicated hardware before it is believed.
 | X-06 | Line and branch coverage is 100% on every crate | CI coverage job | ✓ |
 | X-07 | No mutant survives on a touched module | `cargo-mutants`, scheduled | — |
 | X-08 | No tracked file contains a literal credential path | CI gate 1c | ✓ |
+| X-09 | `core` declares no dependency at all | CI gate 9 | ✓ |
+| X-10 | Every reachable row in this file names a test that exists | CI gate 10 | ✓ |
+| X-11 | A price is constructible from a float only through the one checked conversion | `core::price::refuses_an_out_of_range_price_instead_of_saturating` (private field; no other path exists) | ✓ |
 
 ---
 
