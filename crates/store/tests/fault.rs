@@ -559,6 +559,36 @@ fn a_counter_claiming_more_than_the_file_holds_falls_back_to_the_last_supported_
 }
 
 #[test]
+fn ragged_tail_truncates_loudly() {
+    // docs/04-invariants.md S-07, and docs/02 §7. A file whose length does not
+    // divide by the stride was interrupted mid-record. The remainder is
+    // reported so it can be logged with a byte count -- never ignored, never
+    // rounded away, and never counted as a record.
+    let v2 = Layout::V2;
+    for whole in 0..5u64 {
+        let clean = file_len(whole);
+        assert_eq!(v2.ragged_tail_bytes(clean), 0, "{whole} whole records");
+        assert_eq!(v2.capacity_for(clean), whole);
+        for torn in 1..RECORD_STRIDE {
+            assert_eq!(
+                v2.ragged_tail_bytes(clean + torn),
+                torn,
+                "{torn} bytes into record {whole}",
+            );
+            assert_eq!(
+                v2.capacity_for(clean + torn),
+                whole,
+                "the torn record must not be counted",
+            );
+        }
+    }
+    // A file shorter than a header region is all tail.
+    assert_eq!(v2.ragged_tail_bytes(30), 30);
+    assert_eq!(v2.capacity_for(30), 0);
+    assert_eq!(v2.ragged_tail_bytes(HEADER_LEN - 1), HEADER_LEN - 1);
+}
+
+#[test]
 fn a_file_too_short_for_its_header_region_is_refused() {
     let (region, _) = three_commits();
     assert_eq!(
@@ -640,6 +670,22 @@ fn a_batch_that_does_not_follow_the_committed_records_is_refused() {
     assert_eq!(after.last_ts_micros, next_to);
     assert_eq!(after.n_valid, 175);
 
+    // An EMPTY file has nothing for a batch to follow, so the ordering guard
+    // does not apply to it -- not even when the header still carries a stale
+    // last timestamp ahead of the batch. A guard that fired here would refuse
+    // the first append to every new file.
+    let empty = Header {
+        last_ts_micros: T0 + 999 * MINUTE,
+        ..Header::genesis(7, 60, FLAG_CHECKSUMS)
+    };
+    assert_eq!(empty.n_valid, 0);
+    let opened = empty
+        .advance(1, T0, T0)
+        .expect("an empty file follows nothing");
+    assert_eq!(opened.first_ts_micros, T0);
+    assert_eq!(opened.last_ts_micros, T0);
+    assert_eq!(opened.n_valid, 1);
+
     // An empty commit carries both timestamps forward untouched.
     let republished = header.advance(0, 0, 0).expect("no records is not an error");
     assert_eq!(republished.first_ts_micros, header.first_ts_micros);
@@ -666,6 +712,17 @@ fn a_header_whose_advertised_range_runs_backwards_is_refused() {
             next: T0,
         }),
     );
+
+    // A single record: first and last name the same instant, which is a range
+    // that does not run backwards. Refusing it would condemn every file that
+    // holds exactly one bar.
+    let one = Header {
+        n_valid: 1,
+        first_ts_micros: T0,
+        last_ts_micros: T0,
+        ..Header::genesis(7, 60, FLAG_CHECKSUMS)
+    };
+    assert_eq!(one.validate(Layout::V2, file_len(1)), Ok(()));
 
     // An empty file says nothing about its range, so nothing is checked.
     let empty = Header {

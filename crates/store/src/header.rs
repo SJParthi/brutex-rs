@@ -630,8 +630,8 @@ fn whole_slots(region: &[u8]) -> u64 {
 ///
 /// Covering the reserved tail as well as the fields means a flipped bit
 /// *anywhere* in the 64 bytes is detected — there is no window a corruption
-/// can land in and be called clean. `store::fault::a_single_bit_flip_in_any_
-/// header_byte_is_detected` walks all 512 of them.
+/// can land in and be called clean. All 512 of them are walked by
+/// `store::fault::a_single_bit_flip_in_any_header_byte_is_detected`.
 fn covered(slot: &[u8]) -> impl Iterator<Item = u8> + '_ {
     slot.iter()
         .take(OFF_CRC)

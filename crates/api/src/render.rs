@@ -108,20 +108,13 @@ thead th a:hover{color:var(--acc)}\
 .filters{margin:0 auto;max-width:1180px;padding:0 20px}\
 .filters input{position:absolute;opacity:0;pointer-events:none}\
 .pills{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 14px}\
-.pills label{cursor:pointer;user-select:none;padding:9px 16px;border-radius:99px;font-weight:650;\
+.pills a{cursor:pointer;user-select:none;text-decoration:none;display:inline-block;padding:9px 16px;border-radius:99px;font-weight:650;\
 font-size:13.5px;border:1px solid var(--line);background:var(--panel);color:var(--dim);\
 transition:all .22s cubic-bezier(.2,.8,.2,1)}\
-.pills label:hover{transform:translateY(-2px);border-color:var(--acc);color:var(--ink)}\
-.pills label b{font-variant-numeric:tabular-nums;opacity:.65;margin-left:7px;font-weight:700}\
-#f-all:checked~.pills label[for=f-all],\
-#f-fno:checked~.pills label[for=f-fno],\
-#f-ntm:checked~.pills label[for=f-ntm],\
-#f-idx:checked~.pills label[for=f-idx]\
-{background:linear-gradient(135deg,var(--acc),var(--acc2));border-color:transparent;color:#fff;\
+.pills a:hover{transform:translateY(-2px);border-color:var(--acc);color:var(--ink)}\
+.pills a b{font-variant-numeric:tabular-nums;opacity:.65;margin-left:7px;font-weight:700}\
+.pills a.on{background:linear-gradient(135deg,var(--acc),var(--acc2));border-color:transparent;color:#fff;\
 box-shadow:0 6px 18px color-mix(in srgb,var(--acc) 34%,transparent);transform:translateY(-1px)}\
-#f-fno:checked~table tbody tr:not(.u-fno),\
-#f-ntm:checked~table tbody tr:not(.u-ntm),\
-#f-idx:checked~table tbody tr:not(.u-idx){display:none}\
 footer{margin:22px auto 0;max-width:1180px;padding:0 20px;color:var(--dim);font-size:12.5px;line-height:1.9}\
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}";
 
@@ -269,43 +262,143 @@ fn isin_cell(row: &Row) -> String {
 ///
 /// Extracted from [`instruments_page`] because that function is at clippy's
 /// 100-line ceiling; the split is a lint, not a design.
-fn filter_pills(rows: &[Row]) -> String {
+fn filter_pills(counts: UniverseCounts, query: &str, active: &str, all: bool) -> String {
     let mut out = String::with_capacity(512);
-    // THE UNIVERSE FILTER — four radio inputs and one CSS rule.
+    // THE PILLS ARE LINKS, NOT A CSS TOGGLE.
     //
-    // No script, and none is wanted: `#f-fno:checked ~ table tbody tr:not(.u-fno)
-    // {display:none}` is resolved by the browser's selector engine in native
-    // code. It is faster than any handler could be, it cannot throw, and it
-    // needs no round trip — filtering is instant and the server is not touched.
+    // They were a `:checked ~` rule, which filtered without a round trip. But a
+    // CSS rule can only hide rows the browser already HAS, and a page carries
+    // 200 of 785 — so "F&O" showed 52 when the answer was 208, instantly and
+    // authoritatively wrong. The count and the rows behind it disagreed.
     //
-    // The inputs precede the table because a sibling combinator only reaches
-    // FORWARD; that ordering is load-bearing, not cosmetic.
+    // As links, the server selects from the whole set and the number on the
+    // pill is the population behind it. The round trip costs 0.6 ms on
+    // loopback, below anything a person perceives, so correctness is free here.
     //
-    // Counts are of the whole universe, not of this page, so a filter never
-    // implies the 200 rendered rows are all there are.
-    let (n_fno, n_ntm, n_idx) = rows.iter().fold((0, 0, 0), |(f, t, i), r| {
-        (
-            f + usize::from(r.universe.contains(Universe::FNO)),
-            t + usize::from(r.universe.contains(Universe::TOTAL_MARKET)),
-            i + usize::from(r.universe.contains(Universe::INDEX)),
-        )
-    });
+    // `all` is carried through, so widening to every NSE listing and then
+    // filtering by universe compose instead of cancelling.
+    let q = escape(query);
+    let suffix = if all { "&amp;all=1" } else { "" };
+    let pill = |slug: &str, label: &str, n: usize| -> String {
+        let on = if active == slug { " class=\"on\"" } else { "" };
+        format!("<a href=\"/instruments?q={q}&amp;u={slug}{suffix}\"{on}>{label}<b>{n}</b></a>")
+    };
     let _ = write!(
         out,
-        "<section class=\"filters\">\
-         <input type=\"radio\" name=\"u\" id=\"f-all\" checked>\
-         <input type=\"radio\" name=\"u\" id=\"f-fno\">\
-         <input type=\"radio\" name=\"u\" id=\"f-ntm\">\
-         <input type=\"radio\" name=\"u\" id=\"f-idx\">\
-         <div class=\"pills\">\
-         <label for=\"f-all\">All<b>{}</b></label>\
-         <label for=\"f-fno\">F&amp;O<b>{n_fno}</b></label>\
-         <label for=\"f-ntm\">NIFTY Total Market<b>{n_ntm}</b></label>\
-         <label for=\"f-idx\">Indices<b>{n_idx}</b></label>\
-         </div>",
-        rows.len()
+        "<section class=\"filters\"><div class=\"pills\">{}{}{}{}</div>",
+        pill("", "All", counts.all),
+        pill("fno", "F&amp;O", counts.fno),
+        pill("ntm", "NIFTY Total Market", counts.ntm),
+        pill("idx", "Indices", counts.index),
     );
     out
+}
+
+/// How many instruments each universe holds, over the WHOLE tracked set.
+///
+/// Counted by the caller from the merged map, never from the rendered page: a
+/// pill whose number counts only the 200 rows on screen says 52 when the answer
+/// is 208, and looks authoritative doing it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UniverseCounts {
+    /// Every tracked instrument.
+    pub all: usize,
+    /// F&O underlyings.
+    pub fno: usize,
+    /// NIFTY Total Market constituents.
+    pub ntm: usize,
+    /// Index series.
+    pub index: usize,
+}
+
+/// The sortable table: header links, then one row per instrument.
+///
+/// Split out of [`instruments_page`] to stay under clippy's 100-line ceiling.
+/// The split is a lint, not a design.
+fn table(rows: &[Row], query: &str, sort: &str) -> String {
+    let mut body = String::with_capacity(256 + rows.len() * 256);
+    // SORTABLE HEADERS. Links, not script: the order is part of the URL, so a
+    // sorted view is linkable, reloadable and back-buttonable, and the server
+    // decides it once from data already in memory. The query is carried through
+    // so sorting does not silently clear a search.
+    let q = escape(query);
+    let sort_link = |col: &str, label: &str| -> String {
+        let mark = if sort == col { " ▾" } else { "" };
+        format!("<th><a href=\"/instruments?q={q}&amp;sort={col}\">{label}{mark}</a></th>")
+    };
+    body.push_str("<table><thead><tr>");
+    for (col, label) in [
+        ("key", "Canonical key"),
+        ("vendors", "Vendors"),
+        ("symbol", "Underlying"),
+        ("isin", "ISIN"),
+        ("universe", "Universe"),
+        ("kind", "Kind"),
+    ] {
+        body.push_str(&sort_link(col, label));
+    }
+    body.push_str("<th>Expiry</th><th>Strike</th></tr></thead><tbody>");
+
+    for row in rows {
+        // Classes carry BOTH facts: whether the engine sweeps it (colour) and
+        // which lists it is in (what the filter selects on). One attribute,
+        // because a second would need a wrapper element per row.
+        let mut classes = String::new();
+        if row.key.is_sweepable() {
+            classes.push_str("swept ");
+        }
+        for (bit, name) in [
+            (Universe::FNO, "u-fno"),
+            (Universe::TOTAL_MARKET, "u-ntm"),
+            (Universe::INDEX, "u-idx"),
+        ] {
+            if row.universe.contains(bit) {
+                classes.push_str(name);
+                classes.push(' ');
+            }
+        }
+        let _ = write!(
+            body,
+            "<tr class=\"{}\"><td>{}</td>{}<td>{}</td>{}{}{}</tr>",
+            classes.trim_end(),
+            escape(&row.key.to_string()),
+            vendor_cell(row),
+            escape(row.key.underlying.as_str()),
+            isin_cell(row),
+            universe_cell(row.universe),
+            kind_cells(row.key.kind),
+        );
+    }
+
+    body
+}
+
+/// Everything one rendering of the instruments page needs.
+///
+/// A struct rather than nine parameters: clippy caps a function at seven,
+/// and more to the point a positional list of four `&str` invites a caller to
+/// swap `sort` and `active` with no type error and no test failure -- the page
+/// would simply sort by a filter name and filter by a column name.
+#[derive(Debug, Clone, Copy)]
+pub struct View<'a> {
+    /// The page title.
+    pub title: &'a str,
+    /// The denominator the title's count means.
+    pub total: usize,
+    /// The rows to render, already filtered and sorted.
+    pub rows: &'a [Row],
+    /// What was typed in the search box.
+    pub query: &'a str,
+    /// Which column the rows are ordered by.
+    pub sort: &'a str,
+    /// Whether the universe filter is lifted.
+    pub all: bool,
+    /// Universe sizes, over the whole tracked set.
+    pub counts: UniverseCounts,
+    /// Which universe pill is selected.
+    pub active: &'a str,
+    /// Every line an operator has to be told.
+    pub notes: &'a [String],
 }
 
 /// Renders a complete instruments page.
@@ -320,15 +413,18 @@ fn filter_pills(rows: &[Row]) -> String {
 /// way to reach most of the universe, silently dropped the one thing the page
 /// existed to say.
 #[must_use]
-pub fn instruments_page(
-    title: &str,
-    total: usize,
-    rows: &[Row],
-    query: &str,
-    sort: &str,
-    all: bool,
-    notes: &[String],
-) -> String {
+pub fn instruments_page(view: &View<'_>) -> String {
+    let View {
+        title,
+        total,
+        rows,
+        query,
+        sort,
+        all,
+        counts,
+        active,
+        notes,
+    } = *view;
     let mut body = String::with_capacity(1024 + rows.len() * 256);
     body.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">");
     body.push_str("<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">");
@@ -383,61 +479,9 @@ pub fn instruments_page(
     }
     body.push_str("</ul>");
 
-    body.push_str(&filter_pills(rows));
+    body.push_str(&filter_pills(counts, query, active, all));
 
-    // SORTABLE HEADERS. Links, not script: the order is part of the URL, so a
-    // sorted view is linkable, reloadable and back-buttonable, and the server
-    // decides it once from data already in memory. The query is carried through
-    // so sorting does not silently clear a search.
-    let q = escape(query);
-    let sort_link = |col: &str, label: &str| -> String {
-        let mark = if sort == col { " ▾" } else { "" };
-        format!("<th><a href=\"/instruments?q={q}&amp;sort={col}\">{label}{mark}</a></th>")
-    };
-    body.push_str("<table><thead><tr>");
-    for (col, label) in [
-        ("key", "Canonical key"),
-        ("vendors", "Vendors"),
-        ("symbol", "Underlying"),
-        ("isin", "ISIN"),
-        ("universe", "Universe"),
-        ("kind", "Kind"),
-    ] {
-        body.push_str(&sort_link(col, label));
-    }
-    body.push_str("<th>Expiry</th><th>Strike</th></tr></thead><tbody>");
-
-    for row in rows {
-        // Classes carry BOTH facts: whether the engine sweeps it (colour) and
-        // which lists it is in (what the filter selects on). One attribute,
-        // because a second would need a wrapper element per row.
-        let mut classes = String::new();
-        if row.key.is_sweepable() {
-            classes.push_str("swept ");
-        }
-        for (bit, name) in [
-            (Universe::FNO, "u-fno"),
-            (Universe::TOTAL_MARKET, "u-ntm"),
-            (Universe::INDEX, "u-idx"),
-        ] {
-            if row.universe.contains(bit) {
-                classes.push_str(name);
-                classes.push(' ');
-            }
-        }
-        let _ = write!(
-            body,
-            "<tr class=\"{}\"><td>{}</td>{}<td>{}</td>{}{}{}</tr>",
-            classes.trim_end(),
-            escape(&row.key.to_string()),
-            vendor_cell(row),
-            escape(row.key.underlying.as_str()),
-            isin_cell(row),
-            universe_cell(row.universe),
-            kind_cells(row.key.kind),
-        );
-    }
-
+    body.push_str(&table(rows, query, sort));
     body.push_str("</tbody></table></section>");
     body.push_str(
         "<footer>Rendered on the server. No JavaScript — \
@@ -494,7 +538,17 @@ mod tests {
 
     /// A page with no notes, for the tests that are about rows.
     fn page(title: &str, total: usize, rows: &[Row], query: &str) -> String {
-        instruments_page(title, total, rows, query, "", false, &[])
+        instruments_page(&View {
+            title,
+            total,
+            rows,
+            query,
+            sort: "",
+            all: false,
+            counts: UniverseCounts::default(),
+            active: "",
+            notes: &[],
+        })
     }
 
     #[test]
@@ -680,15 +734,17 @@ mod tests {
             "dhan: UNAVAILABLE — no such file".to_owned(),
             "ISIN CONFLICT · NSE-CHOLAFIN: groww says A, dhan says B".to_owned(),
         ];
-        let html = instruments_page(
-            "search",
-            1,
-            &[row(nifty(), &[Vendor::Groww])],
-            "NIFTY",
-            "",
-            false,
-            &notes,
-        );
+        let html = instruments_page(&View {
+            title: "search",
+            total: 1,
+            rows: &[row(nifty(), &[Vendor::Groww])],
+            query: "NIFTY",
+            sort: "",
+            all: false,
+            counts: UniverseCounts::default(),
+            active: "",
+            notes: &notes,
+        });
         for note in &notes {
             assert!(html.contains(&escape(note)), "{note} must be on the page");
         }
@@ -698,7 +754,17 @@ mod tests {
             "the tally is quiet; UNAVAILABLE and the conflict are not"
         );
         // And a note is escaped like everything else.
-        let html = instruments_page("t", 0, &[], "", "", false, &["<b>x</b>".to_owned()]);
+        let html = instruments_page(&View {
+            title: "t",
+            total: 0,
+            rows: &[],
+            query: "",
+            sort: "",
+            all: false,
+            counts: UniverseCounts::default(),
+            active: "",
+            notes: &["<b>x</b>".to_owned()],
+        });
         assert!(html.contains("&lt;b&gt;x&lt;/b&gt;"));
         assert!(!html.contains("<li><b>"));
     }

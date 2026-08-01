@@ -465,35 +465,6 @@ fn capacity_and_ragged_tail_agree_with_the_bytes() {
 }
 
 #[test]
-fn ragged_tail_truncates_loudly() {
-    // S-07 and docs/02 §7. A file whose length does not divide by the stride
-    // was interrupted mid-record. The remainder is reported so it can be
-    // logged with a byte count -- never ignored, never rounded away.
-    let v2 = Layout::V2;
-    for whole in 0..5u64 {
-        let clean = HEADER_LEN + whole * RECORD_STRIDE;
-        assert_eq!(v2.ragged_tail_bytes(clean), 0, "{whole} whole records");
-        assert_eq!(v2.capacity_for(clean), whole);
-        for torn in 1..RECORD_STRIDE {
-            assert_eq!(
-                v2.ragged_tail_bytes(clean + torn),
-                torn,
-                "{torn} bytes of a record {whole}",
-            );
-            assert_eq!(
-                v2.capacity_for(clean + torn),
-                whole,
-                "the torn record is not counted",
-            );
-        }
-    }
-    // A file shorter than a header region is all tail.
-    assert_eq!(v2.ragged_tail_bytes(30), 30);
-    assert_eq!(v2.capacity_for(30), 0);
-    assert_eq!(v2.ragged_tail_bytes(HEADER_LEN - 1), HEADER_LEN - 1);
-}
-
-#[test]
 fn commits_alternate_between_the_slots() {
     let v2 = Layout::V2;
     assert_eq!(v2.slot_offset(0), 0);
@@ -777,6 +748,48 @@ fn a_genesis_header_describes_an_empty_file() {
     assert_eq!(second.first_ts_micros, 99, "record 0 never moves");
     assert_eq!(second.last_ts_micros, 420);
     assert_eq!(second.n_valid, 5);
+}
+
+// ===========================================================================
+// The block checksum
+// ===========================================================================
+
+#[test]
+fn a_block_outside_the_commit_is_refused_by_both_doors() {
+    // The geometry refuses before a byte is hashed, and `verify` propagates
+    // that refusal rather than swallowing it into "the checksum did not
+    // match" -- two different problems that would send an operator to two
+    // different places.
+    let v2 = Layout::V2;
+    let header = Header::genesis(7, 60, FLAG_CHECKSUMS)
+        .advance(1, 100, 100)
+        .expect("fits");
+    let record = [7u8; 56];
+    let past = Err(FormatError::BlockNotCommitted {
+        block: 1,
+        blocks: 1,
+    });
+
+    assert_eq!(block::seal(v2, header.n_valid, 1, &record), past);
+    assert_eq!(block::verify(&header, v2, 1, &record, 0), past.map(|_| ()));
+    assert_eq!(
+        block::verify(&header, v2, 0, &record[..55], 0),
+        Err(FormatError::BlockLengthMismatch {
+            block: 0,
+            len: 55,
+            need: 56,
+        }),
+    );
+
+    // And the happy path, so this is not only a list of refusals: one record
+    // committed, one block, and the seal is what verify accepts.
+    let sealed = block::seal(v2, header.n_valid, 0, &record).expect("one record, one block");
+    assert_eq!(block::verify(&header, v2, 0, &record, sealed), Ok(()));
+    assert_eq!(
+        block::seal(v2, header.n_valid, 0, &record),
+        Ok(sealed),
+        "sealing is idempotent, byte for byte",
+    );
 }
 
 // ===========================================================================

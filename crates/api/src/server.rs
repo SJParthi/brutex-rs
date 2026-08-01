@@ -364,7 +364,7 @@ fn hex_digit(c: u8) -> Option<u8> {
 /// are now a banner the page always carries, whatever was typed.
 #[must_use]
 pub fn instruments_html(dir: &Path, query: &str) -> String {
-    instruments_html_from(&universe(dir), query, "", false)
+    instruments_html_from(&universe(dir), query, "", false, "")
 }
 
 /// The instruments page, rendered from a universe that is **already loaded**.
@@ -385,7 +385,13 @@ pub fn instruments_html(dir: &Path, query: &str) -> String {
 /// renders from that. Re-reading is now an explicit operator action rather
 /// than a side effect of looking at the page.
 #[must_use]
-pub fn instruments_html_from(read: &Read, query: &str, sort: &str, all: bool) -> String {
+pub fn instruments_html_from(
+    read: &Read,
+    query: &str,
+    sort: &str,
+    all: bool,
+    universe_filter: &str,
+) -> String {
     let needle = query.to_uppercase();
 
     // THE TRACKED UNIVERSE, and nothing else.
@@ -408,18 +414,38 @@ pub fn instruments_html_from(read: &Read, query: &str, sort: &str, all: bool) ->
     // recompile.
     let tracked =
         |u: Universe| all || u.contains(Universe::TOTAL_MARKET) || u.contains(Universe::INDEX);
-    let total = read
+    // COUNTS OVER THE WHOLE TRACKED SET, never over the rendered page. A pill
+    // that counts the 200 rows on screen says 52 when the answer is 208, and
+    // looks authoritative doing it.
+    let counts = read
         .merged
         .by_key
         .values()
         .filter(|e| tracked(e.universe))
-        .count();
+        .fold(render::UniverseCounts::default(), |mut c, e| {
+            c.all += 1;
+            c.fno += usize::from(e.universe.contains(Universe::FNO));
+            c.ntm += usize::from(e.universe.contains(Universe::TOTAL_MARKET));
+            c.index += usize::from(e.universe.contains(Universe::INDEX));
+            c
+        });
+    let total = counts.all;
+
+    // The universe pill, applied HERE so it selects from the whole set rather
+    // than hiding rows the page happened to load. An unrecognised value selects
+    // everything: a stale bookmark should render the page, not an empty one.
+    let selected = |u: Universe| match universe_filter {
+        "fno" => u.contains(Universe::FNO),
+        "ntm" => u.contains(Universe::TOTAL_MARKET),
+        "idx" => u.contains(Universe::INDEX),
+        _ => true,
+    };
 
     let mut keys: Vec<_> = read
         .merged
         .by_key
         .iter()
-        .filter(|(_, e)| tracked(e.universe))
+        .filter(|(_, e)| tracked(e.universe) && selected(e.universe))
         .filter(|(k, _)| needle.is_empty() || k.to_string().to_uppercase().contains(&needle))
         .map(|(k, e)| (*k, *e))
         .collect();
@@ -475,7 +501,17 @@ pub fn instruments_html_from(read: &Read, query: &str, sort: &str, all: bool) ->
             matched,
         )
     };
-    render::instruments_page(&title, denominator, &rows, query, sort, all, &read.notes)
+    render::instruments_page(&render::View {
+        title: &title,
+        total: denominator,
+        rows: &rows,
+        query,
+        sort,
+        all,
+        counts,
+        active: universe_filter,
+        notes: &read.notes,
+    })
 }
 
 /// The instruments page.
@@ -487,7 +523,8 @@ async fn page(
     let typed = parse_query(raw);
     let sort = param(raw, "sort");
     let all = param(raw, "all") == "1";
-    axum::response::Html(instruments_html_from(&read, &typed, &sort, all))
+    let u = param(raw, "u");
+    axum::response::Html(instruments_html_from(&read, &typed, &sort, all, &u))
 }
 
 /// The health endpoint.
