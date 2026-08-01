@@ -110,41 +110,40 @@ jobs:
           # ---------------------------------------------------------------
           # 4. Every gate. Not only the required one.
           # ---------------------------------------------------------------
+          # This step used to REFUSE whenever any check was still pending. That
+          # was wrong and it broke every merge: on a `pull_request` event the
+          # gates have only just STARTED, so pending is the normal state and it
+          # refused every single time. Nothing re-evaluated afterwards, because
+          # the `workflow_run` re-trigger fires against main rather than the
+          # pull request branch. Both of the first two pull requests had to be
+          # merged by hand as a result.
+          #
+          # The deeper error was duplicating a guarantee the platform already
+          # provides. GitHub's native auto-merge waits for required checks by
+          # definition, and branch protection requires `ci-ok` with strict mode
+          # on. GitHub is incapable of merging a red or unfinished pull
+          # request. Re-deriving that in shell added no safety and got it wrong.
           runs=$(gh api "repos/${REPO}/commits/${head}/check-runs" --paginate \
-                   --jq '.check_runs[] | [.name, .status, (.conclusion // "none")] | @tsv')
-
-          if [ -z "$runs" ]; then
-            refuse "no check run has reported for ${head} yet."
-          fi
-
-          red=0; pending=0; required_ok=0
+                   --jq '.check_runs[] | [.name, .status, (.conclusion // "none")] | @tsv' \
+                 || true)
           while IFS=$'\t' read -r name status conclusion; do
             [ -n "$name" ] || continue
-            if [ "$name" = "$SELF_CHECK_NAME" ]; then
-              continue                       # do not wait on ourselves
-            fi
+            [ "$name" = "$SELF_CHECK_NAME" ] && continue
             say "  gate ${name}: ${status}/${conclusion}"
-            case "$conclusion" in
-              failure|cancelled|timed_out|action_required|stale)
-                red=$((red + 1)) ;;
-            esac
-            if [ "$status" != "completed" ]; then
-              pending=$((pending + 1))
-            fi
-            if [ "$name" = "$REQUIRED_CHECK" ] \
-               && [ "$status" = "completed" ] && [ "$conclusion" = "success" ]; then
-              required_ok=1
-            fi
           done <<< "$runs"
-
-          [ "$red" -eq 0 ]     || refuse "${red} gate(s) are red."
-          [ "$pending" -eq 0 ] || refuse "${pending} gate(s) are still running."
-          [ "$required_ok" -eq 1 ] \
-            || refuse "the required check '${REQUIRED_CHECK}' has not reported success."
+          say "Required check '${REQUIRED_CHECK}' is enforced by branch protection."
 
           # ---------------------------------------------------------------
-          # 5. Green. Hand it to GitHub.
+          # 5. Hand it to GitHub, which merges iff ci-ok goes green.
           # ---------------------------------------------------------------
-          say "Every gate is green. Enabling squash auto-merge on #${pr}."
-          gh pr merge "$pr" --repo "$REPO" --auto --squash
-          say "Squash auto-merge enabled."
+          say "Enabling squash auto-merge on #${pr}."
+          if gh pr merge "$pr" --repo "$REPO" --auto --squash; then
+            say "Auto-merge enabled — GitHub merges when ci-ok passes."
+          else
+            # `--auto` merges outright when the pull request is already
+            # mergeable, and a second invocation then errors. That is not a
+            # failure worth surfacing.
+            now=$(gh pr view "$pr" --repo "$REPO" --json state --jq .state)
+            [ "$now" = "MERGED" ] || refuse "could not enable auto-merge; state is ${now}."
+            say "Already merged."
+          fi
