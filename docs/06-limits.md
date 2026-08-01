@@ -126,7 +126,67 @@ exactly the mistake the read-only-mapping decision was made to avoid.
 | Secondary-vendor index security ids other than NIFTY | community sources only, unverified — cross-check against the vendor scrip master before use |
 | Secondary-vendor India VIX candle availability | undocumented — treat as a hard gate |
 | Primary-vendor per-second request cap | undocumented; the production ceiling is a chosen value, not a measured one |
-| Whether a bar timestamp marks the open or the close of its minute | assumed open; unverified against either vendor |
+| ~~Whether a bar timestamp marks the open or the close of its minute~~ | **RESOLVED — open.** See §9. |
 
 Each of these is a probe someone must run against a live credential. Until
 then they stay in this table and out of any claim.
+
+---
+
+## 9. What the lake actually contains
+
+Measured 2026-08-01 by a full read of all 284 one-minute Parquet files for the
+three engine instruments plus India VIX — 1,706,290 bars. These are
+observations of the data on disk, not claims about the exchange.
+
+**Resolved.** A bar timestamp is the **open** of its minute. Three independent
+grounds: the first bar of a session is 09:15 and not 09:16; the last is 15:29
+and not 15:30; and 09:15 through 15:29 inclusive is exactly 375 bars, which is
+the observed row count on 1,617 of 1,630 NIFTY days. No other edge convention
+produces 375. The charter's assumption was right; it is now a measurement.
+
+**Resolved.** Prices convert to paisa without loss. Every OHLC value in all
+four series lies on the 2-decimal grid; the largest deviation of `x·100` from
+an integer is **9.3 × 10⁻¹⁰ paisa**, nine orders of magnitude below a half
+paisa. No value is ambiguous between two paisa, so the half-up snap at the
+write boundary is exact rather than merely close.
+
+**Limits found, which were not previously written down:**
+
+| Limit | Consequence |
+|---|---|
+| **SENSEX history begins 2022-09-01**, not 2020-01 | NIFTY and BANKNIFTY have 2 years 8 months that SENSEX does not. A cross-instrument sweep before 2022-09 has no SENSEX data at all. Never present a three-instrument result over a window SENSEX cannot cover. |
+| **India VIX does not print every minute** | 449 of 1,630 dates deviate from 375 bars, against 13 for NIFTY. Gaps are single scattered minutes with no time-of-day concentration — 2024-06 has 7,088 VIX bars against 7,125 NIFTY bars. The `vix_at_entry` / `vix_at_exit` stamp therefore **cannot assume a VIX bar exists for its index bar**, and must carry an explicit absence rather than a zero. |
+| **375 bars per day is the common case, not the rule** | 13 NIFTY days, 8 SENSEX days and 449 VIX days differ. Ten sessions sit wholly or partly outside 09:15–15:29: three weekend budget sessions, four evening Muhurat sessions, one afternoon Muhurat session, one circuit-halt pair, and the 2021-02-24 outage day which runs to 16:59 with a 3.5-hour hole. Any code that hardcodes 375 is wrong on those days. |
+| **Parquet footer statistics are absent** | The writer emitted no min/max/null-count for any column chunk. Integrity verification during conversion requires reading column data; there is no cheap footer path. |
+| **`open_interest` is 100% null, `volume` is 100% literal zero** | Across all 1,706,290 bars, `volume` has exactly one distinct value. Both columns carry no information for spot indices. The null/zero distinction is preserved correctly in the source, so mapping null to `i64::MIN` cannot collide with a genuine zero. |
+
+**Four dates the lake says are holidays and the predecessor's calendar does
+not.** Each has **zero bars across NIFTY, BANKNIFTY and SENSEX** — which is the
+predecessor's own evidence standard for an untraded day — but none is
+traceable to an exchange circular anyone has read. Under Golden Rule 1 they are
+`UNVERIFIED` and are carried, not inherited silently:
+
+| Date | Evidence | Status |
+|---|---|---|
+| 2024-01-22 | 0 bars, 3 indices. The predecessor's own bench fixture calls it "the 2024-01-22 special holiday" while its calendar unit test asserts the opposite. Self-contradictory at source. | UNVERIFIED |
+| 2024-11-20 | 0 bars, 3 indices. The date is load-bearing elsewhere in the predecessor as a SEBI regime change, yet absent from its holiday set. | UNVERIFIED |
+| 2025-10-10 | 0 bars, 3 indices. Named nowhere in the predecessor. | UNVERIFIED |
+| 2026-01-15 | 0 bars, 3 indices. Pins a drift the predecessor documented but never located: a live vendor pull served 20 January-2026 sessions where its calendar derived 21. The predecessor concluded "more likely a vendor data gap"; three indices at zero argues the other way. | UNVERIFIED |
+| 2023-06-28 **or** 2023-06-29 | Both have 0 bars, 3 indices. One is a genuine holiday mis-dated by one day. Which one cannot be settled from files. | UNVERIFIED |
+
+Settling any of these requires reading the exchange circular. Until then the
+calendar carries them with their evidence lane attached, and a sweep window
+crossing one of them reports the abstention rather than silently producing
+fewer bars than the caller expected.
+
+**Two session shapes with no recorded cause:** 2022-03-07 (335 bars) and
+2025-09-26 (321 bars, truncated at 14:35). Both are contiguous runs rather
+than scattered gaps, which is halt-shaped, but neither is named in any source
+read so far. Whether 2025-09-26 is an exchange event or an ingest failure is
+UNVERIFIED and settleable from the predecessor's own audit log.
+
+**The whole of 2026 is UNVERIFIED.** The predecessor's 2026 holiday list was
+assembled from broker and news secondary sources after nineteen attempts to
+fetch the official circular returned HTTP 403. No 2026 date is
+primary-verified, and 2026-01-15 above is the first one the data disputes.

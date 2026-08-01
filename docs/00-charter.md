@@ -58,14 +58,24 @@ Sources are Indian exchange publications and the vendor documentation cited in
 | Regular session | 09:15 – 15:30 IST, NSE and BSE equity |
 | Pre-open auction | 09:00 – 09:15 IST — excluded from bars |
 | First index tick | 09:15:00 IST |
-| Forced exit | 15:20 IST |
 | Timezone | IST, fixed +05:30, no daylight saving |
 | Bars per regular session | 375 at 1-minute granularity |
 | Muhurat (Diwali) session | ~1 hour, an evening session on a date that is
   otherwise a holiday. Verified dates: 2020-11-14, 2021-11-04, 2022-10-24,
   2023-11-12, 2024-11-01, 2025-10-21 |
-| Special weekend sessions | Budget-day Saturdays. Verified: 2021-01-30,
-  2021-02-01 (Monday), 2026-02-01 |
+| Special weekend sessions | Union Budget sessions falling on a weekend, run at
+  full regular hours. **2020-02-01 (Sat), 2025-02-01 (Sat), 2026-02-01 (Sun)**
+  — 375 bars each, confirmed in the lake. This is the complete set: 1 February
+  fell on a weekend in no other year from 2020 to date. Supersedes an earlier
+  claim of 2021-01-30 and 2021-02-01; see D-0014. |
+| Bar timestamp | the **OPEN** (left edge) of its minute. A bar covers the
+  half-open window `[t, t + tf)`, left-closed and left-labelled. VERIFIED |
+| Last regular 1-minute bar | **15:29:00 IST**, not 15:30. 09:15 through 15:29
+  inclusive is exactly 375 bars, which is the arithmetic that closes it. |
+| Forced exit | 15:20 IST, **inclusive of the 15:20 bar**: a bar is a
+  forced-exit bar iff `bar_open + tf > 15:20`. The 15:19 bar closes exactly at
+  15:20 and is not forced. Generalises to `session_close − 10 min`, which
+  yields 14:35 for the 2025 Muhurat session and 16:50 for 2021-02-24. |
 | Tick grid | 2 decimal places |
 | Price storage | paisa integers, `i64` |
 | Track-1 brokerage | none. Spot indices are not tradable; the sweep is
@@ -74,6 +84,32 @@ Sources are Indian exchange publications and the vendor documentation cited in
 **Muhurat is not a normal session.** A previous-day anchor must never roll
 across it — the one-hour evening OHLC is not the prior regular day. This was a
 real defect that silently poisoned six years of daily anchors.
+
+Stated exactly, because "never roll across it" is not implementable:
+
+> For a bar on any day after a Muhurat session, the previous-day anchor is the
+> OHLC of the **last regular trading session strictly before the Muhurat
+> date**. The Muhurat day's own OHLC never enters the previous-day anchor, the
+> multi-day rolling history, or the previous-session edge.
+
+Worked case: the anchor for 2024-11-04 (Mon) is **2024-10-31 (Thu)** — not
+2024-11-01, which was the Muhurat Friday. The mechanism is that every Muhurat
+date is also a non-trading date, so an anchor walk restricted to trading days
+skips it structurally rather than by a special case that can be forgotten.
+
+Muhurat sessions, confirmed bar-for-bar against the lake:
+
+| Date | Session (IST) | Bars |
+|---|---|---|
+| 2020-11-14 (Sat) | 18:15 – 19:15 | 60 |
+| 2021-11-04 (Thu) | 18:15 – 19:15 | 60 |
+| 2022-10-24 (Mon) | 18:15 – 19:15 | 60 |
+| 2023-11-12 (Sun) | 18:00 – 19:00 | **46** — a 14-bar deficit; the open is UNVERIFIED, first bar is 18:07 |
+| 2024-11-01 (Fri) | 18:00 – 19:00 | 60 |
+| 2025-10-21 (Tue) | 13:45 – 14:45 | 60 — an afternoon session, not an evening one |
+
+2026 has an announced Muhurat date (2026-11-08) with **no notified timings**.
+It is therefore absent rather than guessed.
 
 ---
 

@@ -226,6 +226,49 @@ process start, which is not on any hot path measured by gate 8.
 
 ---
 
+## D-0014 · 2026-08-01 · The calendar is transcribed data carrying an evidence lane per date
+
+**Decision.** `crates/core` holds the NSE/BSE calendar as Rust literals with
+**zero dependencies and no runtime fetch**. Every date carries the lane it was
+verified at — `Verified`, `Secondary`, or `Unverified` — and the lane is a
+value in the type, not a comment. A sweep window that crosses an `Unverified`
+date reports the fact rather than absorbing it.
+
+This supersedes the `docs/00-charter.md` §3 row that listed the special
+weekend sessions as 2021-01-30 and 2021-02-01. Both are wrong. 2021-01-30 has
+zero bars in the lake and appears in no predecessor source; 2021-02-01 was an
+ordinary Monday with a full 375-bar session, so it is a normal trading day and
+not a special one. The correct and complete set is **2020-02-01, 2025-02-01,
+2026-02-01** — the only three years since 2020 in which 1 February fell on a
+weekend. All three show exactly 375 bars.
+
+**Rejected — fetching the calendar from the exchange at runtime.** It makes
+`core` depend on the network, which would break its zero-dependency rule and
+make a sweep non-reproducible: the same run on two days could load two
+calendars and produce two different `data_digest` values from identical bars.
+The predecessor already proved the fetch unreliable — nineteen consecutive
+attempts to read the 2026 circular returned HTTP 403.
+
+**Rejected — inheriting the predecessor's holiday sets as verified.** They are
+demonstrably incomplete. Four dates have zero bars across all three engine
+instruments and appear in no holiday set, and a fifth is mis-dated by one day.
+Copying them over with the `verified` label would promote an evidence lane
+during a copy, which `docs/00-charter.md` §4 forbids in as many words.
+
+**Rejected — silently adding the four disputed dates as holidays.** The lake
+is strong evidence and it is not a circular. Golden Rule 1 says an unverified
+fact is written `UNVERIFIED` and stopped at, not quietly promoted because it
+looks right. They are carried in `docs/06-limits.md` §9 with their evidence.
+
+**Why a lane per date rather than one lane for the file.** The 2020–2025
+dates are individually checkable against bars; the whole of 2026 is
+secondary-sourced and one of its dates is already disputed by data. A single
+file-level lane would have to take the worst case and would mark 2024 as
+unreliable as 2026, which is false and would make the field useless. The lane
+is the finest granularity that is honest.
+
+---
+
 ## How to add an entry
 
 Next free ID, today's date, the decision in one sentence, the alternative
