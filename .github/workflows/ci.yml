@@ -318,10 +318,25 @@ jobs:
     if: always()
     steps:
       - name: Verify every gate went green
+        # The results cross into the shell through env rather than being
+        # interpolated into the script body — the same rule the auto-merge
+        # workflow follows, applied here for consistency even though `needs`
+        # results are not attacker-controlled.
+        #
+        # Note the SINGLE quotes inside the expression. A GitHub Actions
+        # expression accepts only single-quoted strings; `join(x, " ")` is a
+        # parse error that invalidates the ENTIRE workflow file, which is how
+        # this repository's first CI run produced zero jobs and no log.
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
         run: |
-          r='${{ join(needs.*.result, " ") }}'
-          echo "results: $r"
-          for x in $r; do
+          set -euo pipefail
+          echo "results: ${RESULTS}"
+          if [ -z "${RESULTS}" ]; then
+            echo "no gate reported a result at all — refusing to call that green"
+            exit 1
+          fi
+          for x in ${RESULTS}; do
             [ "$x" = "success" ] || { echo "a gate did not pass: $x"; exit 1; }
           done
           echo "all gates green"
