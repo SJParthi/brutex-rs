@@ -14,6 +14,16 @@ version = 2
 allow = ["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.0", "Zlib"]
 confidence-threshold = 0.93
 
+# An entry in `allow` that no dependency uses is a tidiness observation, not a
+# policy violation — and while crates/core is the only member, NOTHING uses any
+# of them, so the default made gate 3 red on a workspace with zero
+# dependencies. This does not weaken the policy: a license outside the list
+# above is still refused, which is the check that matters. Trimming the list to
+# whatever happens to be in use today would be worse — it would have to be
+# edited every time a dependency lands, which is how an allowlist quietly
+# becomes a rubber stamp.
+unused-allowed-license = "allow"
+
 [bans]
 multiple-versions = "warn"
 wildcards         = "deny"
