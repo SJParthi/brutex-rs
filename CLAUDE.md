@@ -11,8 +11,12 @@ A brute-force backtesting engine for Indian spot indices. It sweeps
 combinations of boolean market conditions over historical 1-minute bars and
 ranks what survives.
 
-**Engine surface — exactly three instruments:**
-`NSE-NIFTY`, `NSE-BANKNIFTY`, `BSE-SENSEX`.
+**Engine surface — exactly two instruments, NSE only:**
+`NSE-NIFTY`, `NSE-BANKNIFTY`.
+
+BSE and MCX are not swept and not pulled. Narrowed from three
+instruments by D-0017. Existing BSE data already on disk is not deleted --
+append-only history applies to the store as well.
 
 `NSE-INDIAVIX` is **reference only**: it is stored and it is stamped onto
 observable trades, but it never enters the condition vocabulary, never enters
@@ -47,8 +51,8 @@ CI gate 1 enforces this by walking every tracked file. It is not advisory.
 1. **No invention.** Every claim about a vendor, an exchange, an instrument or
    a cost is traceable to a source recorded in `docs/00-charter.md`. If you are
    unsure, write `UNVERIFIED` and stop.
-2. **No silent scope change.** The engine surface in §1 does not widen without
-   a new entry in `docs/05-decisions.md`.
+2. **No silent scope change.** The engine surface in §1 does not widen OR
+   narrow without a new entry in `docs/05-decisions.md`.
 3. **Reproducibility.** Every run is identified by
    `blake3(mask ‖ direction ‖ instrument ‖ timeframe ‖ params ‖ data_digest ‖
    vocab_version ‖ commit)`. No computation without that identity recorded.
