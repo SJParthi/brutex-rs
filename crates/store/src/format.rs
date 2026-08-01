@@ -10,7 +10,7 @@
 //! No search, no decode, no allocation — which is the entire reason the format
 //! exists and the only thing that makes bar lookup O(1).
 
-use core::price::Paisa;
+use brutex_core::price::Paisa;
 
 /// Bytes of header before the first record.
 pub const HEADER_LEN: u64 = 64;

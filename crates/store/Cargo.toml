@@ -8,7 +8,13 @@ publish      = { workspace = true }
 description  = "The fixed-stride bar file: bytes on disk, addressed by arithmetic."
 
 [dependencies]
-core = { path = "../core", package = "core", version = "0.1.0" }
+# The lib target is `brutex_core`, and it MUST be referred to by that name.
+# Depending on it under the key `core` shadows the sysroot crate inside
+# rustdoc's generated doc-test harness, which itself references
+# `core::result` and `core::fmt` -- so every doc-test in this crate fails to
+# compile with "cannot find `result` in `core`". Proven twice now: once in
+# crates/core itself, once here.
+brutex_core = { path = "../core", package = "core", version = "0.1.0" }
 
 [lints]
 workspace = true
