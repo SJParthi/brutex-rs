@@ -1046,3 +1046,53 @@ records why it was narrow.
 Next free ID, today's date, the decision in one sentence, the alternative
 rejected, and the reason. If you cannot name what was rejected, the decision
 is not yet made — it is a default, and defaults do not belong in this file.
+
+---
+
+## D-0031 · 2026-08-01 · The on-disk format is version 2, and version 1 is refused rather than read
+
+**Decision — the store format is `BRUTEXB2`, `FORMAT_VERSION = 2`.
+`Layout::KNOWN` contains version 2 alone, so a version 1 file is refused by
+name. Version 1's geometry is left exactly as D-0002 and D-0005 describe it and
+is not redefined.**
+
+The hardening in this change altered the on-disk geometry in three ways:
+
+| | v1 (D-0002, D-0005) | v2 |
+|---|---|---|
+| Header | 64 bytes, one copy | 32,768 = 2 slots × 16,384 stride |
+| Block | 4,096 bytes | **4,088 = 56 × 73** |
+| Commit | 3 fields rewritten in place | double-buffered slot, highest valid generation wins |
+
+The block size is the load-bearing one. 4,096 is not a multiple of 56, so
+4096/56 = 73.14 and a record could span two blocks — 23 of the first 2,000 did.
+A record that straddles cannot be verified against one checksum, and verifying
+it against only the block it starts in checks part of its bytes and calls that
+a pass. 56 × 73 = 4,088 makes straddling **unrepresentable** rather than
+handled, which is why the geometry moved rather than the verifier gaining a
+second block lookup.
+
+**The first attempt mutated version 1 in place** — it changed `HEADER_LEN` and
+`BLOCK_LEN`, moved every field offset and inserted `generation`, while leaving
+`MAGIC = b"BRUTEXB1"` and `FORMAT_VERSION = 1`. That is exactly what §3 rule 8
+and §4 forbid, and it defeated the version dispatch built in the same change:
+the one geometry change that had actually happened was invisible to it, because
+both geometries answered version 1. An old file was then detected only by
+accident — the checksum had moved, so the header failed to decode and the
+operator was told "the header is unreadable", a loud refusal naming the wrong
+reason. Had the checksum domains happened to agree, the file would have been
+read at a 64-byte offset shift and returned plausible integers.
+
+**Version 1 is not in `KNOWN`.** No v1 file exists anywhere: the version shipped
+in PR #10 as format and offset arithmetic with no writer, so nothing has ever
+been written in it. A v1 file therefore cannot be encountered, and supporting a
+geometry no file uses would be untestable code guarding an impossible case.
+Should one ever appear it is refused with its version number named — never
+guessed at, never read at the current stride.
+
+**Cost of getting this wrong later.** One line today: a new magic, a new version
+constant, a second row in `KNOWN`. Once bars are on disk it is a migration of
+every file, and the failure mode in the meantime is silently plausible numbers.
+
+Supersedes the geometry halves of D-0002 (64-byte header) and D-0005 (4 KiB
+block) for version 2 onward. Both remain the correct description of version 1.
