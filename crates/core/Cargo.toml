@@ -1,0 +1,25 @@
+[package]
+name         = "core"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+publish      = { workspace = true }
+description  = "Types, errors, the frozen condition table, and the trading calendar. Depends on nothing."
+
+# ---------------------------------------------------------------------------
+# THIS SECTION IS DELIBERATELY EMPTY AND STAYS EMPTY.
+#
+# docs/01-architecture.md: core "May depend on: nothing". Every rule that both
+# the server and the browser must agree on lives here and is compiled twice --
+# once native, once to wasm32 -- so the two cannot drift. A dependency added
+# here is a dependency forced on crates/web, which compiles to WebAssembly
+# where the filesystem does not exist.
+#
+# Adding a line below requires an entry in docs/05-decisions.md naming what it
+# replaces, and it will make CI gate 7 fail for crates/web.
+# ---------------------------------------------------------------------------
+[dependencies]
+
+[lints]
+workspace = true

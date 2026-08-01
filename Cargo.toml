@@ -9,7 +9,7 @@ resolver = "3"
 # The intended final graph is in docs/01-architecture.md §1, in the order the
 # crates are built:
 #   core → store → vocab → indicators → engine → pull → api → web → cli
-members = []
+members = ["crates/core"]
 
 [workspace.package]
 version      = "0.1.0"
@@ -27,7 +27,7 @@ publish      = false
 unsafe_code            = "deny"
 missing_docs           = "warn"
 unreachable_pub        = "warn"
-rust_2024_compatibility = "warn"
+rust_2024_compatibility = { level = "warn", priority = -1 }
 
 [workspace.lints.clippy]
 all                 = { level = "deny", priority = -1 }
