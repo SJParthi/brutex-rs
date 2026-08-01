@@ -1119,12 +1119,25 @@ block:
 | **slice-by-8 — this decision** | **1,487.5** | **0.364** | **20.4** |
 | slice-by-16 | 1,632.7 | 0.399 | 22.4 |
 
-`block::seal`, which is what a verifier actually calls, went from 24,083 ns to
-1,656 ns — 14.5×. Most of the remainder was **not** the checksum: `byte_count`
-folded one `saturating_add` per byte to compute a length `bytes.len()` gives in
-O(1), so every seal walked the block twice. It cost 0.65 ns/byte measured in
-isolation, and it is retired in the same change. A CRC fix alone would have
-reached about 7×, not 14×.
+`block::seal`, which is what a verifier actually calls, was measured before and
+after through the same harness — `crates/store/benches/ratio.rs`, run against a
+worktree pinned at the pre-fix commit and against this one, three runs each,
+minimum taken:
+
+| | before (min of 3) | after (min of 3) | factor |
+|---|---|---|---|
+| `crc32c`, one block | 13,512.1 ns | 1,491.3 ns | 9.06× |
+| `block::seal`, one block | 15,291.0 ns | 1,485.0 ns | **10.30×** |
+| `Header::read_region`, 1× region | 194.6 ns | 17.1 ns | 11.39× |
+
+The gap between the two rows is the second scan. `byte_count` folded one
+`saturating_add` per byte to compute a length `bytes.len()` gives in O(1), so
+every seal walked the block twice: seal minus checksum was 1,779 ns before and
+is inside the noise band after. It is retired in the same change, because a CRC
+fix alone would have left it costing more than the checksum beside it.
+
+`read_region` was never touched; it got 11× faster because decoding a header
+slot is a 60-byte checksum, and it decodes several.
 
 **Why the signature had to move.** `crc32c` took `IntoIterator<Item = u8>`,
 justified by the header slot needing to skip the four bytes holding its own
@@ -1207,6 +1220,19 @@ every length and only the scanned-but-unused `trading_symbol` grows:
 | 16 KiB | 997.8 ns | `Ok(Keep(RELIANCE))` |
 | 4 MiB | 245,839.2 ns | `Ok(Keep(RELIANCE))` |
 
+Re-measured through `crates/core/benches/ratio.rs`, run three times against a
+worktree pinned at the pre-fix commit and three times against this one, minimum
+taken:
+
+| `trading_symbol` | before | after | |
+|---|---|---|---|
+| 28 B — the widest real value | 46.9 ns, kept | 51.1 ns, kept | **9% slower**, and that is the price |
+| 6.4 KB — 100× the bound | 356.6 ns, kept | 7.6 ns, refused | 46.9× |
+| 4 MiB | 229,517.3 ns, **kept** | 7.7 ns, **refused** | 29,858× |
+
+The first row is the honest cost of the fix: ten `str::len` reads on every row,
+about 4 ns. It buys the other two.
+
 Linear over four orders of magnitude — and **worse than the cost**: the 4 MiB
 row was accepted and stored. `Symbol::new` only ever saw whichever field became
 the identity, and `trading_symbol` becomes the identity only when `underlying`
@@ -1265,6 +1291,13 @@ that this made C-01..C-04 unenforceable "in perpetuity"; this is the repair.
 
 **A skip that reports success is the fallback §4 bans.** An empty bench set now
 fails and says what to do about it.
+
+**The gate was checked against the tree it failed to catch.** Both harnesses
+were run, unchanged except for the pre-fix API spelling, against a worktree
+pinned at the commit before this change. They **fail** there: C-08 reports the
+checksum at 0.995× the bit loop (because it *was* the bit loop), C-09 reports
+4,898× at a 4 MiB field, and C-10 reports `refused=false`. A gate that has never
+been observed failing is a gate nobody has tested.
 
 **Why no benchmarking framework.** A harness would add a dependency tree to take
 a handful of `Instant` readings. `harness = false` makes each bench an ordinary

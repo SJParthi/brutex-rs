@@ -389,22 +389,27 @@ D-0032 made it 9.4× faster over one block. It did not make it constant, and
 nothing can: a CRC has to read every byte it protects.
 
 What is claimed, and what the numbers are — Apple M4 Pro, `rustc` 1.97.1,
-release profile, minimum of 201 trials × 200 reps, `black_box` on both sides:
+release profile, `black_box` on both sides. The first row is the standalone
+harness (min of 201 trials × 200 reps); the rest are
+`crates/store/benches/ratio.rs` run three times against a worktree pinned at the
+pre-fix commit and three times against this one, minimum taken:
 
-| | before D-0032 | after |
-|---|---|---|
-| one 4,088-byte block | 13,952.5 ns (3.413 ns/B) | 1,487.5 ns (0.364 ns/B) |
-| `block::seal` of the same block | 24,083.0 ns | 1,656.0 ns |
-| amortised per record, 73 per block | 191.1 ns | 20.4 ns |
+| | before D-0032 | after | factor |
+|---|---|---|---|
+| one 4,088-byte block, standalone harness | 13,952.5 ns (3.413 ns/B) | 1,487.5 ns (0.364 ns/B) | 9.38× |
+| `crc32c`, one block, gate 8 harness | 13,512.1 ns | 1,491.3 ns | 9.06× |
+| `block::seal` of the same block | 15,291.0 ns | 1,485.0 ns | 10.30× |
+| `Header::read_region`, 1× region | 194.6 ns | 17.1 ns | 11.39× |
+| amortised per record, 73 per block | 209.5 ns | 20.3 ns | 10.30× |
 
 **Per *operation* — one block — the cost is constant**, because a block is a
 fixed 4,088 bytes. That is the claim `docs/02-store-format.md` §6 makes and it
 is the one enforced, by C-07. Per *byte* it is linear and stays linear.
 
 **The whole lake, once, is an EXTRAPOLATION.** 1,706,290 bars ÷ 73 records per
-block × 1,487.5 ns = 0.035 s. That is arithmetic on a per-block measurement, not
-an end-to-end run; no such run has been made, because no bar reader exists.
-Labelled as required by §3 rule 6.
+block × 1,485.0 ns = 0.035 s, against 0.357 s before. That is arithmetic on a
+per-block measurement, not an end-to-end run; no such run has been made, because
+no bar reader exists. Labelled as required by §3 rule 6.
 
 **A hardware kernel would be faster and is not used.** An earlier probe measured
 the ARMv8 CRC32C instruction at 381.9 ns for the same block — roughly 3.9× this

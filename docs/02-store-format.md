@@ -247,10 +247,10 @@ Verification is O(1) per read: one block CRC, not a file scan. Enforced by
 
 **Read "O(1)" precisely.** The *operation* is constant because a block is a
 fixed 4,088 bytes; the CRC inside it still reads every one of them, and always
-will. Measured on an Apple M4 Pro after D-0032: 1,487.5 ns for the checksum,
-1,656.0 ns for `block::seal` end to end, 20.4 ns amortised over the 73 records a
-block covers. Before D-0032 the same seal cost 24,083.0 ns. `docs/06-limits.md`
-§14 carries the full numbers and states what is not claimed.
+will. Measured on an Apple M4 Pro after D-0032: 1,485.0 ns for `block::seal` end
+to end, 20.3 ns amortised over the 73 records a block covers. Before D-0032 the
+same seal cost 15,291.0 ns. `docs/06-limits.md` §14 carries the full numbers and
+states what is not claimed.
 
 ---
 
