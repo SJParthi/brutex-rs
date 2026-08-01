@@ -16,5 +16,18 @@
 # Criterion output.
 /target/criterion
 
+# cargo-mutants output. Build output, and it writes `.json` — which CI gate 1b
+# confines to `.github/` and `crates/web/`.
+/mutants.out
+/mutants.out.old
+
+# Editor and agent scratch. `.claude/` holds `launch.json` and
+# `settings.local.json`, and `.json` is NOT in CLAUDE.md section 2's allowed
+# extension list at all — CI gate 1b confines `.json` to `.github/` and
+# `crates/web/`, so a single `git add -A` here would turn the build red. The
+# directory is local tooling, not source; it is ignored rather than deleted so
+# the tooling keeps working. See docs/05-decisions.md D-0028.
+/.claude/
+
 # macOS.
 .DS_Store

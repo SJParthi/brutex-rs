@@ -15,11 +15,16 @@ description  = "HTTP surface. Server-rendered HTML; no JavaScript anywhere."
 # A version is required alongside the path: deny.toml sets
 # wildcards = "deny", and a path dependency with no version IS a wildcard.
 # Relaxing the ban was rejected -- it protects registry crates too.
-# `package` is an explicit rename: the PACKAGE is `core` but its lib target
-# is `brutex_core` (a lib named `core` shadows the sysroot crate and breaks
-# rustdoc). This restores `use core::...` here while keeping the dependency
-# KEY as `core`, which is what gates 7 and 9 match on.
-core   = { path = "../core", package = "core", version = "0.1.0" }
+#
+# The dependency KEY is `brutex_core` and the PACKAGE is `core`. Both halves
+# are load-bearing and the earlier comment here claimed the opposite of what
+# the line does, so: the package must stay named `core` because CI gates 7 and
+# 9 match on that name, and the key must NOT be `core` because a crate bound
+# to that name shadows the sysroot crate -- `#[tokio::main]` expands to
+# `core::future::...` and stops compiling, and rustdoc's generated doc-test
+# harness breaks the same way. Hence `crates/core` declares
+# `[lib] name = "brutex_core"` and this line renames the key to match.
+brutex_core = { path = "../core", package = "core", version = "0.1.0" }
 axum   = { workspace = true }
 tokio  = { workspace = true }
 

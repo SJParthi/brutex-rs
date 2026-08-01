@@ -149,6 +149,22 @@ Evidence lane is recorded per row and is never promoted while copying.
 | Security ids | NIFTY = 13 (verified from the SDK's own example). BANKNIFTY 25, SENSEX 51, INDIA VIX 21 — **community sources only, unverified.** | mixed |
 | India VIX candle availability | **UNVERIFIED.** No documentation states it. Treat as a hard gate before relying on it. | unverified |
 
+### 4a. Instrument facts transcribed into source
+
+Golden rule 1: every claim about an instrument names the route that produced
+it. These are the instrument-level facts compiled into this repository as Rust
+data rather than fetched, so the route has to be recorded here.
+
+| Fact | Where it lives | Route | Lane |
+|---|---|---|---|
+| **NIFTY Total Market — 750 constituents** | `core::universe::NIFTY_TOTAL_MARKET` | niftyindices.com states the index holds 750 stocks: "all stocks that are part of Nifty 500 and Nifty Microcap 250". The names were transcribed from the local lake's NSE/CASH directories and matched the primary broker's equity list 750/750 with zero misses. Re-checked against both real masters 2026-08-01: 750/750 resolve as a kept equity in **both** vendors, ISINs agreeing. | derived + cross-checked; **UNVERIFIED against an NSE constituent circular** |
+| **F&O underlyings — 213 names** | `core::universe::FNO_UNDERLYINGS` | Derived from the derivative rows of both vendor masters, excluding `*NSETEST`. The two brokers agree exactly: 213 each, zero on either side only. | derived + cross-checked; **UNVERIFIED against an NSE circular** |
+| **NSE board series — 128 codes** | `core::vendor::EQUITY_BOARD_SERIES`, `SME_BOARD_SERIES`, `NON_EQUITY_SERIES` | The measured union of every distinct `series` on a Groww `NSE/CASH/EQ` row and every distinct `SERIES` on a Dhan `NSE/E/EQUITY` row, 2026-08-01. 6 equity-board, 2 SME, 120 debt and fund. Board verdicts agree on 4,080 of 4,080 shared ISINs. | measured from both masters; **UNVERIFIED against an NSE series circular** |
+
+Both index lists are **snapshots** of rebalanced indices, and none of the three
+has been checked against an exchange publication. `docs/06-limits.md` §11
+carries what that costs. D-0025 and D-0029.
+
 ---
 
 ## 5. Run identity

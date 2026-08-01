@@ -143,7 +143,7 @@ observe mid-flight.** Results accumulate per shard and merge once at the end.
 | Operation | Cost | Mechanism |
 |---|---|---|
 | Locate a slice | O(1) | path join |
-| Read bar *i* | O(1) | `base + 64 + i·56` |
+| Read bar *i* | O(1) | `base + 32768 + i·56` — see `docs/02-store-format.md` §1 |
 | Read condition bits for bar *i* | O(1) | index into a `Vec<u128>` |
 | Test one candidate against one bar | O(1) | `(bits & mask) == mask` |
 | Reject a duplicate candidate | O(1) | filter probe, then a sharded exact confirm |

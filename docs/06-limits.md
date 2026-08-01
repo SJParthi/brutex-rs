@@ -112,6 +112,8 @@ exactly the mistake the read-only-mapping decision was made to avoid.
 |---|---|
 | Extension allowlist | the design is good — only that it is one language |
 | 100% coverage | the tests assert anything useful; that is what mutation testing is for |
+| 100% coverage | **branches** were covered. `cargo llvm-cov` reports `Branches 0 0 -` for every file: zero branches are instrumented, and the coverage job gates on `--fail-under-lines` and `--fail-under-regions` only. `--branch` needs `-Z coverage-options=branch`, which is nightly, and `rust-toolchain.toml` pins stable 1.97.1 — so `cargo llvm-cov --branch` fails with `error: 1 nightly option were parsed`. Branch coverage is **unmeasured and currently unmeasurable here**. `docs/04-invariants.md` X-06 claimed it for a long time with a ✓ beside it; D-0030 narrowed the row to what is enforced. Region coverage is the closest stable substitute and is the number that is actually 100%. |
+| Gate 10 | the invariants file is complete. It walks **rows → tests** and never tests → rows, so a module can ship with genuine invariants, real tests and no rows at all, and the build stays green. `crates/core/src/universe.rs` did exactly that; D-0029 and rows `U-01`…`U-05` are the correction, and the gap in the gate remains. |
 | Gate 8 ratios | absolute speed is acceptable — only that it did not degrade with input size |
 | `cargo deny` | a dependency is trustworthy — only that it is licensed and un-advised |
 | Property tests | the property is the right one |
@@ -218,3 +220,118 @@ UNVERIFIED and settleable from the predecessor's own audit log.
 assembled from broker and news secondary sources after nineteen attempts to
 fetch the official circular returned HTTP 403. No 2026 date is
 primary-verified, and 2026-01-15 above is the first one the data disputes.
+
+---
+
+## 10. ~~The equity gate is not symmetric between the vendors~~ — CLOSED by D-0025
+
+**This section recorded an asymmetry that no longer exists.** It is kept
+rather than deleted, because it also records what closed it.
+
+It said Dhan's `SERIES` column was "**not** read, because reading a second
+column to make the two vendors agree would be a guess about what that column
+means on every other row, and no measurement was taken of it", and that closing
+the asymmetry meant "measuring Dhan's `SERIES` alphabet first and recording the
+result — not adding the column because the numbers would look tidier".
+
+That measurement was taken. Dhan's `SERIES` is the same NSE board series Groww
+carries; no equity-segment row leaves it empty; and on the 4,080 shared ISINs
+the two vendors' board verdicts differ on **0**. The full table is in D-0025.
+The gate now reads it, and the SME decline is symmetric: **558** rows at Groww
+and **559** at Dhan, the same paper by ISIN.
+
+What the asymmetry had cost, before it was closed: 558 SME shares that Dhan
+kept and Groww declined entered the merged universe on one vendor's word, and
+`docs/06-limits.md` recorded only that half — the 54 mutual-fund plans Dhan's
+paper class called `ETF`, and the 30 surveillance and partly-paid equity series
+the Groww arm called debt, were not recorded anywhere.
+
+**Still unmeasured:** whether Groww's 209 suffixed symbols are stable between
+snapshots. The suffix strip is confirmed per run against the other vendor's
+ISIN, so a change would not corrupt anything — it would show up as instruments
+splitting into two rows, visibly, on the page. That the leak is *stable* is
+not claimed.
+
+---
+
+## 11. The instrument universes are snapshots, and lookup is O(log n)
+
+`crates/core/src/universe.rs`. D-0029.
+
+**Not constant time.** Membership is a `binary_search` over a sorted array —
+O(log n), at most ten comparisons on 750 entries. `CLAUDE.md` golden rule 4
+requires constant per-operation cost, and this is a departure from it, written
+down here rather than glossed. It is defensible because membership is asked
+**once per instrument at merge time and never once per bar**, so it is not on
+the path the rule protects; a perfect hash would make it O(1) and is not worth
+the machinery at this size. If a universe lookup ever moves onto the per-bar
+path, this entry is the reason it must be replaced first.
+
+**UNVERIFIED against any exchange source.** Neither list has been checked
+against an NSE constituent circular:
+
+| List | Size | Where it came from | Lane |
+|---|---:|---|---|
+| `NIFTY_TOTAL_MARKET` | 750 | transcribed from the local lake's NSE/CASH directories; matched the primary broker's equity list 750/750 | derived, unverified |
+| `FNO_UNDERLYINGS` | 213 | derived from both vendor masters, which agree exactly (213 each, zero on either side only) | derived, cross-checked, unverified |
+
+Both are **snapshots**, and index membership is rebalanced. A rebalance is not
+detected by anything here; it shows up as a member failing to resolve, which
+the report's census makes visible but does not explain.
+
+Measured against the real masters on 2026-08-01 under D-0025: 750 of 750 Total
+Market members and 208 of 213 F&O underlyings resolve as a kept equity in
+**both** vendors. The remaining five F&O underlyings are indices — see §12.
+
+---
+
+## 12. Index identity is not cross-checked at all
+
+D-0027. An index carries **no ISIN**, so the cross-check D-0024 added cannot
+reach it, and there is no second field to reconcile two vendors' spellings
+with.
+
+Measured: of the 35 merged NSE index keys, **four** are spelled identically by
+both masters — `NIFTY`, `BANKNIFTY`, `FINNIFTY`, `NIFTYIT`. The other 31 are
+named by one vendor only, and at least three pairs are the same index under two
+names:
+
+| Groww | Dhan | Consequence |
+|---|---|---|
+| `NIFTYJR` | `NIFTYNXT50` | held twice, each tagged with one vendor |
+| `NIFTYMIDSELECT` | `MIDCPNIFTY` | held twice; both are F&O underlyings |
+| `MIDCAP50` | `NIFTYMCAP50` | held twice |
+
+**211 of the 213 F&O underlyings are confirmed by both vendors; 2 rest on
+one.** No alias table is invented — see D-0027 for why — so the report names
+every single-vendor universe member on every run under `UNCHECKED IDENTITY`,
+and the census prints "resolved" and "confirmed by both vendors" as two
+separate numbers.
+
+This does **not** degrade the run. It is a permanent structural fact rather
+than a change, and a status that is `DEGRADED` on every run carries no
+information.
+
+**Neither swept instrument is affected.** `NSE-NIFTY` and `NSE-BANKNIFTY` are
+named identically by both vendors and carry two vendor tags.
+
+---
+
+## 13. Two things the reader still does not do
+
+**A declined row's ISIN is parsed leniently.** On a kept equity a bad ISIN is
+an error; on a declined row it yields no evidence and no complaint. The row is
+declined and counted under its reason either way, and the ISIN there is only
+ever used to notice that *another* vendor kept the same paper. The cost is that
+one specific cross-check is unavailable for a declined row whose ISIN does not
+parse — on the real masters that is exactly one row, `IN1520250085`, a state
+development loan both vendors decline anyway.
+
+**CSV fields are split on every comma, with no quote handling.** Measured: the
+Dhan master has 33 fields on all 200,460 rows and the Groww master has 21 on
+all 133,378, and **neither file contains a single `"` character**. So the naive
+split cannot shift a column on this data. The day a vendor quotes a company
+name containing a comma, the row's field count changes — which the shortfall
+check in `api::master::load` catches when the row gets *shorter*, and does not
+catch when it gets longer. A longer row would misread the columns after the
+quoted field. This is not fixed; it is measured, bounded and written down.

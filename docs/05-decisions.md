@@ -603,6 +603,444 @@ produced it.**
 
 ---
 
+## D-0024 · 2026-08-01 · The equity gate is the series column; the ISIN is a cross-check, not a key
+
+**Decision, part one — what counts as an equity is read from the vendor's own
+class column, per vendor, and everything else on the equity segment is
+declined with a named reason.**
+
+`INSTRUMENT = EQUITY` does not mean "a share". It means "trades on the equity
+segment". Measured on the real masters this session:
+
+| Vendor | Column read | Kept | Declined |
+|---|---|---|---|
+| Groww | `series` | `EQ` 2,407 · `BE` 289 | ~100 debt/fund series codes, plus `SM` 401 and `ST` 157 as SME |
+| Dhan | `INSTRUMENT_TYPE` (**trimmed** — the values are space padded) | `ES` 2,974 · `ETF` 388 | `DBT` 4,416 · `DEB` 1,429 · `Other` 141 · `TB` 81 · `GB` 78 · `CB` 72 · `MF` 66 · `InvITU` 21 · `REIT` 6 · `PTC` 1 · `PS` 1 |
+
+Of Dhan's 9,674 NSE equity-segment rows, **6,312 are not equity at all**.
+
+**Why this is a correctness fix and not tidying.** Those rows do not merely
+inflate a count — they **capture the ticker**. Dhan line 167146 is
+`NSE,E,19257,INE121A08PJ0,EQUITY,,CHOLAFIN,…,DEB,D1,…,5.0`, a 7.5% NCD, and it
+appears **before** line 171414, `…,INE121A01024,EQUITY,,CHOLAFIN,…,ES,EQ,…,10.0`,
+the share. Insert-if-absent therefore resolved `CHOLAFIN` to the bond and took
+its tick size, silently and dependent on nothing but file order. `MOTHERSON`
+(`INE775A08105`, an NCD) and `ELECTCAST` (`INE086A13016`, a warrant) went the
+same way. All three are NIFTY Total Market members; two are F&O underlyings.
+After the gate, duplicate tickers in Dhan's equity segment fall from **4 to 0**,
+and all three resolve to the share's own ISIN.
+
+**The gate is applied only to a row that already decoded as cash equity.** An
+index row has no class — Groww leaves `series` empty on all 24 of its NSE index
+rows and writes the *ticker* in the `isin` column; Dhan writes `NA` in both.
+Gating any earlier declines `NIFTY` and `BANKNIFTY`, which is the entire
+engine surface.
+
+**Rejected — one flat table of accepted codes across both vendors.** The two
+alphabets are disjoint, and a flat table invites one vendor's code to be
+silently accepted for the other. Same reasoning as `Vendor::segment_of`.
+
+**Rejected — erroring on an unrecognised class.** Unlike a segment or an
+instrument type, this alphabet is open-ended: NSE mints a new debt series
+whenever it needs one and a hundred already exist. An unknown code is declined
+and **counted under its reason**; what never happens is an unknown code being
+accepted.
+
+**SME is a separate reason, and the vendors are asymmetric about it.** An SME
+listing IS a share, so filing it with the debentures would hide a real choice
+behind a wrong label. It is declined because the equity universe is F&O
+underlyings plus NIFTY Total Market, and neither contains an SME listing.
+Groww marks the board in `series` (`SM`, `ST`); **Dhan's `INSTRUMENT_TYPE` does
+not distinguish it** — an SME share is `ES` there — so Dhan keeps SME rows that
+Groww declines. That asymmetry is recorded in `docs/06-limits.md` §10 rather
+than papered over by reading a second Dhan column on a guess.
+
+---
+
+**Decision, part two — the ISIN sits BESIDE the instrument key and is never a
+field of it.**
+
+`InstrumentKey` derives `Hash` and `Eq` over every field and is used directly
+as a `HashMap` key; that collision **is** the deduplication (D-0015). If the
+ISIN were a field, two vendors disagreeing about one instrument's ISIN would
+produce **two different keys**, the merge map would hold it twice, and the
+disagreement would never be seen by anyone. Adding the field that was supposed
+to make identity more precise would silently split it.
+
+Beside the key, the same disagreement is one loud line naming the key and both
+ISINs — the shape D-0020 already requires of every vendor disagreement.
+Measured: across the 4,080 ISINs the two masters share there are **zero**
+conflicts today, and all 750 NIFTY Total Market members resolve in both vendors
+with agreeing ISINs. The check costs nothing until the day it does not.
+
+**Rejected — keying on the ISIN instead of the symbol.** Indices have no ISIN
+at all, so the two instruments the engine sweeps could not be keyed. Inventing
+a sentinel ISIN for `NIFTY` was rejected for the reason every sentinel is
+rejected here: it is a fabrication that reads like a fact.
+
+**Rejected — the exchange token as the cross-check.** It is not time-stable.
+NSE issues a token per (symbol, series), so an `EQ`→`BE` migration mints a new
+one — `SICALLOG` went 19434 → 19440 between the two snapshots. Exactly the 22
+of 4,080 rows whose series differ also differ in token, while the ISIN held
+fixed across all 4,080.
+
+**The check digit is verified, not assumed.** Exactly one row in either master
+fails it — `IN1520250085`, a state development loan — and the equity gate
+declines it before an ISIN is ever parsed. The parse therefore happens **after**
+the gate, and that order is itself tested.
+
+---
+
+**Decision, part three — Groww's series suffix is stripped only when two
+independent things agree.**
+
+Groww leaks `internal_trading_symbol` into `trading_symbol` on exactly **209**
+of the 4,080 shared ISINs, and the rule is exact with zero residual:
+`groww.trading_symbol == dhan.UNDERLYING_SYMBOL + "-" + series`. It reaches
+tradeable equity and ETFs — `BLUECHIP-BE`, `CBAZAAR-ST`, `HDFCLIQUID-EQ`,
+`LOWVOL-EQ` — so "only debt is suffixed" is **false**.
+
+The strip requires the trailing segment to be the row's **own series** (decided
+in `core`, where the series is) **and** some vendor to have asserted the
+stripped identity under the **same ISIN** (decided in `api`, where both vendors
+are). Where both do not hold, the symbol stands exactly as the vendor wrote it.
+
+**Rejected — stripping a trailing `-XX` wherever it appears.** `BAJAJ-AUTO`
+and `NAM-INDIA` are real tickers. `crates/core/src/symbol.rs` already argues
+that blind normalisation manufactures the collision it exists to prevent, and
+an unmerged row is a visible duplicate while a wrongly merged one is two
+instruments silently becoming one.
+
+---
+
+**Consequence, measured before and after on the real masters:**
+
+| | kept | declined | unreadable |
+|---|---|---|---|
+| groww, before | 4,104 | 129,274 | 0 |
+| groww, after | **2,720** | 130,658 (+558 SME, +826 not equity) | 0 |
+| dhan, before | 9,667 | 190,689 | 104 |
+| dhan, after | **3,377** | 196,979 (+6,290 not equity) | 104 |
+
+Merged: **3,400** instruments, **0** ISIN conflicts. The unreadable counts are
+unchanged, which is the check that requiring an ISIN on a kept equity added no
+new failures.
+
+> **Superseded in part by D-0025.** The column D-0024 chose for Dhan —
+> `INSTRUMENT_TYPE` — was measurably wrong on 57 rows, and the per-vendor
+> alphabet it argued for stopped being two alphabets once both vendors were
+> pointed at the NSE series. The *shape* of D-0024 stands: gate the equity
+> segment, apply it only to a row already decoded as cash equity, keep SME
+> under its own reason, and hold the ISIN beside the key. Only the column and
+> the catch-all changed. Nothing in this entry is edited; D-0025 records what
+> replaced it and why.
+
+---
+
+## D-0025 · 2026-08-01 · The equity gate reads the NSE board series, from both vendors, against a measured table
+
+**Decision — the gate reads one exchange-issued fact, `series` at Groww and
+`SERIES` at Dhan, and every code it does not recognise is its own loud
+outcome.**
+
+D-0024 read Groww's NSE `series` and Dhan's own `INSTRUMENT_TYPE`. An
+adversarial review found both arms wrong at an edge, and both wrongnesses had
+one cause: `INSTRUMENT_TYPE` is minted by a broker, and the code was trusting
+one vendor column per vendor with nothing to check it against.
+
+**What Dhan's paper class got wrong.** Measured by joining the two masters on
+ISIN:
+
+| Dhan `INSTRUMENT_TYPE` | Dhan's own `SERIES` | Rows | What they really are |
+|---|---|---:|---|
+| `ETF` | `MF` | 54 | Franklin `FISTIP*`/`FICRF*`, PGIM `PGIMCSA*`, Bandhan `BPF0*` — open-ended fund plans, not ETFs. Groww carries 29 of the ISINs under `series=MF` and declines them. |
+| `Other` | `EQ` | 2 | `IVZINNIFTY` (Invesco India Nifty ETF) and `NARMADA` (Narmada Agrobase Ltd) — real listings Groww keeps. |
+| `MF` | `EQ` | 1 | `INFRABEES` (Nippon India ETF Infra BeES) — a genuine ETF. |
+
+Every one of those 57 rows is a case where the two columns on the **same Dhan
+row** disagree, and the series is right on all 57. Under D-0024 the 54 fund
+plans entered the equity universe as `Kind::Equity` — the exact category
+`Skip::NotEquityListing`'s own text says it exists to remove.
+
+**What the Groww arm got wrong.** It accepted `EQ` and `BE` only, so 30 genuine
+equity listings were declined and *counted under the reason "not an equity
+listing"*, which was false about them:
+
+| Series | Rows (g/d) | What it is |
+|---|---:|---|
+| `BZ` | 25 / 38 | trade-for-trade under surveillance — `HDIL`, `RAJESHEXPO`, `IL&FSENGG`, `ANSALAPI`, `FEL`, `ARSHIYA` |
+| `IT` | 2 / 2 | trade-for-trade, illiquid |
+| `SZ` | 1 / 2 | trade-for-trade, surveillance (second list) |
+| `E1` | 2 / 3 | partly-paid equity |
+
+Three independent confirmations that these are equity: the NSDL security-type
+digits of the ISIN are `01` on 27 of the 30 and `IN9…` (partly paid) on the
+other 3, against `08` for the `CHOLAFIN` NCD and `13` for the `ELECTCAST`
+warrant the gate still declines; Dhan classes all 30 as `ES`; and they are
+ordinary listed companies.
+
+**The measurement that made one table legitimate.** `docs/06-limits.md` §10
+said the Dhan/Groww asymmetry could only be closed by "measuring Dhan's
+`SERIES` alphabet first and recording the result — not adding the column
+because the numbers would look tidier". That measurement was taken:
+
+| Dhan `INSTRUMENT_TYPE` | The `SERIES` values on those rows |
+|---|---|
+| `ES` (2,974) | `EQ` 2,079 · `BE` 291 · `SM` 414 · `ST` 145 · `BZ` 38 · `E1` 3 · `IT` 2 · `SZ` 2 — **nothing else** |
+| `ETF` (388) | `EQ` 334 · `MF` 54 |
+| every debt class | only debt series (`SG`, `GS`, `N0`…`NZ`, `Y*`, `Z*`, `D1`, `W1`, `TB`, …) |
+
+Dhan's `SERIES` is the same NSE alphabet as Groww's `series`, and no
+equity-segment row in either file leaves it empty. On the 4,080 ISINs the two
+masters share, the two series columns disagree on **22** rows — all snapshot
+skew inside one board, `EQ`↔`BE` or `SM`↔`ST`, e.g. `SICALLOG` — and the
+**board verdict differs on 0**. One exchange fact, carried by both vendors,
+agreeing everywhere.
+
+**Rejected — keeping the per-vendor table.** D-0024 argued a flat table
+"invites one vendor's code to be silently accepted for the other". True of two
+broker alphabets; false of one exchange alphabet carried twice. Two copies of
+one fact are free to drift, and the drift is exactly what produced the 57
+errors above.
+
+**Rejected — reading both columns and refusing where they disagree.** It would
+decline `INFRABEES`, `IVZINNIFTY` and `NARMADA`, which are real, and it would
+emit 57 conflict lines every run for a column already known to be the wrong
+one. A check against a source measured to be wrong is noise, not evidence.
+
+**Rejected — an `INF` issuer prefix as the fund test.** `HDFCLIQUID`
+(`INF179KC1JG3`) is a genuine ETF with an `INF` prefix. The rule would have
+been wrong in both directions.
+
+**Decision — an unrecognised series is `Skip::UnrecognisedListingClass`, not
+`Skip::NotEquityListing`.**
+
+Both arms of D-0024's gate ended in `_ => NotEquity`, so a code the engine had
+never seen was reported in the identical words a routine debenture gets.
+Demonstrated on the real Dhan master by rewriting `EQ` to `EQX`: **2,438 shares
+vanished**, every F&O underlying among them, the report still printed `ok`, and
+the exit code was still 0. That is the failure `Vendor::segment_of` is
+documented as making unrepeatable, reproduced in a different column.
+
+It stays a *decline* and not an error — NSE mints a debt series whenever it
+needs one, and turning a routine bond listing into a failed ingest would be the
+opposite mistake. But it is its own decline: its own reason string, its own
+counter, **the offending code itself** carried to the operator
+(`api::master::Loaded::unrecognised`), and a non-zero exit (D-0026). The
+120-code `NON_EQUITY_SERIES` table is what makes "unrecognised" meaningful; it
+is the measured union of both masters, so a new NSE debt series is a one-line
+append.
+
+**Rejected — erroring on an unknown code**, as `segment_of` and `type_of` do.
+Those alphabets are closed and tiny; this one is open-ended with 120 members
+already. An error per bond row would make the unreadable count meaningless.
+
+**Consequence, measured on the real masters:**
+
+| | kept | declined | unreadable |
+|---|---|---|---|
+| groww, D-0024 | 2,720 | 130,658 | 0 |
+| groww, D-0025 | **2,750** | 130,628 (SME 558 · not equity 796) | 0 |
+| dhan, D-0024 | 3,377 | 196,979 | 104 |
+| dhan, D-0025 | **2,767** | 197,589 (SME 559 · not equity 6,341) | 104 |
+
+Merged **2,787** instruments · **0** ISIN conflicts · **0** eligibility
+conflicts. Dhan falls by 610 (54 fund plans + 559 SME, less the 3 real
+listings its paper class had wrongly declined); Groww rises by 30 (`BZ`, `IT`,
+`SZ`, `E1`). The SME decline is now symmetric — 558 at Groww and 559 at Dhan,
+the same paper by ISIN — which is what §10 recorded as unclosed.
+
+All **750** NIFTY Total Market members and **208** of the 213 F&O underlyings
+resolve as a kept equity in **both** vendors; the other five are indices. See
+D-0027 for the two that only one vendor names.
+
+---
+
+## D-0026 · 2026-08-01 · A disagreement or a missing vendor refuses the universe, and the exit code says so
+
+**Decision — `report` prints `DEGRADED`, `run` exits 3, and `/health` answers
+503 whenever a vendor was never read, two vendors disagreed, or a listing class
+was not recognised.**
+
+The code and this ledger both claimed a conflict was a refusal — `merge.rs`
+said a non-empty conflicts vector "is a refusal to believe the merge, not a
+warning to be scrolled past"; `isin.rs` called it "a single loud refusal …
+which is what D-0020 already requires"; D-0024 called it "the shape D-0020
+already requires of every vendor disagreement". Nothing refused. `report`
+emitted an unconditional `ok`, `run` returned 0 for every completed report, and
+`/health` answered 200 with that body. A monitor checking the exit code, the
+HTTP status or the first line saw green while one of the two masters had never
+been opened.
+
+D-0020 is titled "A vendor disagreement refuses the window and names it" and
+requires naming **and** refusing. The old behaviour named and continued, which
+is the "primary vendor wins, log the difference" shape D-0020 exists to reject.
+Report-and-continue may well be right for a master merge — but then it is a new
+locked choice needing its own honest text, not an assertion of conformity with
+a decision that says the opposite. This is that text.
+
+**What is refused, and what is not.** The disputed instruments stay in the map
+and on the page. Dropping them would hide the disagreement, which is the
+failure `CLAUDE.md` §4 forbids. What is refused is the *universe as a whole*:
+`merge::Merged::verdict` returns `Disputed`, `server::Read::is_clean` is false,
+and no caller can turn that into a success.
+
+**Exit code 3, not 1.** `FAILED` means "I tried and could not". Here the work
+completed and the output is real; it is the answer that must not be trusted.
+Distinct codes let a monitor tell a crashed process from a half-read universe.
+
+**Rejected — refusing to print anything.** The tallies are exactly what an
+operator needs in order to find out *why* the read is degraded. Refusing to
+emit them would trade one silent failure for another.
+
+**Rejected — degrading on the unchecked index identity of D-0027.** It is a
+permanent structural fact, not a change, so every run would be `DEGRADED` and
+the signal would mean nothing. It is named loudly on every run instead.
+
+---
+
+## D-0027 · 2026-08-01 · Index identity is unchecked, and the report says which members rest on one vendor
+
+**Decision — no alias table is invented for the indices the two vendors spell
+differently; the report names every universe member only one vendor asserted.**
+
+An index carries no ISIN, so the cross-check D-0024 added cannot reach it.
+Measured: of 35 merged NSE index keys, **only four are spelled identically by
+both masters** — `NIFTY`, `BANKNIFTY`, `FINNIFTY`, `NIFTYIT`. Two of the
+mismatches are F&O underlyings:
+
+| Groww | Dhan |
+|---|---|
+| `NIFTYJR` | `NIFTYNXT50` |
+| `NIFTYMIDSELECT` | `MIDCPNIFTY` |
+| `MIDCAP50` | `NIFTYMCAP50` |
+
+The merged universe therefore holds each of these **twice**, as two
+single-vendor instruments. 211 of the 213 F&O underlyings are confirmed by both
+vendors; 2 are not.
+
+**Rejected — an alias table mapping `NIFTYJR` to `NIFTYNXT50`.** The evidence
+is suggestive — both vendors' *derivative* rows use the Dhan spelling — but it
+is an inference, and `crates/core/src/symbol.rs` argues at length that blind
+normalisation manufactures the collision it exists to prevent. Merging two
+instruments on a guess is precisely the failure the ISIN cross-check exists to
+catch; doing it where no cross-check is possible would be worse, not better.
+
+**Rejected — leaving it implied.** The previous behaviour reported `0 isin
+conflicts` and said nothing, so a clean-looking report was the only evidence
+either way. The report now prints, on every run, how many members of each
+universe resolved and how many **two vendors confirmed**, followed by an
+`UNCHECKED IDENTITY` line naming each single-vendor member. `docs/06-limits.md`
+§12 records the limit.
+
+Neither swept instrument is affected: `NSE-NIFTY` and `NSE-BANKNIFTY` are named
+identically by both vendors and carry two vendor tags.
+
+---
+
+## D-0028 · 2026-08-01 · `.claude/` is ignored, not tracked
+
+**Decision — `/.claude/` and `/mutants.out*` are added to `.gitignore`.**
+
+`.claude/launch.json` was in the working tree and matched no ignore rule, so
+`git check-ignore` exited 1 and the next `git add -A` would have tracked it.
+`.json` is not in `CLAUDE.md` §2's allowed extension list at all, and CI gate
+1b confines `.json` and `.yml` to `.github/` and `crates/web/` — so the commit
+would have failed the build at gate 1b, naming the file. Its sibling
+`settings.local.json` was safe only by accident, through a rule in the
+operator's personal `~/.config/git/ignore` that no clone of this repository
+carries.
+
+**Rejected — deleting the directory.** It is working local tooling, and the
+rule is about what this repository *tracks*, not about what sits beside it.
+Ignoring states that intent; deleting would invite it back untracked and
+unignored.
+
+`mutants.out/` is `cargo-mutants` build output and writes `.json` for the same
+reason; both are ignored in the same change.
+
+---
+
+## D-0029 · 2026-08-01 · The instrument universes are transcribed Rust data, and the merge consults them
+
+**Decision — `crates/core/src/universe.rs` holds the NIFTY Total Market and
+F&O underlying lists as sorted `[&str]` literals, membership is a bitset looked
+up *from* the key, and `api::merge` stamps every merged instrument with it.**
+
+This module shipped in the D-0024 change with no entry here, no invariant rows,
+no charter source for its 963 transcribed instrument names, a `See
+docs/06-limits.md` pointer to a section that did not exist, and **no caller
+anywhere in the workspace**. `CLAUDE.md` §9 requires a ledger entry for every
+locked choice and an invariants row beside the test that proves it; golden rule
+1 requires every claim about an instrument to be traceable to a source recorded
+in `docs/00-charter.md`. None of that was done, and CI stayed green because
+gate 10 walks invariant-rows→tests and never tests→rows. This entry, the rows
+`U-01`…`U-04` in `docs/04-invariants.md`, §4a of the charter and §11 of the
+limits are the correction.
+
+**Why Rust literals.** `CLAUDE.md` §2 permits no `.csv`, so a constituent list
+cannot be tracked as a data file. The data is fine; the format is not.
+
+**Why membership is not a field of `InstrumentKey`.** The key derives `Hash`
+and `Eq` over every field and *is* the deduplication (D-0015). The same
+contract carrying different memberships would become two keys and dedup would
+break in silence — the identical argument D-0024 makes about the ISIN.
+
+**Why it must have a caller.** `Skip::SmeBoard` declines 1,117 real shares on
+the ground that "neither list contains an SME listing". That claim was a
+sentence in a comment about a module nothing consulted. It is now (a) checked
+by `core::universe::no_measured_sme_ticker_belongs_to_either_universe` against
+14 SME tickers taken verbatim from the masters, and (b) load-bearing: the merge
+stamps `Entry::universe`, the page renders a Universe column, and the report
+prints a census on every run. Measured on the real masters: **0 of the 559
+Dhan SME tickers** are in either list.
+
+**Rejected — a perfect hash.** Lookup is `binary_search`, O(log n) — at most
+ten comparisons on 750 entries. That is a departure from golden rule 4 and it
+is written down rather than glossed (`docs/06-limits.md` §11). Membership is
+asked once per instrument at merge time and never once per bar, so it is not on
+the constant-cost path the rule protects; a perfect hash would buy nothing at
+this size and would add machinery to maintain.
+
+**UNVERIFIED and carried as such:** neither list has been checked against an
+NSE constituent circular. Both are snapshots of a rebalanced index.
+
+---
+
+## D-0030 · 2026-08-01 · Branch coverage is not measured, and X-06 no longer claims it is
+
+**Decision — `docs/04-invariants.md` X-06 is narrowed to the line and region
+coverage the CI job actually enforces, and the branch half is recorded as
+unmeasured in `docs/06-limits.md` §7.**
+
+X-06 read "Line and branch coverage is 100% on every crate", proven by "CI
+coverage job", status ✓. The coverage job passes `--fail-under-lines 100
+--fail-under-regions 100` and nothing else. `cargo llvm-cov` reports
+`Branches 0 0 -` for every file — zero branches instrumented — so the branch
+half was a green tick over a measurement that had never run.
+
+It is not merely unreported, it is **unrunnable as configured**: branch
+coverage needs `-Z coverage-options=branch`, which is nightly-only, and
+`rust-toolchain.toml` pins stable 1.97.1. `cargo llvm-cov --branch` fails
+outright with `error: 1 nightly option were parsed`.
+
+**Rejected — moving to nightly to satisfy the row.** The pin is itself a
+decision, and trading a reproducible toolchain for a coverage column is the
+wrong trade.
+
+**Rejected — leaving the row as it was.** A gate that claims a measurement
+nobody took is the same shape as the defects this change exists to fix, and
+`docs/06-limits.md` §7 is the table that exists to say what a green build does
+not prove.
+
+Region coverage is the closest thing the stable toolchain measures: it counts
+every distinct execution region, which subsumes most of what branch coverage
+would catch on this code. It is enforced at 100% and it is what the row now
+claims. When branch coverage stabilises, the row widens again and this entry
+records why it was narrow.
+
+---
+
 ## How to add an entry
 
 Next free ID, today's date, the decision in one sentence, the alternative
