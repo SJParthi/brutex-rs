@@ -37,6 +37,22 @@ enforces it.
 | `api` | HTTP surface | `core`, `store`, `engine` |
 | `web` | browser UI, compiled to `wasm32-unknown-unknown` | **`core` only** |
 | `cli` | operator entry point | everything |
+| `greeks` | Black-Scholes-Merton in `f64`: the five greeks, implied volatility, the strike ladder | **nothing** |
+
+`greeks` is a **leaf with no arrow into it and none out of it**, which is why
+it is not drawn in the diagram above. It is not part of the sweep. It is shared
+with the `tickvault` repository, which takes it by git URL, so it declares zero
+dependencies for the same reason `core` does — and unlike `core`, its public
+surface mentions no type from this workspace at all, only `f64` and plain enums
+it owns. It is also the one place in this repository where a float is the
+correct type: `CLAUDE.md` §7 keeps statistical values at full precision and
+reserves `i64` paisa for prices, and this crate never sees a paisa. See
+`docs/05-decisions.md` D-0036.
+
+**`CLAUDE.md` §5 does not list it.** That is a real discrepancy and §10 makes
+`CLAUDE.md` the winner, so this row is the document running ahead of session
+law rather than the other way round. `greeks` adds no arrow to §5's graph, so
+it violates nothing in it; bringing §5 into line is an operator decision.
 
 ---
 

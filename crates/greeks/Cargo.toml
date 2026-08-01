@@ -1,0 +1,30 @@
+[package]
+name         = "greeks"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+publish      = { workspace = true }
+description  = "Black-Scholes-Merton greeks and implied volatility for European options. f64 in, f64 out. Depends on nothing."
+
+# ---------------------------------------------------------------------------
+# THIS SECTION IS DELIBERATELY EMPTY AND STAYS EMPTY.
+#
+# Same rule as crates/core, for a different reason. This crate is consumed by
+# the `tickvault` repository as well as this one, by git URL. A dependency
+# added here is a dependency forced on every consumer, and a consumer that
+# wanted a closed-form option price does not want a transitive graph with it.
+#
+# It is also why no type from this workspace appears in the public surface:
+# every argument and every field is `f64` or a plain enum this crate owns.
+# `crates/greeks/tests/standalone.rs` is the structural proof -- it names
+# nothing but `greeks::`, and it would fail to compile if that stopped being
+# true.
+#
+# Adding a line below requires an entry in docs/05-decisions.md naming what it
+# replaces. See D-0036.
+# ---------------------------------------------------------------------------
+[dependencies]
+
+[lints]
+workspace = true

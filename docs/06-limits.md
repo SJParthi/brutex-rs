@@ -443,3 +443,188 @@ field measured 28 bytes across 333,840 rows of real data. If a vendor
 legitimately grows past 64, this refuses real rows — loudly, naming the field
 and the length, which is the intended failure. It is a number to revisit, not a
 law.
+
+---
+
+## 18. `crates/greeks` — what is bounded, what is measured, and what is neither
+
+Added by D-0036.
+
+### The solver is not O(1), and the crate says so in its own documentation
+
+`CLAUDE.md` §3 rule 4 is about per-operation cost. Inverting the
+Black-Scholes price in volatility is a root find. What it has instead is a
+ceiling that is **arithmetic**:
+
+```text
+MAX_ITERATIONS = NEWTON_STEPS + BISECTION_STEPS = 8 + 64 = 72
+```
+
+The bisection performs exactly 64 halvings of `[1e-6, 5]` with no early exit,
+no tolerance test and no stagnation detection. `(5 − 1e-6)/2^64 ≈ 2.7e-19` is
+narrower than one unit in the last place of any volatility in the band, so a
+fixed count is sufficient rather than merely safe — and its cost does not
+depend on any input value, because it does not read the input to decide when
+to stop.
+
+**Measured on an 819-point grid of moneyness × maturity × volatility — by the
+calibration harness, whose rescuer was Brent and whose bisection exited early.
+This is NOT a measurement of the shipped solver.** It is why the shipped shape
+was chosen. The shipped solver uses a fixed 64-halving bisection and is
+measured at a worst total of **72**, which is also its arithmetic ceiling.
+
+| Newton cap | by Newton | rescued | worst total | median |
+|---|---|---|---|---|
+| 0 — bracketed only | 0 | 523 | 55 | 17 |
+| **8 — the cap shipped** | 232 | 291 | **63** | 19 |
+| 500 | 432 | 100 | 444 | 11 |
+
+Newton alone reached **427** iterations with a fixed tolerance and **444** with
+stagnation detection, at `K/S = 1.10, T = 2h`; median 7–8, p90 ≈ 71, p99
+351–394. Worst among points resolvable to fourteen digits: **131**.
+
+**Said plainly because it argues against the shipped shape:** at a cap of 8 the
+Newton pre-pass did not beat the bracketed method alone on that grid — 63
+against 55 worst, 19 against 17 median. It is kept for the common case, which
+converges in three or four steps and never reaches the bisection.
+
+### `exp` and `ln` are NOT measured for constant time
+
+The closed form has no loop and no input-dependent branch other than the one
+choosing a call from a put. That is a statement about the **code**, not about
+the **cost**: whether the platform's `exp`, `ln` and `sqrt` take the same time
+for every argument is not measured here, and this crate carries no bench that
+would measure it. Any claim that one greek evaluation is constant-time is
+therefore an **EXTRAPOLATION** from the shape of the source.
+
+What *is* asserted as a number is the solver's iteration count, which is an
+integer and does not move with a scheduler —
+`greeks::solver::the_iteration_count_never_exceeds_the_arithmetic_bound`.
+
+### `f64` runs out before the model does
+
+Measured floor — the smallest relative radius around the true volatility on
+which the computed price is still strictly ordered on both sides — against the
+textbook `ulp(price)/vega` estimate:
+
+| case | `ulp/vega` estimate | **measured floor** |
+|---|---|---|
+| at the money, 7 days | 1.60e-16 | **1.67e-14** |
+| at the money, 1 day | 2.11e-16 | 3.76e-14 |
+| at the money, 1 hour | 1.29e-16 | 2.73e-13 |
+| 1.25 S, 7 days | 8.32e-19 | 1.84e-13 |
+| 0.75 S, any maturity | 1.3e-1 | **inf — no volatility recoverable** |
+
+The estimate is **optimistic by two orders of magnitude**, because a deep
+out-of-the-money price is a difference of two nearly equal terms and loses
+digits the ulp cannot see. Over an 819-point grid: **223 points resolvable to
+fourteen digits, 321 resolvable but coarser, 275 not resolvable at all.**
+
+**Fourteen significant digits is at the very edge of `f64` Black-Scholes even
+at the money.** A vendor printing seventeen digits of implied volatility is
+printing the shortest round-trip form of an `f64`; it is **not** evidence of
+fourteen correct digits.
+
+`GreeksError::Indeterminate` screens on the `ulp(price)/vega` estimate, so its
+criterion is **necessary and not sufficient**. Passing it does not prove the
+answer is good to `MAX_RELATIVE_UNCERTAINTY`; failing it proves the answer is
+worthless.
+
+### Hart 5666 caps at about eight relative digits
+
+Shipped because it is 145× faster than the reference. Measured: **2.22e-16**
+absolute everywhere, **8.911872737504238e-9** relative at `x = −7.78`. Every
+price this crate produces inherits that. Abramowitz & Stegun 7.1.26 was
+rejected outright — 6.97e-8 absolute and a relative error of **1.01** in the
+tail, which is no relative accuracy at all.
+
+### What the Dhan sample cannot settle
+
+The captured chain pins `T` and does **not** pin `r`. Over the rounding box of
+the six printed fields — 200,000 draws, uniform half-ulp on each, deterministic
+generator:
+
+| quantity | p2.5 | median | p97.5 | width |
+|---|---|---|---|---|
+| `T`, calendar days | 5.0796 | **5.1583** | 5.2376 | 0.158 |
+| `S` | 25654.8 | 25851.2 | 26050.8 | 396 |
+| `r`, call side | 8.9173% | **9.4618%** | 10.0025% | **1.085 pts** |
+| `r`, put side | 9.8966% | **10.4619%** | 11.0326% | 1.136 pts |
+
+and the two sides differ by 1.00 points, which lies outside both intervals. The
+problem is well-conditioned in `T` and ill-conditioned in `r`, structurally:
+`r` enters theta only through `r·K·e^-rT·N(d2)` while `T` enters through
+`S·n(d1)·sigma/(2·sqrt(T))`, which is most of it. One-at-a-time sensitivity to
+the last printed digit says the same thing — a half-ulp on either delta moves
+`T` by 0.046 days and `r` by 0.32 points, while half-ulps on vega and theta
+move `r` by **0.0000**.
+
+A joint four-parameter chi-square over all eight published fields, each with
+its `5e-6` display precision as its sigma, gives **chi²/dof = 7.0e5 at best**
+across all eight configurations tested. **No single `(S, K, T, r)` reproduces
+all eight fields within their printed precision.** Best-fit residual pulls run
+to −1249 on the call delta.
+
+Publishing the spot would not fix it: a 1% error in `S` moves `r` by only about
+0.2 points, measured. What would settle it, in order of leverage:
+
+1. **The premiums.** `C − P = S·e^-qT − K·e^-rT` is model-free and linear in
+   `r`. Measured leverage at this maturity: one rupee of `C − P` is worth
+   **0.27 percentage points** of `r`.
+2. **The capture and expiry timestamps.** 5.158 calendar days ending 15:30 IST
+   lands at 21:06, outside session hours; 3.561 trading days lands inside one.
+   Both are arithmetically available and the sample cannot choose.
+3. **A second strike from the same chain at the same instant.** `T` and `r` are
+   common across strikes, so two strikes over-determine both — and would expose
+   the volatility transposition directly.
+
+### UNVERIFIED
+
+- Whether Dhan's `r` is a market rate or a hardcoded constant near 10%.
+- The day count that generates `T = 0.0141324716` years. The *divisor* 365 is
+  measured at 23.3:1; the day count is not.
+- Whether the vendor prices spot BSM or forward Black-76. Every conclusion
+  above survives either, but the forward reading would shift `T` by about 4%.
+- The NIFTY and BANKNIFTY strike intervals. Nothing in `docs/00-charter.md`
+  states them, so `Moneyness::from_ladder` takes the interval as an argument
+  and assumes nothing.
+
+### Mutation testing: 308 killed, 2 alive, and both are named
+
+`cargo mutants --package greeks`, on the tree that shipped: **308 caught, 2
+missed, 0 timed out, 12 unviable.** The twelve unviable are mutants that
+replace a function body with `Default::default()` for a type that has no
+`Default`; they do not compile and are not survivors.
+
+The first pass missed **eleven**, and every one of them was a real hole:
+
+| what survived | what it exposed |
+|---|---|
+| `>` → `>=` on four separate bounds | no test stood on the inclusive edge of any bound. Each bound was proved to refuse the value past it and never proved to accept the value on it |
+| `*` → `/` inside rho, twice | the central-difference check skipped a greek whose *analytic* value was below the stencil's noise floor — so a defect that made rho small made itself unresolvable and escaped. The gate now uses the larger of the analytic and the numeric value |
+| six arithmetic mutations in the Brenner-Subrahmanyam seed | a seed only changes how long the search takes, never what it returns, so nothing that asserts an answer can see it being wrong. The seed is now a named function with its own test |
+| `+=` → `*=` on the iteration counter | `iterations <= MAX_ITERATIONS` is satisfied by zero. The floor is now asserted as well as the ceiling |
+
+**The two that remain are not holes, and this is the honest reading of them:**
+
+1. `solver.rs` — `uncertainty > MAX_RELATIVE_UNCERTAINTY` against `>=`. The two
+   differ only when the computed uncertainty is *exactly* `1e-3`. That value is
+   a quotient of a price, a vega and a volatility, all derived through a root
+   find; no input can be chosen to produce the exact bit pattern, so no test
+   can distinguish the two.
+2. `solver.rs` — `price(middle) < price` against `<=` inside the bisection. The
+   two differ only when the model price at a midpoint equals the target
+   exactly, and at that point **both** choices keep the root inside the
+   bracket. The final answers can differ by at most the final bracket width,
+   `2.7e-19`, which is below one unit in the last place of any volatility the
+   function returns.
+
+`CLAUDE.md` §9 asks for no surviving mutant on a touched module. Two survive,
+both on a comparison whose boundary is unreachable, and neither corresponds to
+a behaviour a caller could observe. Recording them here is the alternative to
+either deleting the check or claiming a clean sweep that was not taken.
+
+Two more were removed rather than tested, in `normal.rs`: `x > 0.0` appeared
+twice where `x` can never be zero — once past the saturating tail, once where
+`upper` is exactly `0.5` at zero and both arms return the same number. Both are
+now written as a question about the **sign**, which has no boundary at all.

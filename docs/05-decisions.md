@@ -1336,3 +1336,260 @@ fetched fresh, which is the part that is supposed to move.
 tests and `crates/engine` does not exist; their status stays `—`. Gate 8 now
 enforces over what exists rather than over nothing, which is a different claim
 from enforcing over everything. See `docs/06-limits.md` §7c.
+
+---
+
+## D-0036 · 2026-08-02 · Greeks are their own crate, in `f64`, and the crate never sees a paisa
+
+**Numbering.** This entry is D-0036 and not D-0035. D-0035 is claimed by
+`crates/pull` on the unmerged branch `feat/pull`; this work was cut from `main`,
+where the ledger ends at D-0034. Reusing 0035 would put two different decisions
+under one identifier the moment both merge, and this file is append-only in
+identifiers as well as in lines.
+
+**Decision.** A new leaf crate, `crates/greeks`. Black-Scholes-Merton for
+European options: `d1`, `d2`, price, delta, gamma, vega, theta, rho, implied
+volatility, and a strike's position on the ladder in strike steps. It declares
+**zero dependencies**, its public surface mentions **no type from this
+workspace**, and every value crossing its boundary is an `f64`, a `u32`, an
+`i32` or a plain enum it owns.
+
+**Rejected — putting this in `crates/core`.** `core` is compiled to `wasm32`
+through `crates/web` and is the one crate every other crate already depends on.
+Greeks are needed by exactly one consumer here and by the `tickvault`
+repository, which takes this crate by git URL. Folding it into `core` would
+force a transcendental-function surface onto the browser build for no caller,
+and would put the float exception below in the crate that must never have one.
+
+**Rejected — an `f64` price type anywhere in the surface.** `CLAUDE.md` §7 is
+not negotiated here: prices are `i64` paisa. This crate is `f64` **because it
+never sees money**. There is no `i64` in its surface, no conversion from one,
+and no snapping to a tick. The caller converts at its own boundary.
+`greeks::standalone::the_whole_public_surface_is_reachable_with_nothing_else_in_scope`
+is the structural proof: it names nothing but `greeks::`, and it stops
+compiling the day a workspace type appears in a signature.
+
+### The lint exception, and how narrow it is
+
+`clippy::float_arithmetic` is `warn` at the workspace root and CI runs clippy
+with `-D warnings`, so it is denied in practice. **The workspace level is not
+touched.** Four module files carry `#![allow(clippy::float_arithmetic)]` as an
+inner attribute with the reason attached — `normal.rs`, `bsm.rs`, `solver.rs`,
+`moneyness.rs`. `error.rs` does not need it and does not have it, and every
+other crate in the workspace is unaffected.
+
+The justification is `CLAUDE.md` §7's own second sentence: *statistical values
+keep full precision and are never rounded for storage*. A delta is a
+derivative, a gamma is a second derivative, an implied volatility is a solved
+parameter. None of them has a representation on a two-decimal tick grid, and
+rounding one to paisa would destroy it. They are the statistical values §7
+exempts, not the prices §7 constrains.
+
+**One further exception, in one expression.**
+`crates/greeks/src/moneyness.rs` carries
+`#[allow(clippy::cast_possible_truncation)]` on the single `rounded as i32` that
+turns a step count into an ordinal. The two checks that make the cast exact —
+the value is a whole number, and its magnitude is at most `MAX_STEPS` — are the
+two statements immediately above it, and `std` offers no checked `f64 -> i32`.
+Every other cast in the workspace is still denied.
+
+### What the vendors actually publish, measured rather than assumed
+
+One live Dhan option-chain response, one strike, both sides. Four properties
+of it had to be measured before it could anchor anything, and each is a test in
+`crates/greeks/tests/vendor_anchor.rs`:
+
+| | measured |
+|---|---|
+| **vega** | per **one percentage point**. The raw scaling implies an index level of **258.51**; the per-percent scaling implies **25,851.19** |
+| **theta** | per **calendar day, over 365**. The two sides of one strike agree on `r` to **0.9999** points under 365 and **23.2598** under 252 — a factor of **23.3** |
+| **the two IVs** | **transposed** relative to the delta/gamma/vega block. The scale-free identity `vega·gamma·sigma == n(d1)^2` gives **1.21979 / 0.82249** as published and **1.00012 / 1.00315** swapped, against gamma's own printed slack of 0.38% / 0.46% |
+| **the carry** | **zero**. `delta_call − delta_put = 1.00603` is reproduced exactly by `N(d1c) + N(−d1p)` under the two volatilities. Under one volatility it would be `e^-qT` and would imply `q = −46%`, which is not a rate |
+| **rho** | Dhan publishes **none**. Groww publishes all five. Rho is shipped here: it is one `N(d2)` on a quantity already computed |
+
+Getting the day divisor wrong costs `365/252 = 1.448413` — a theta of `−15.15`
+a day becomes `−10.46`, a **44.8%** error on one strike, and nothing in a
+response says which convention produced it.
+
+**The anchor is the two gammas.** Dhan publishes no spot, no strike and no
+maturity, so they are solved out of the sample: the deltas and volatilities
+give `T` in closed form, vega gives the spot, theta gives the rate. Four of the
+eight published numbers are therefore *inputs* to the fit and are not evidence
+for it. **Neither gamma is used anywhere in the fit.** Reproduced:
+
+| | ours | Dhan | deviation |
+|---|---|---|---|
+| gamma call | 0.001319843888 | 0.00132 | **1.561e-7** |
+| gamma put | 0.001086576818 | 0.00109 | **3.423e-6** |
+
+Both inside the vendor's own display precision of `5e-6`. Fitted state:
+`T = 0.0141324716` years (5.15835 calendar days), `S = 25851.1937 / 25781.0114`,
+`K = 25858.2764 / 25791.7192`, `r = 9.4619% / 10.4618%`.
+
+**And the fit does not close, which is recorded rather than smoothed.** The two
+sides give spots 0.2722% apart and rates 0.9999 points apart, both outside the
+rounding box of the printed fields.
+`greeks::vendor_anchor::the_two_sides_disagree_on_the_rate_and_the_disagreement_is_reported_not_hidden`
+pins those residuals so that no later change can quietly claim the sample is
+cleaner than it is. **Nothing in this crate hardcodes a rate.**
+
+### The normal distribution: Hart 5666, and a transposed digit
+
+Three candidates, measured against a reference built from an all-positive-term
+`erf` series below `|x| = 1.5` and a backward continued fraction above it:
+
+| CDF | max abs | max rel | ns/call |
+|---|---|---|---|
+| reference | — | — | 423–497 |
+| **Hart 5666 — shipped** | **2.22e-16** | **8.911872737504238e-9** at `x = −7.78` | **3.3** |
+| A&S 7.1.26 | 6.97e-8 | 1.01 | — |
+
+**Rejected — Abramowitz & Stegun 7.1.26**, which is the approximation everyone
+reaches for. Its published `1.5e-7` bound on `erf` measures as `6.97e-8` on
+`N(x)`: 7.2 absolute digits and **zero** relative digits in the tail. A CDF
+with no relative accuracy in the tail cannot price a far strike at all.
+
+**The differential test earned its cost on the first run.** Hart's `B6` was
+entered as `1.755_667_161_832_64` for `1.755_667_163_182_64` — two digits
+transposed. It left the tail *exactly* right, reproducing the calibrated
+relative error at `x = −7.78` to all sixteen digits, and put **2.4e-13** of
+absolute error in the body around `|x| = 1.73`. No known-value table at
+five decimals would have seen it. A second implementation sharing no line of
+code did. The test-side `sqrt(pi)` is now derived from `std::f64::consts::PI`
+rather than transcribed, for the same reason.
+
+### The solver: bracketed first, Newton as the optimisation
+
+**`MAX_ITERATIONS = NEWTON_STEPS + BISECTION_STEPS = 8 + 64 = 72`, and 72 is
+arithmetic, not observed.** The bisection performs *exactly* 64 halvings of
+`[1e-6, 5]` with no early exit, no tolerance test and no stagnation detection:
+`(5 − 1e-6)/2^64 ≈ 2.7e-19`, narrower than one unit in the last place of any
+volatility in that band. Its cost does not depend on any input value, because
+it does not look at the input to decide when to stop.
+
+**Rejected — Newton as the primary method.** Measured over an 819-point grid:
+Newton alone reached **427** iterations with a fixed tolerance and **444** with
+stagnation detection, at `K/S = 1.10, T = 2h`, against a median of 7–8. Raising
+its cap to 500 buys a median of 11 and a ceiling of 444. `CLAUDE.md` §3 rule 4
+is a worst-case rule, and a method whose worst case is fifty times its median
+cannot carry one.
+
+**Stated because it argues against the shape shipped here:** at a cap of 8 the
+Newton pre-pass did **not** beat the bracketed method alone on that grid — 63
+against 55 worst, 19 against 17 median. It is kept because the common case
+converges in three or four steps and never reaches the bisection, and because
+its cost is capped at 8 whatever happens.
+
+**Rejected — Brent over bisection.** Brent is faster (29 iterations against 55
+on the constructed pathological case) and its worst case is not arithmetic in
+the same one-line way; its three-way branch structure also has arms that a test
+must contrive to reach, which is a coverage argument for a gate that measures
+regions. A fixed halving count is the cheapest thing to be *certain* about.
+
+**Rejected — returning an answer where the price does not determine one.**
+Twenty-one grid points are unrecoverable at any cost; at `K/S = 0.75` Newton
+"converges" to answers wrong by a relative 1.279, 4.942 and 28.9. Returning
+them is exactly the fallback `CLAUDE.md` §4 bans. `GreeksError::Indeterminate`
+refuses when one unit in the last place of the quote would move the answer by
+more than `1e-3` of itself, and carries the volatility, the vega, the
+uncertainty and the bound so the refusal is checkable.
+
+That criterion is **necessary and not sufficient**, and this entry says so
+rather than implying otherwise. `ulp(price)/vega` is optimistic: measured
+against the smallest interval around the true volatility on which the computed
+price is still strictly ordered, it understates the real floor by two orders of
+magnitude at the money — `1.60e-16` estimated against `1.67e-14` measured at
+seven days, `1.29e-16` against `2.73e-13` at one hour. Passing it does not
+prove the answer is good to `1e-3`. Failing it proves the answer is worthless.
+
+### No unreachable failure arm, anywhere
+
+The same reasoning D-0035 applied to `checked_mul` behind a `?`. Three shapes
+were removed from this crate after the coverage gate found them, and the
+reasoning is recorded because all three are easy to write again:
+
+- **A `matches!` on a bare variant pattern** compiles to a discriminant switch
+  whose "no match" arm no run reaches. Replaced by `assert_eq!` against a fully
+  constructed error value, which also checks the numbers the refusal carries.
+- **A catch-all `Err(other) => panic!(..)` arm.** Replaced by counting the
+  refusals that do occur and requiring the count to account for all of them.
+- **An expression that appears only inside a failing assertion's message.**
+  `value + mirrored` in `normal.rs` was a region no passing run executed.
+  Hoisted above the assertion. This is the third route to the trap
+  `docs/07-o1-architecture.md` records, after the `const fn` and the
+  uncontrived collision.
+
+There is deliberately **no `NoConvergence` variant**. Once the price is proved
+to lie strictly between the model prices at the two ends of the band, the
+bisection cannot fail, so a non-convergence arm would be an arm no input
+reaches. Every way the search can fail is named at the point where it can
+actually happen: outside the arbitrage bounds, outside the searched band, or
+indeterminate.
+
+### No bench, and why that is not a gap
+
+Gate 8 counts benches across the workspace and `crates/core` and `crates/store`
+carry them, so the gate still measures. This crate adds none. The closed form
+has no loop and no input-dependent branch other than the one choosing a side,
+and the solver's bound is an **iteration count** — a deterministic integer,
+asserted as a number by
+`greeks::solver::the_iteration_count_never_exceeds_the_arithmetic_bound`, which
+is a stronger statement than a timing ratio and does not move with a scheduler.
+**Whether `exp` and `ln` are constant-time in their arguments is not measured
+here**; see `docs/06-limits.md` §18.
+
+### UNVERIFIED, and not guessed
+
+- **Whether Dhan's `r` is a market rate or a vendor constant.** Measured at
+  9.46% / 10.46%, midpoint 9.96%; a hardcoded 10.0% is consistent with the
+  sample and so is a rate near 7% under a strike-grid reading. This sample
+  cannot separate them, and nothing here assumes one.
+- **The day count that generates `T = 0.0141324716` years.** The *divisor*
+  `365` is measured at 23.3:1. The day count is not, without the capture
+  timestamp: 5.158 calendar days ending 15:30 IST lands at 21:06, outside
+  session hours, while 3.561 trading days lands inside one.
+- **Whether the vendor prices spot BSM or forward Black-76.** The closed form
+  for `T` eliminates `ln(S/K) + rT` either way, so every conclusion above
+  survives it, but a forward discount would shift `T` by about 4%.
+- **The NIFTY and BANKNIFTY strike intervals.** No source in
+  `docs/00-charter.md` states them. `Moneyness::from_ladder` therefore takes
+  the interval as an argument and hardcodes nothing.
+
+### One discrepancy an operator has to settle
+
+`CLAUDE.md` §5 lists nine crates and `greeks` is not among them. It adds no
+arrow to that graph — it depends on nothing and nothing in this workspace
+depends on it yet — so it breaks no rule in §5. But §10 says that where
+`CLAUDE.md` and a document disagree, `CLAUDE.md` wins and the document is the
+stale copy. Here the document (`docs/01-architecture.md`, updated by this
+change) is ahead of §5. **`CLAUDE.md` was not edited by this change**, and
+bringing §5 into line is an operator decision, not one to take in passing.
+
+### What mutation testing found, and the two it could not
+
+`cargo mutants --package greeks`: **308 caught, 2 missed, 0 timed out, 12
+unviable.** The first pass missed eleven, and every one was a genuine hole —
+four bounds nothing stood on the inclusive edge of, two rho mutations that hid
+behind the central-difference test's own noise floor, six arithmetic mutations
+in the Brenner-Subrahmanyam seed that no assertion about an *answer* can see,
+and an iteration counter whose ceiling was asserted and whose floor was not.
+The repairs are `greeks::bsm::every_bound_accepts_the_value_exactly_on_it`,
+`greeks::solver::the_seed_lands_next_to_the_answer_at_the_money`,
+`greeks::solver::the_iteration_count_is_the_work_actually_done`, and a
+resolvability gate that now takes the larger of the analytic and the numeric
+value rather than trusting the one being tested.
+
+**Two survive and this entry names them rather than claiming a clean sweep:**
+`uncertainty > MAX_RELATIVE_UNCERTAINTY` against `>=`, whose boundary is an
+exact bit pattern of a quotient no input can be chosen to produce; and
+`price(middle) < price` against `<=` in the bisection, where both choices keep
+the root bracketed and the answers can differ by at most `2.7e-19`. Neither is
+a behaviour a caller could observe. `docs/06-limits.md` §18 carries the full
+reading.
+
+Two more were **removed rather than tested**. `normal.rs` compared `x > 0.0` in
+two places where `x` can never be zero — once past the saturating tail, and
+once where `upper` is exactly `0.5` at zero so both arms return the same
+number. Both are now a question about the **sign**, which has no boundary for a
+mutant to sit on. That is the general repair for this class: an unreachable
+boundary is a design smell before it is a coverage problem.
