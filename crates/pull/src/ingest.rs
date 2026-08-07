@@ -276,6 +276,34 @@ pub fn from_members(members: &[Member], store_root: &Path, plan: Plan<'_>) -> In
     // denies, a later run would refetch them, and the append would be refused
     // for bars that are already there.
     let census_path = crate::manifest::manifest_path(store_root, vendor);
+
+    // THE LOCK, AND IT IS TAKEN BEFORE THE READ.
+    //
+    // The census cycle is read-whole-file, mutate in memory, write-whole-file.
+    // Locking only the write serialises the two renames and leaves the two
+    // reads racing: run A reads 20 entries, run B reads the same 20, A installs
+    // 20+A, B installs 20+B on top, and A's entries are gone without either run
+    // ever finding the lock contended. Holding it from here to the install is
+    // what makes the read-modify-write atomic, which is the property the
+    // incident in `CensusLock`'s docs actually needed.
+    //
+    // Declared before `census` so it drops after it — the lock outlives every
+    // use of the thing it protects.
+    let census_lock = match CensusLock::take(&census_path) {
+        Ok(guard) => guard,
+        Err(why) => {
+            // The folder was read, so say how much was in it, exactly as the
+            // unreadable-census arm below does. Reporting zero rows would blame
+            // the vendor for a refusal that is ours.
+            done.rows_read = members.iter().map(|member| member.rows.len()).sum();
+            done.failures.push(Failure {
+                instrument: census_path.display().to_string(),
+                why,
+            });
+            return done;
+        }
+    };
+
     let mut census = match read_census(&census_path, vendor) {
         Ok(census) => census,
         Err(why) => {
@@ -359,7 +387,7 @@ pub fn from_members(members: &[Member], store_root: &Path, plan: Plan<'_>) -> In
 
     // ONE INSTALL, AFTER THE LOOP — and none at all when nothing changed, so
     // a re-run of the same folder leaves the census byte for byte as it was.
-    if publish && let Err(why) = install(&census_path, &census.image()) {
+    if publish && let Err(why) = install_locked(&census_lock, &census_path, &census.image()) {
         done.failures.push(Failure {
             instrument: census_path.display().to_string(),
             why: format!(
@@ -695,70 +723,77 @@ fn read_census(path: &Path, vendor: Vendor) -> Result<Manifest, String> {
 ///
 /// The path and the host's own words, for a directory that cannot be made, a
 /// temporary that cannot be written or flushed, or a rename that is refused.
-fn install(path: &Path, image: &[u8]) -> Result<(), String> {
-    // THE CENSUS LOCK, and the reason it exists is measured rather than
-    // imagined. Two POSTs fired at the same instant — one person, two browser
-    // tabs — over two folders sharing no files at all:
-    //
-    //   both receipts said STORED
-    //   both said "balances: yes — every row accounted for"
-    //   40 bar files landed, all of run A and all of run B
-    //   the census held 20 entries: RUN B ONLY
-    //   6,433 bars, 48.3% of everything written and fsync-ed, invisible
-    //
-    // The install is a read-modify-write of one whole file, so the loser's
-    // whole census is overwritten by a rename that never saw it. Each run's
-    // books were internally perfect and both were wrong about the disk: a
-    // correctness check that only inspects its own run cannot see a concurrent
-    // one.
-    //
-    // `store::file` has taken an advisory `try_lock` on every INDIVIDUAL bar
-    // file since it was written. The census — the one file two runs actually
-    // contend over — was the only one nothing locked. This is that same call,
-    // in the one place it mattered most.
-    //
-    // `try_lock` rather than a blocking lock: a second pull should be told it
-    // is second, loudly, and not wait an unbounded time behind a run that may
-    // be importing eleven thousand contracts.
-    // The directory first: the lock lives beside the census, and on a first
-    // ever run neither exists. `install_locked` creates it too, but that is
-    // after this point and the lock cannot wait for it.
-    // BEST EFFORT, and deliberately not `?`. The lock lives beside the census
-    // and on a first ever run neither exists, so the directory is attempted
-    // here — but a failure to create it is NOT this function's to report.
-    // `install_locked` creates it too and names the fault properly, and a test
-    // that puts a *file* where the directory belongs expects that sentence, not
-    // this one. Swallowing here means the real refusal still reaches the
-    // operator; refusing here would replace it with a worse-worded twin.
-    if let Some(dir) = path.parent() {
-        let _ = fs::create_dir_all(dir);
+/// The census lock, held for the whole read-modify-write.
+///
+/// # Why this is a guard and not a call inside `install`
+///
+/// It *was* a call inside `install`, and that closed half the hole. The census
+/// cycle is: read the whole file, mutate the image in memory, write the whole
+/// file back. Locking only the write serialises the two renames and does
+/// nothing about the two reads that already happened — so run A reads 20
+/// entries, run B reads the same 20, A installs 20+A, B installs 20+B over the
+/// top, and A's entries are gone. Neither run ever sees the lock contended,
+/// because neither holds it while the other is reading.
+///
+/// That is a lost update, and it produces the exact symptom the incident below
+/// records. The fix is not a better lock; it is a lock held across the whole
+/// cycle. This guard is taken before [`read_census`] and dropped after the
+/// install, and [`install_locked`] takes a reference to it so the install
+/// cannot be reached without it.
+///
+/// Dropping the [`File`] is what releases the month, so the field is live for
+/// its whole life and read exactly once, by the compiler-generated drop.
+struct CensusLock {
+    _held: Option<fs::File>,
+}
+
+impl CensusLock {
+    /// Take the lock, or refuse naming the run that holds it.
+    ///
+    /// `Ok(None)` inside the guard means the lock file could not be *opened* at
+    /// all, which happens when the directory is not a directory. That is not
+    /// this function's fault to report: the install fails on the same cause a
+    /// moment later and names it in the words an operator needs, and a test
+    /// that puts a file where the directory belongs expects that sentence
+    /// rather than a worse-worded twin from here.
+    fn take(path: &Path) -> Result<Self, String> {
+        // BEST EFFORT, and deliberately not `?`. The lock lives beside the
+        // census and on a first ever run neither exists, so the directory is
+        // attempted here — but a failure to create it is `install_locked`'s to
+        // report, for the reason above.
+        if let Some(dir) = path.parent() {
+            let _ = fs::create_dir_all(dir);
+        }
+        let lock_path = path.with_extension("man.lock");
+        let Ok(lock) = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+        else {
+            return Ok(Self { _held: None });
+        };
+        if lock.try_lock().is_err() {
+            return Err(format!(
+                "another pull holds the census lock at {}. Refused rather than \
+                 queued: two runs installing at once silently discard one, and \
+                 the loser's receipt still reads 'every row accounted for' \
+                 because its own books balanced. Wait for the other run and try \
+                 again.",
+                lock_path.display()
+            ));
+        }
+        Ok(Self { _held: Some(lock) })
     }
-    let lock_path = path.with_extension("man.lock");
-    let Ok(lock) = fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&lock_path)
-    else {
-        // The lock could not even be opened, which means the directory is not
-        // one. Fall through: the install below fails on the same cause and says
-        // so in the words the operator needs.
-        return install_locked(path, image);
-    };
-    if lock.try_lock().is_err() {
-        return Err(format!(
-            "another pull holds the census lock at {}. Refused rather than \
-             queued: two runs installing at once silently discard one, and the \
-             loser's receipt still reads 'every row accounted for' because its \
-             own books balanced. Wait for the other run and try again.",
-            lock_path.display()
-        ));
-    }
-    install_locked(path, image)
 }
 
 /// The install itself, once the census lock is held.
-fn install_locked(path: &Path, image: &[u8]) -> Result<(), String> {
+///
+/// The guard is taken by reference and never read. That is the point: it makes
+/// "the lock is held" a thing the compiler checks rather than a thing a comment
+/// asserts, so no future caller can reach the publish without having gone
+/// through [`CensusLock::take`] first.
+fn install_locked(_lock: &CensusLock, path: &Path, image: &[u8]) -> Result<(), String> {
     // A rendered census path is `<root>/manifest/<vendor>.man`, so the parent
     // is always there; the fallback is the path itself, which cannot be
     // created as a directory and therefore fails loudly on the next line

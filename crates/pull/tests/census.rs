@@ -792,3 +792,107 @@ fn a_degraded_census_is_named_and_the_run_installs_the_repair() {
     );
     assert_eq!(census.total_rows(), 10 + BARS as u64);
 }
+
+// ===========================================================================
+// The lost update
+// ===========================================================================
+
+/// **A RUN THAT CANNOT PUBLISH ITS COUNT WRITES NO BARS AT ALL.**
+///
+/// # The incident
+///
+/// Two POSTs fired at the same instant over two folders sharing no files: both
+/// receipts said STORED, both said "every row accounted for", forty bar files
+/// landed, and the census held twenty entries — run B only. 6,433 bars, 48.3%
+/// of everything written and `fsync`ed, invisible to the counter.
+///
+/// A lock was added and it covered the wrong half. The census cycle is
+/// read-whole-file, mutate in memory, write-whole-file; locking only the
+/// *install* serialises the two renames and leaves the two reads racing. A
+/// reads 20, B reads the same 20, A installs 20+A, B installs 20+B on top.
+/// Neither ever finds the lock contended, because neither holds it while the
+/// other is reading — so the receipts stay perfect and the entries still go.
+///
+/// # Why this test holds the lock instead of racing two threads
+///
+/// The obvious test — spawn two ingests behind a barrier and assert nothing is
+/// lost — was written first and **thrown away, because it passed against the
+/// broken placement three runs out of three.** Two real ingests do not reliably
+/// interleave: one finishes its install before the other reaches its read, and
+/// then there is no lost update to find. A test that cannot fail against the
+/// defect it names is a test that asserts nothing, which `CLAUDE.md` §4 bans.
+///
+/// So this holds the lock outright — exactly what a concurrent run holds — and
+/// asserts the consequence that separates the two placements with no timing in
+/// it at all:
+///
+/// * **Lock inside `install`** (the old shape): the read needs no lock, so the
+///   run reads the census, writes every bar file, `fsync`s them, and only then
+///   discovers at install time that it cannot publish. Bars on disk, count not
+///   updated — the precise state the incident produced.
+/// * **Lock across the whole cycle** (the fix): the run refuses before it reads
+///   anything, so not one byte of bar data is written.
+///
+/// `bars_stored == 0` and an absent `bars/` tree are therefore true under the
+/// fix and false under the defect, deterministically, on every run.
+#[test]
+fn a_run_that_cannot_take_the_census_lock_writes_no_bars_at_all() {
+    let scratch = Scratch::new("lock-held");
+    let store = scratch.store();
+
+    // Hold the census lock the way a concurrent run holds it.
+    let census_path = manifest_path(&store, VENDOR);
+    fs::create_dir_all(census_path.parent().expect("the census has a parent"))
+        .expect("the manifest directory");
+    let lock_path = census_path.with_extension("man.lock");
+    let held = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .expect("the lock file");
+    held.try_lock().expect("this test is the first holder");
+
+    let archive = scratch.archive(&[("AAAA", BODY), ("BBBB", BODY), ("CCCC", BODY)]);
+    let done = ingest::from_dir(&archive, &store, plan_over(&request(), "INDEX"))
+        .expect("the folder itself is readable — the census is what is contended");
+
+    // It refused, and it said which path is contended.
+    let census_name = census_path.display().to_string();
+    let refusal = done
+        .failures
+        .iter()
+        .find(|failure| failure.instrument == census_name)
+        .unwrap_or_else(|| {
+            panic!(
+                "a run that cannot take the census lock must refuse and name it. \
+                 failures: {:?}",
+                done.failures
+            )
+        });
+    assert!(
+        refusal.why.contains("another pull holds the census lock"),
+        "the refusal must say what is wrong in words an operator can act on: {}",
+        refusal.why
+    );
+
+    // And it refused BEFORE writing. This is the half the old placement failed.
+    assert_eq!(
+        done.bars_stored, 0,
+        "the run could never have published its count, so it must not have \
+         written bars nothing would count. {} bars reached the disk uncounted, \
+         which is the incident this lock exists to prevent.",
+        done.bars_stored
+    );
+    assert!(
+        !store.join("bars").exists(),
+        "a run that refused at the census still created the bars tree at {}",
+        store.join("bars").display()
+    );
+    assert!(
+        done.counted == 0 && done.rows_read > 0,
+        "the folder WAS read — {} rows — and nothing was counted, which is what \
+         an honest refusal looks like",
+        done.rows_read
+    );
+}
