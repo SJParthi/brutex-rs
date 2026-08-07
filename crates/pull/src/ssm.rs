@@ -515,6 +515,208 @@ pub fn host_for(region: &str) -> String {
     format!("ssm.{region}.amazonaws.com")
 }
 
+/// The credential-dependent headers this request puts on the wire.
+///
+/// Returned as data rather than applied in place so a test can hold it beside
+/// [`Signable::signed_headers`] and prove the two agree. They must: AWS rebuilds
+/// the canonical request from what it *receives*, so a name that is signed and
+/// not sent — or sent and not signed — produces `SignatureDoesNotMatch` on a
+/// credential that is perfectly valid.
+///
+/// That is precisely what happened. `signed_headers` added
+/// `x-amz-security-token` whenever a session token was present and the request
+/// set four fixed headers regardless, so every Parameter Store read under a
+/// temporary credential was refused. It survived because this machine holds a
+/// long-lived key pair with no session token, making the arm unreachable, and
+/// every test stopped at `Signable` — the half that was already correct.
+///
+/// The condition below reads `identity.session_token`, the same field
+/// `Signable` carries, so the two cannot drift.
+fn wire_headers(identity: &AwsIdentity) -> Vec<(&'static str, &str)> {
+    match identity.session_token.as_deref() {
+        Some(token) => vec![("x-amz-security-token", token)],
+        None => Vec::new(),
+    }
+}
+
+/// One live `GetParameter` call, signed and sent.
+///
+/// # This is the function that makes it real
+///
+/// Everything above is pure: a signature is arithmetic over its inputs, and
+/// `tests` prove it against AWS's own published vectors without a socket. This
+/// is the one place a packet leaves the process, and it is deliberately small —
+/// build the body, sign it, send it, read the value out.
+///
+/// # What travels, and what does not
+///
+/// The AWS **identity's** signature travels, in the `Authorization` header. The
+/// AWS secret never does — that is the whole point of a signature. And the
+/// **broker token** does not travel at all: it is what comes *back*, and from
+/// here it goes to [`crate::http::HttpSource`] and nowhere else. It is never
+/// logged, never formatted into an error, and never written to disk.
+///
+/// # Errors
+///
+/// [`SsmError`] for a socket that did not answer, a status that is not 200, or
+/// a body this build cannot read. AWS's own error code is mapped to the port's
+/// vocabulary — `AccessDeniedException` and `ParameterNotFound` send an operator
+/// to opposite places and must not be flattened into "it failed".
+pub async fn get_parameter(
+    identity: &AwsIdentity,
+    region: &str,
+    name: &str,
+    stamp: &str,
+) -> Result<String, SsmError> {
+    let host = host_for(region);
+    let body = body(name, true);
+    let signable = Signable {
+        host: &host,
+        region,
+        stamp,
+        body: &body,
+        session_token: identity.session_token.as_deref(),
+    };
+    let authorization = signable.authorization(identity)?;
+
+    let client = reqwest::Client::builder()
+        .timeout(core::time::Duration::from_secs(CREDENTIAL_TIMEOUT_SECS))
+        // REDIRECTS ARE NOT FOLLOWED HERE EITHER, for the reason D-0050 gives
+        // about the broker: a signature is scoped to a host, and a client that
+        // chases a `Location` would carry an `Authorization` header to a host
+        // the signature was never computed for.
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|why| {
+            SsmError::unreachable(format!("the HTTPS client could not be built: {why}"))
+        })?;
+
+    let mut request = client
+        .post(format!("https://{host}/"))
+        .header("content-type", CONTENT_TYPE)
+        .header("x-amz-target", TARGET)
+        .header("x-amz-date", stamp)
+        .header("authorization", authorization);
+
+    // A temporary credential MUST transmit the header its own signature covers.
+    //
+    // `signed_headers` and `canonical_request` both add `x-amz-security-token`
+    // when a session token is present, so the signature is computed over it.
+    // Sending four headers regardless meant AWS rebuilt a canonical request
+    // without that line, derived a different signature, and refused every read
+    // with `SignatureDoesNotMatch` — for a credential that was perfectly valid.
+    //
+    // It has never been seen because this machine's credential is a long-lived
+    // key pair with no session token, so the arm is unreachable here and every
+    // test that exercised it stopped at `Signable`, which is the half that was
+    // already right. It breaks the first time the pull runs under an assumed
+    // role, an SSO profile, or anything on EC2 or ECS.
+    //
+    // The condition is `identity.session_token`, matching `Signable`'s field
+    // exactly, so the two cannot drift into disagreeing about whether the
+    // header exists.
+    for (name, value) in wire_headers(identity) {
+        request = request.header(name, value);
+    }
+
+    let answer = request.body(body).send().await.map_err(|why| {
+        // `why` is reqwest's own words and never carries a header this code
+        // set, so neither secret can reach this string.
+        SsmError::unreachable(format!("{host} was not reached: {why}"))
+    })?;
+
+    let status = answer.status();
+    let text = answer
+        .text()
+        .await
+        .map_err(|why| SsmError::unreachable(format!("the answer could not be read: {why}")))?;
+
+    if !status.is_success() {
+        // AWS names its faults in the body; the port's four variants are what
+        // an operator acts on. Mapped rather than flattened.
+        let kind = if text.contains("AccessDenied") || status.as_u16() == 403 {
+            SecretError::AccessDenied
+        } else if text.contains("ParameterNotFound") || status.as_u16() == 404 {
+            SecretError::NotFound
+        } else {
+            SecretError::Unreachable
+        };
+        return Err(SsmError {
+            detail: format!(
+                "Parameter Store refused with {}: {}",
+                status.as_u16(),
+                text.chars().take(300).collect::<String>()
+            ),
+            kind,
+        });
+    }
+
+    let value = value_of(&text)?;
+    if value.is_empty() {
+        return Err(SsmError {
+            detail: "the parameter exists and holds nothing. An empty \
+                     credential is not a credential, and this build will not \
+                     send one to a broker."
+                .to_owned(),
+            kind: SecretError::Empty,
+        });
+    }
+    Ok(value)
+}
+
+/// The current instant, in the basic ISO-8601 form `SigV4` requires.
+///
+/// Taken from the system clock at the one place a request is about to be sent,
+/// rather than threaded down — a signature is only valid for a few minutes, so
+/// there is nothing to gain by stamping it earlier, and a stamp that is an
+/// argument everywhere would be one more thing to pass wrongly.
+///
+/// # Errors
+///
+/// [`SsmError`] before 1970, which a system clock can report and which cannot
+/// produce a valid scope.
+pub fn now_stamp() -> Result<String, SsmError> {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| {
+            SsmError::unreachable(
+                "this machine's clock reads before 1970, which cannot scope a \
+                 signature. AWS will refuse anything signed with it."
+                    .to_owned(),
+            )
+        })?
+        .as_secs();
+    // Civil date from a day count, by the same closed form `costs::day` uses —
+    // no calendar crate, and no float.
+    let days = i64::try_from(secs / 86_400).unwrap_or(0);
+    let rest = secs % 86_400;
+    let (y, m, d) = civil_from_days(days);
+    Ok(format!(
+        "{y:04}{m:02}{d:02}T{:02}{:02}{:02}Z",
+        rest / 3600,
+        (rest % 3600) / 60,
+        rest % 60
+    ))
+}
+
+/// The civil date of a day count, by Howard Hinnant's `civil_from_days`.
+///
+/// The same algorithm `crates/costs/src/day.rs` carries, written here rather
+/// than depended on: `pull` does not take `costs`, and `docs/01-architecture.md`
+/// gives it `core` and `store` only. Integer arithmetic throughout.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
@@ -806,16 +1008,6 @@ mod tests {
         // literal, so an assertion on it here would assert nothing, and a
         // compile-time check fails the BUILD rather than a test.
     }
-}
-
-#[cfg(test)]
-#[allow(
-    clippy::expect_used,
-    clippy::panic,
-    reason = "a test that cannot panic cannot fail"
-)]
-mod shared_file_tests {
-    use super::*;
 
     /// Writes a credentials file and hands back its path.
     ///
@@ -908,206 +1100,4 @@ mod shared_file_tests {
             "the two secrets are told apart in the refusal itself: {detail}"
         );
     }
-}
-
-/// The credential-dependent headers this request puts on the wire.
-///
-/// Returned as data rather than applied in place so a test can hold it beside
-/// [`Signable::signed_headers`] and prove the two agree. They must: AWS rebuilds
-/// the canonical request from what it *receives*, so a name that is signed and
-/// not sent — or sent and not signed — produces `SignatureDoesNotMatch` on a
-/// credential that is perfectly valid.
-///
-/// That is precisely what happened. `signed_headers` added
-/// `x-amz-security-token` whenever a session token was present and the request
-/// set four fixed headers regardless, so every Parameter Store read under a
-/// temporary credential was refused. It survived because this machine holds a
-/// long-lived key pair with no session token, making the arm unreachable, and
-/// every test stopped at `Signable` — the half that was already correct.
-///
-/// The condition below reads `identity.session_token`, the same field
-/// `Signable` carries, so the two cannot drift.
-fn wire_headers(identity: &AwsIdentity) -> Vec<(&'static str, &str)> {
-    match identity.session_token.as_deref() {
-        Some(token) => vec![("x-amz-security-token", token)],
-        None => Vec::new(),
-    }
-}
-
-/// One live `GetParameter` call, signed and sent.
-///
-/// # This is the function that makes it real
-///
-/// Everything above is pure: a signature is arithmetic over its inputs, and
-/// `tests` prove it against AWS's own published vectors without a socket. This
-/// is the one place a packet leaves the process, and it is deliberately small —
-/// build the body, sign it, send it, read the value out.
-///
-/// # What travels, and what does not
-///
-/// The AWS **identity's** signature travels, in the `Authorization` header. The
-/// AWS secret never does — that is the whole point of a signature. And the
-/// **broker token** does not travel at all: it is what comes *back*, and from
-/// here it goes to [`crate::http::HttpSource`] and nowhere else. It is never
-/// logged, never formatted into an error, and never written to disk.
-///
-/// # Errors
-///
-/// [`SsmError`] for a socket that did not answer, a status that is not 200, or
-/// a body this build cannot read. AWS's own error code is mapped to the port's
-/// vocabulary — `AccessDeniedException` and `ParameterNotFound` send an operator
-/// to opposite places and must not be flattened into "it failed".
-pub async fn get_parameter(
-    identity: &AwsIdentity,
-    region: &str,
-    name: &str,
-    stamp: &str,
-) -> Result<String, SsmError> {
-    let host = host_for(region);
-    let body = body(name, true);
-    let signable = Signable {
-        host: &host,
-        region,
-        stamp,
-        body: &body,
-        session_token: identity.session_token.as_deref(),
-    };
-    let authorization = signable.authorization(identity)?;
-
-    let client = reqwest::Client::builder()
-        .timeout(core::time::Duration::from_secs(CREDENTIAL_TIMEOUT_SECS))
-        // REDIRECTS ARE NOT FOLLOWED HERE EITHER, for the reason D-0050 gives
-        // about the broker: a signature is scoped to a host, and a client that
-        // chases a `Location` would carry an `Authorization` header to a host
-        // the signature was never computed for.
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|why| {
-            SsmError::unreachable(format!("the HTTPS client could not be built: {why}"))
-        })?;
-
-    let mut request = client
-        .post(format!("https://{host}/"))
-        .header("content-type", CONTENT_TYPE)
-        .header("x-amz-target", TARGET)
-        .header("x-amz-date", stamp)
-        .header("authorization", authorization);
-
-    // A temporary credential MUST transmit the header its own signature covers.
-    //
-    // `signed_headers` and `canonical_request` both add `x-amz-security-token`
-    // when a session token is present, so the signature is computed over it.
-    // Sending four headers regardless meant AWS rebuilt a canonical request
-    // without that line, derived a different signature, and refused every read
-    // with `SignatureDoesNotMatch` — for a credential that was perfectly valid.
-    //
-    // It has never been seen because this machine's credential is a long-lived
-    // key pair with no session token, so the arm is unreachable here and every
-    // test that exercised it stopped at `Signable`, which is the half that was
-    // already right. It breaks the first time the pull runs under an assumed
-    // role, an SSO profile, or anything on EC2 or ECS.
-    //
-    // The condition is `identity.session_token`, matching `Signable`'s field
-    // exactly, so the two cannot drift into disagreeing about whether the
-    // header exists.
-    for (name, value) in wire_headers(identity) {
-        request = request.header(name, value);
-    }
-
-    let answer = request.body(body).send().await.map_err(|why| {
-        // `why` is reqwest's own words and never carries a header this code
-        // set, so neither secret can reach this string.
-        SsmError::unreachable(format!("{host} was not reached: {why}"))
-    })?;
-
-    let status = answer.status();
-    let text = answer
-        .text()
-        .await
-        .map_err(|why| SsmError::unreachable(format!("the answer could not be read: {why}")))?;
-
-    if !status.is_success() {
-        // AWS names its faults in the body; the port's four variants are what
-        // an operator acts on. Mapped rather than flattened.
-        let kind = if text.contains("AccessDenied") || status.as_u16() == 403 {
-            SecretError::AccessDenied
-        } else if text.contains("ParameterNotFound") || status.as_u16() == 404 {
-            SecretError::NotFound
-        } else {
-            SecretError::Unreachable
-        };
-        return Err(SsmError {
-            detail: format!(
-                "Parameter Store refused with {}: {}",
-                status.as_u16(),
-                text.chars().take(300).collect::<String>()
-            ),
-            kind,
-        });
-    }
-
-    let value = value_of(&text)?;
-    if value.is_empty() {
-        return Err(SsmError {
-            detail: "the parameter exists and holds nothing. An empty \
-                     credential is not a credential, and this build will not \
-                     send one to a broker."
-                .to_owned(),
-            kind: SecretError::Empty,
-        });
-    }
-    Ok(value)
-}
-
-/// The current instant, in the basic ISO-8601 form `SigV4` requires.
-///
-/// Taken from the system clock at the one place a request is about to be sent,
-/// rather than threaded down — a signature is only valid for a few minutes, so
-/// there is nothing to gain by stamping it earlier, and a stamp that is an
-/// argument everywhere would be one more thing to pass wrongly.
-///
-/// # Errors
-///
-/// [`SsmError`] before 1970, which a system clock can report and which cannot
-/// produce a valid scope.
-pub fn now_stamp() -> Result<String, SsmError> {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| {
-            SsmError::unreachable(
-                "this machine's clock reads before 1970, which cannot scope a \
-                 signature. AWS will refuse anything signed with it."
-                    .to_owned(),
-            )
-        })?
-        .as_secs();
-    // Civil date from a day count, by the same closed form `costs::day` uses —
-    // no calendar crate, and no float.
-    let days = i64::try_from(secs / 86_400).unwrap_or(0);
-    let rest = secs % 86_400;
-    let (y, m, d) = civil_from_days(days);
-    Ok(format!(
-        "{y:04}{m:02}{d:02}T{:02}{:02}{:02}Z",
-        rest / 3600,
-        (rest % 3600) / 60,
-        rest % 60
-    ))
-}
-
-/// The civil date of a day count, by Howard Hinnant's `civil_from_days`.
-///
-/// The same algorithm `crates/costs/src/day.rs` carries, written here rather
-/// than depended on: `pull` does not take `costs`, and `docs/01-architecture.md`
-/// gives it `core` and `store` only. Integer arithmetic throughout.
-fn civil_from_days(days: i64) -> (i64, i64, i64) {
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    (if m <= 2 { y + 1 } else { y }, m, d)
 }
