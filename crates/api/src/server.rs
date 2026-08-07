@@ -783,6 +783,23 @@ pub struct Site {
     /// Every instrument-month some vendor holds, newest first — the rows
     /// `/store` opens on, as opposed to the mostly-empty product of the axis.
     pub entries: Vec<(census::Series, store::path::YearMonth)>,
+    /// Whether this process may reach a live broker.
+    ///
+    /// # Why this is a field and not an `if cfg!(test)`
+    ///
+    /// The moment the broker path was joined, seven tests that pass an empty
+    /// folder started **making real authenticated calls to Dhan** — and one of
+    /// them proved it by failing with `DH-905 securityId is required`, a reply
+    /// from the live API. A test suite that reaches a broker is slow, flaky,
+    /// spends the operator's rate budget, and fails for reasons that are not
+    /// the code's; it would be quarantined within a week.
+    ///
+    /// `cfg!(test)` would not have caught it either: these are integration
+    /// tests of a library, and the flag is false in the binary they drive. So
+    /// it is a value on the site, set to [`Broker::Live`] exactly once — in
+    /// [`Site::load`], which only the served process calls — and left
+    /// [`Broker::Refused`] everywhere else.
+    pub broker: Broker,
     /// How many instruments each spot target covers, in
     /// [`ingest::SpotTarget::ALL`] order.
     ///
@@ -854,6 +871,10 @@ impl Site {
             series,
             entries,
             folders,
+            // REFUSED BY DEFAULT. `Site::load` is the one place that turns it
+            // on, so a test constructing a `Site` any other way cannot reach a
+            // broker by omission.
+            broker: Broker::Refused,
             targets,
             store_root,
             loaded_at: ingest::epoch_secs(std::time::SystemTime::now()),
@@ -868,6 +889,20 @@ impl Site {
             census::read_all(store_root),
             store_root.to_path_buf(),
         )
+    }
+
+    /// The same site, permitted to reach a live broker.
+    ///
+    /// **Called by `run_in` and by nothing else.** [`Site::load`] deliberately
+    /// does not set it: the test helpers call `load` too, and a flag that a
+    /// test can switch on by using the ordinary constructor is not a guard. It
+    /// is opt-in at the one call site that serves HTTP to a human.
+    #[must_use]
+    pub fn serving(masters: &Path, store_root: &Path) -> Self {
+        Self {
+            broker: Broker::Live,
+            ..Self::load(masters, store_root)
+        }
     }
 
     /// The journal every pull against this store root appends to.
@@ -1201,7 +1236,7 @@ fn window_facts(window: pull::session::Window) -> Vec<(&'static str, String)> {
 /// attribute is a courtesy, a parser is a rule"* — and spot had only the
 /// courtesy. An attribute is absent from a `curl`, from a replayed POST, and
 /// from any client that is not the browser the form was rendered for.
-fn spot_answer(
+async fn spot_answer(
     body: &str,
     today: Day,
     now: std::time::SystemTime,
@@ -1250,25 +1285,250 @@ fn spot_answer(
             // loud 503 as before rather than a silent nothing.
             let folder = param(body, "folder");
             if folder.is_empty() {
-                let record = audit::Record::refused(
-                    audit::Scope::Spot,
-                    audit::Outcome::NotStarted,
-                    now,
-                    asked.target.label(),
-                    "no local folder was given and there is no HTTP transport in this build",
-                )
-                .with_window(asked.window);
-                facts.push(recorded_fact(&journal, &record));
-                return (
-                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                    accepted_html("Spot pull", facts),
-                );
+                // THE BROKER PATH. This is the join D-0035 stopped one function
+                // short of and the banner has named ever since: the credential
+                // is read from Parameter Store (D-0051), the descriptor drives
+                // the request, and the bars take the same route to disk a
+                // folder's do — `pull::ingest::from_window`.
+                return broker_answer(asked, now, site, &journal, facts).await;
             }
             facts.push(("Source", format!("local folder · {folder}")));
             facts.push(("Store root", site.store_root.display().to_string()));
             local_answer(&folder, asked.window, now, site, &journal, facts)
         }
     }
+}
+
+/// One broker run: credential, request, bars, receipt.
+///
+/// # The join, finally
+///
+/// Every piece of this has existed and been tested for some time —
+/// `pull::http::HttpSource` is the client, `pull::ssm` reads the credential,
+/// `pull::ingest::from_window` lands the bars — and nothing called them in
+/// order. This does.
+///
+/// # Every failure is named, and none of them writes anything
+///
+/// A pull that cannot get a credential, cannot reach the broker, or gets an
+/// answer it cannot decode must say **which**, because those send an operator
+/// to three different places: their AWS role, their network, and the
+/// descriptor. `CLAUDE.md` §4 — degrade loudly and name the reason. Nothing
+/// below writes a bar until the window has decoded.
+///
+/// The credential is read on every run and never cached. `CLAUDE.md` §8: a
+/// stale token is re-read, and this repository never mints one.
+async fn broker_answer(
+    asked: ingest::SpotRequest,
+    now: std::time::SystemTime,
+    site: &Site,
+    journal: &audit::Journal,
+    mut facts: Vec<(&'static str, String)>,
+) -> (axum::http::StatusCode, String) {
+    let started = std::time::Instant::now();
+    facts.push(("Source", "broker · HTTPS".to_owned()));
+    facts.push(("Store root", site.store_root.display().to_string()));
+
+    // BEFORE ANY SOCKET. See `Broker` for what this is guarding against and
+    // how it was found.
+    if site.broker == Broker::Refused {
+        let record = audit::Record::refused(
+            audit::Scope::Spot,
+            audit::Outcome::NotStarted,
+            now,
+            asked.target.label(),
+            "this process may not reach a live broker",
+        )
+        .with_window(asked.window);
+        facts.push((
+            "Refused because",
+            "this process may not reach a live broker. The served binary sets \
+             Broker::Live; nothing else does, so a test cannot spend the \
+             operator's rate budget by omission."
+                .to_owned(),
+        ));
+        facts.push(recorded_fact(journal, &record));
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            accepted_html("Spot pull", facts),
+        );
+    }
+
+    // A refusal, recorded and rendered, with the reason it carries.
+    let refuse = |facts: Vec<(&'static str, String)>, why: &str, code: axum::http::StatusCode| {
+        let record = audit::Record::refused(
+            audit::Scope::Spot,
+            audit::Outcome::NotStarted,
+            now,
+            asked.target.label(),
+            why,
+        )
+        .with_window(asked.window);
+        let mut facts = facts;
+        facts.push(("Refused because", why.to_owned()));
+        facts.push(recorded_fact(journal, &record));
+        (code, accepted_html("Spot pull", facts))
+    };
+
+    match broker_window(&asked, site).await {
+        Err(why) => refuse(facts, &why, axum::http::StatusCode::BAD_GATEWAY),
+        Ok((raw, instrument, origin)) => {
+            let request = pull::fetch::BarRequest {
+                window: asked.window,
+                cadence: pull::session::Cadence::Minute,
+            };
+            let plan = pull::ingest::Plan {
+                columns: pull::csv::Columns::Gdfl,
+                request: &request,
+                encoding: pull::vendor::TimestampEncoding::EpochSecondsUtc,
+                // `http::decode_body` already converted rupees to paisa, so the
+                // plan must say Paisa — `DECODED_PRICE_SCALE` names this trap.
+                scale: pull::http::DECODED_PRICE_SCALE,
+                timeframe: store::path::Timeframe::MINUTE_1,
+                vendor: brutex_core::vendor::Vendor::Dhan,
+                exchange: brutex_core::instrument::Exchange::Nse.as_str(),
+                segment: brutex_core::instrument::Segment::Index.as_str(),
+            };
+            let done =
+                pull::ingest::from_window(&raw, &instrument, &origin, &site.store_root, plan);
+            let took = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+            facts.push(("Instrument", instrument));
+            landed_answer(&done, asked.window, now, &origin, journal, facts, took)
+        }
+    }
+}
+
+/// The credential, the client and one window — or the reason there is none.
+///
+/// Returns the window, what to file it under, and where it came from.
+async fn broker_window(
+    asked: &ingest::SpotRequest,
+    _site: &Site,
+) -> Result<(pull::fetch::RawWindow, String, String), String> {
+    let Some(home) = std::env::var_os("HOME") else {
+        return Err("HOME is unset, so ~/.brutex/credentials.toml cannot be located".to_owned());
+    };
+    let config_path = pull::config::default_config_path(std::path::Path::new(&home));
+    let config = pull::config::CredentialConfig::load(&config_path).map_err(|why| {
+        format!(
+            "the credential configuration at {} is not usable: {why}",
+            config_path.display()
+        )
+    })?;
+
+    let identity =
+        pull::ssm::AwsIdentity::discover().map_err(|why| format!("no AWS identity: {why}"))?;
+
+    let vendor = brutex_core::vendor::Vendor::Dhan;
+    let path = config
+        .path_for(vendor, "access-token")
+        .map_err(|why| format!("the parameter path could not be built: {why}"))?;
+    let stamp = pull::ssm::now_stamp().map_err(|why| why.detail)?;
+
+    // THE TOKEN NEVER TOUCHES A LOG, A FACT OR AN ERROR. It goes from here into
+    // one header and nowhere else — the whole reason `HttpSource`'s Debug is
+    // hand-written.
+    let token = pull::ssm::get_parameter(&identity, config.region(), &path.to_string(), &stamp)
+        .await
+        .map_err(|why| format!("the broker credential could not be read: {}", why.detail))?;
+
+    // The descriptor is the single source of every vendor difference — URL,
+    // auth header, date format, field names. `CLAUDE.md`: adding a broker is a
+    // row in `crate::vendor`, not an edit here.
+    let pull::vendor::Transport::Http(spec) = pull::vendor::Feed::Dhan.descriptor().transport
+    else {
+        return Err(format!(
+            "{} declares a local-archive transport, not an HTTP one",
+            vendor.as_str()
+        ));
+    };
+    let source = pull::http::HttpSource::new(spec, token).map_err(|why| why.to_string())?;
+    let origin = source.url();
+
+    let request = pull::fetch::BarRequest {
+        window: asked.window,
+        cadence: pull::session::Cadence::Minute,
+    };
+    let raw = source
+        .window_async(&request)
+        .await
+        .map_err(|why| format!("the broker did not answer with a window: {why}"))?;
+    // The two swept series are the engine surface; the first is what a spot
+    // pull asks for until the form carries an instrument of its own.
+    Ok((raw, "NIFTY".to_owned(), origin))
+}
+
+/// The receipt for a run that reached the store, whichever side it came from.
+///
+/// # One implementation, for the reason `ingest::from_members` is one
+///
+/// This was the `Ok` arm of the local-archive path and nothing else could reach
+/// it. The broker path needs every line: the six counters, the balance check,
+/// the first five failures by name, the audit record and the two verdicts. A
+/// second copy would have been a second answer to "what did this run do", and
+/// the two would have drifted the first time either was edited — which is
+/// exactly what happened to the ingest pipeline before `from_members` existed.
+///
+/// `source` is what the run is filed under in the journal: a folder path on one
+/// side, the broker's URL on the other.
+fn landed_answer(
+    done: &pull::ingest::Ingested,
+    window: pull::session::Window,
+    now: std::time::SystemTime,
+    source: &str,
+    journal: &audit::Journal,
+    mut facts: Vec<(&'static str, String)>,
+    took: u64,
+) -> (axum::http::StatusCode, String) {
+    facts.push(("Members read", done.members.to_string()));
+    facts.push(("Rows read", done.rows_read.to_string()));
+    facts.push(("Bars stored", done.bars_stored.to_string()));
+    facts.push(("Rows folded into an open bar", done.rows_folded.to_string()));
+    facts.push(("Slices the census counted", done.counted.to_string()));
+    facts.push(("Rows dropped", done.census.total().to_string()));
+    facts.push(("Members failed", done.failures.len().to_string()));
+    facts.push(("Took", render_elapsed(took)));
+    // EVERY ROW ACCOUNTED FOR, or say so. A row that vanished without landing
+    // in one of the four is indistinguishable from a row the vendor never sent.
+    facts.push((
+        "Balances",
+        if done.balances() {
+            format!(
+                "yes — {} read = {} stored + {} folded + {} dropped",
+                done.rows_read,
+                done.bars_stored,
+                done.rows_folded,
+                done.census.total()
+            )
+        } else {
+            format!(
+                "NO — {} rows read, {} stored, {} folded, {} dropped, {} members failed",
+                done.rows_read,
+                done.bars_stored,
+                done.rows_folded,
+                done.census.total(),
+                done.failures.len()
+            )
+        },
+    ));
+    for f in done.failures.iter().take(5) {
+        facts.push(("Failed", format!("{} — {}", f.instrument, f.why)));
+    }
+    let record = audit::Record::of_run(audit::Scope::Spot, now, took, source, window, done);
+    let verdict = record.outcome.label();
+    facts.push(recorded_fact(journal, &record));
+    let reason = if done.balances() {
+        "The run finished and every row is accounted for. Bars are on disk, \
+         the manifest counts them, and this run is on the record at /audit."
+    } else {
+        "THE RUN FINISHED AND THE BOOKS DO NOT BALANCE. Rows in does not equal \
+         bars out plus rows folded plus rows dropped, or a member failed. \
+         Nothing has been hidden — the figures below are what happened."
+    };
+    (
+        axum::http::StatusCode::OK,
+        stored_html("Spot pull", verdict, reason, &facts),
+    )
 }
 
 /// One local-archive run, from the folder to the receipt.
@@ -1291,61 +1551,7 @@ fn local_answer(
     let took = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
 
     match outcome {
-        Ok(done) => {
-            facts.push(("Members read", done.members.to_string()));
-            facts.push(("Rows read", done.rows_read.to_string()));
-            facts.push(("Bars stored", done.bars_stored.to_string()));
-            facts.push(("Rows folded into an open bar", done.rows_folded.to_string()));
-            facts.push(("Slices the census counted", done.counted.to_string()));
-            facts.push(("Rows dropped", done.census.total().to_string()));
-            facts.push(("Members failed", done.failures.len().to_string()));
-            facts.push(("Took", render_elapsed(took)));
-            // EVERY ROW ACCOUNTED FOR, or say so. A row that vanished without
-            // landing in one of the four is indistinguishable from a row the
-            // vendor never sent.
-            facts.push((
-                "Balances",
-                if done.balances() {
-                    format!(
-                        "yes — {} read = {} stored + {} folded + {} dropped",
-                        done.rows_read,
-                        done.bars_stored,
-                        done.rows_folded,
-                        done.census.total()
-                    )
-                } else {
-                    format!(
-                        "NO — {} rows read, {} stored, {} folded, {} dropped, {} members failed",
-                        done.rows_read,
-                        done.bars_stored,
-                        done.rows_folded,
-                        done.census.total(),
-                        done.failures.len()
-                    )
-                },
-            ));
-            for f in done.failures.iter().take(5) {
-                facts.push(("Failed", format!("{} — {}", f.instrument, f.why)));
-            }
-            let record =
-                audit::Record::of_run(audit::Scope::Spot, now, took, folder, window, &done);
-            let verdict = record.outcome.label();
-            facts.push(recorded_fact(journal, &record));
-            let reason = if done.balances() {
-                "The run finished and every row is accounted for. Bars are on \
-                 disk, the manifest counts them, and this run is on the record \
-                 at /audit."
-            } else {
-                "THE RUN FINISHED AND THE BOOKS DO NOT BALANCE. Rows in does not \
-                 equal bars out plus rows folded plus rows dropped, or a member \
-                 failed. Nothing has been hidden — the figures below are what \
-                 happened."
-            };
-            (
-                axum::http::StatusCode::OK,
-                stored_html("Spot pull", verdict, reason, &facts),
-            )
-        }
+        Ok(done) => landed_answer(&done, window, now, folder, journal, facts, took),
         Err(why) => {
             facts.push(("Refused", why.clone()));
             facts.push(("Took", render_elapsed(took)));
@@ -1467,9 +1673,19 @@ async fn pull_spot(
     // request that straddles midnight cannot be gated against one day and
     // recorded on another.
     let now = std::time::SystemTime::now();
-    let (code, page) = dated(ingest::ist_day(now), "Spot pull", |today| {
-        spot_answer(&body, today, now, &site)
-    });
+    // `dated` takes a synchronous closure, and `spot_answer` is now async
+    // because the broker path awaits a credential and a window. Rather than
+    // make `dated` generic over futures — which would touch every page that
+    // uses it for one caller's benefit — the day is resolved first and the
+    // refusal arm is spelled out here. `dated`'s job was always to turn a bad
+    // clock into a page, and that is what these three lines do.
+    let (code, page) = match ingest::ist_day(now) {
+        Ok(today) => spot_answer(&body, today, now, &site).await,
+        Err(why) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            refusal_html("Spot pull", &why),
+        ),
+    };
     (code, axum::response::Html(page))
 }
 
@@ -1951,6 +2167,20 @@ pub fn bars_html(site: &Site, query: &str) -> (axum::http::StatusCode, String) {
     }
 }
 
+/// Whether a live vendor call may leave this process.
+///
+/// Two states and no default: a bool would read as `false` in a struct literal
+/// that forgot it, and "forgot to say" and "said no" must not be the same value
+/// when the difference is whether a test hits a broker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Broker {
+    /// Reach the vendor. Set only by [`Site::load`], which only the served
+    /// process calls.
+    Live,
+    /// Refuse before a socket is opened, and say so. Every test.
+    Refused,
+}
+
 /// Every route this server answers, serving from an already-loaded site.
 ///
 /// Takes the site rather than a directory: a router holding a `PathBuf` can
@@ -2099,7 +2329,9 @@ async fn run_in(dir: &Path, args: &[String], shutdown: Shutdown) -> u8 {
                 println!("brutex api listening on http://{addr}/instruments");
                 println!("  masters: {}", dir.display());
                 println!("  store:   {}", store_root.display());
-                let site = Site::load(dir, &store_root);
+                // `serving`, not `load`: this is the one process that may
+                // reach a broker. See `Broker`.
+                let site = Site::serving(dir, &store_root);
                 stopped(serve(listener, router(Loaded::new(site)), shutdown).await)
             }
             Err(e) => {
@@ -4035,8 +4267,8 @@ mod tests {
     /// all drop or all fail never reaches the store root at all. A test that
     /// wrote into the operator's real `$HOME/.brutex/store` would be a test
     /// with a side effect nobody asked for.
-    #[test]
-    fn a_local_folder_that_is_not_there_refuses_the_pull_and_names_it() {
+    #[tokio::test]
+    async fn a_local_folder_that_is_not_there_refuses_the_pull_and_names_it() {
         let dir = agreeing("localabsent");
         let site = site("localabsent", &dir);
         let absent = crate::scratch::path("vendor-localabsent-NOT-THERE");
@@ -4047,7 +4279,8 @@ mod tests {
             day(2026, 8, 7),
             moment(),
             &site,
-        );
+        )
+        .await;
         assert_eq!(
             code,
             axum::http::StatusCode::BAD_REQUEST,
@@ -4067,8 +4300,8 @@ mod tests {
 
     /// A folder whose every row falls outside the window stores nothing, says
     /// nothing was stored, and reports that the run **balances**.
-    #[test]
-    fn a_local_pull_that_stores_nothing_still_accounts_for_every_row() {
+    #[tokio::test]
+    async fn a_local_pull_that_stores_nothing_still_accounts_for_every_row() {
         let dir = agreeing("localdropped");
         let site = site("localdropped", &dir);
         // February rows against a January window: both are declined, neither
@@ -4087,7 +4320,8 @@ mod tests {
             day(2026, 8, 7),
             moment(),
             &site,
-        );
+        )
+        .await;
         assert_eq!(code, axum::http::StatusCode::OK, "{html}");
         assert!(html.contains("Members read"), "{html}");
         assert!(
@@ -4119,8 +4353,8 @@ mod tests {
 
     /// A member that fails is named on the receipt, and the run is reported as
     /// **not** balancing rather than as a success with a smaller number.
-    #[test]
-    fn a_local_pull_with_a_failed_member_says_it_does_not_balance_and_names_it() {
+    #[tokio::test]
+    async fn a_local_pull_with_a_failed_member_says_it_does_not_balance_and_names_it() {
         let dir = agreeing("localfailed");
         let site = site("localfailed", &dir);
         // File order is the only order there is, and this file's order
@@ -4140,7 +4374,8 @@ mod tests {
             day(2026, 8, 7),
             moment(),
             &site,
-        );
+        )
+        .await;
         assert_eq!(
             code,
             axum::http::StatusCode::OK,
@@ -4163,8 +4398,8 @@ mod tests {
     /// Without a folder the HTTP path is what is being asked for, and it does
     /// not exist — so the pull is refused loudly rather than silently doing
     /// nothing.
-    #[test]
-    fn a_spot_pull_with_no_folder_is_still_the_loud_unavailable() {
+    #[tokio::test]
+    async fn a_spot_pull_with_no_folder_is_still_the_loud_unavailable() {
         let dir = agreeing("localnofolder");
         let site = site("localnofolder", &dir);
         let (code, html) = spot_answer(
@@ -4172,7 +4407,8 @@ mod tests {
             day(2026, 8, 7),
             moment(),
             &site,
-        );
+        )
+        .await;
         assert_eq!(
             code,
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -4195,8 +4431,8 @@ mod tests {
     /// hunts. The old test asserted the old function's shape faithfully — it
     /// was the *design* that was wrong, so the assertion is now about the
     /// property that matters instead: one root, taken from the site.
-    #[test]
-    fn a_run_writes_under_the_same_store_root_the_page_reports() {
+    #[tokio::test]
+    async fn a_run_writes_under_the_same_store_root_the_page_reports() {
         let dir = agreeing("localroot");
         let site = site("localroot", &dir);
         let folder = vendor_folder(
@@ -4212,7 +4448,8 @@ mod tests {
             day(2026, 8, 7),
             moment(),
             &site,
-        );
+        )
+        .await;
         assert_eq!(code, axum::http::StatusCode::OK, "{html}");
         let root = site.store_root.display().to_string();
         assert!(
@@ -4234,8 +4471,8 @@ mod tests {
     ///
     /// The whole loop in one test: a run happens, a record lands on disk, and
     /// the page renders that record's counters rather than an em dash.
-    #[test]
-    fn a_run_is_recorded_and_the_pull_page_reads_the_record_back() {
+    #[tokio::test]
+    async fn a_run_is_recorded_and_the_pull_page_reads_the_record_back() {
         let dir = agreeing("localaudit");
         let site = site("localaudit", &dir);
         // Before anything: no journal, dashes, and a sentence naming the empty
@@ -4262,7 +4499,8 @@ mod tests {
             day(2026, 8, 7),
             moment(),
             &site,
-        );
+        )
+        .await;
         assert_eq!(code, axum::http::StatusCode::OK, "{receipt}");
         assert!(
             receipt.contains("<th>Recorded</th><td>yes — appended to"),
@@ -4432,8 +4670,8 @@ mod tests {
     /// metadata call on the journal path then fails with `NotADirectory`, which
     /// is neither "absent" nor "held" and is exactly the third state the reader
     /// keeps separate.
-    #[test]
-    fn a_journal_that_cannot_be_read_is_loud_and_a_lost_record_is_named() {
+    #[tokio::test]
+    async fn a_journal_that_cannot_be_read_is_loud_and_a_lost_record_is_named() {
         let dir = agreeing("journalbroken");
         let site = site("journalbroken", &dir);
         std::fs::write(site.store_root.join("audit"), b"not a directory").expect("writes");
@@ -4468,7 +4706,8 @@ mod tests {
             day(2026, 8, 7),
             moment(),
             &site,
-        );
+        )
+        .await;
         assert_eq!(
             code,
             axum::http::StatusCode::OK,
