@@ -1372,7 +1372,13 @@ async fn broker_answer(
 
     match broker_window(&asked, site).await {
         Err(why) => refuse(facts, &why, axum::http::StatusCode::BAD_GATEWAY),
-        Ok((raw, instrument, origin)) => {
+        Ok(BrokerWindow {
+            raw,
+            instrument,
+            origin,
+            spec,
+            store_vendor,
+        }) => {
             let request = pull::fetch::BarRequest {
                 window: asked.window,
                 cadence: pull::session::Cadence::Minute,
@@ -1380,12 +1386,18 @@ async fn broker_answer(
             let plan = pull::ingest::Plan {
                 columns: pull::csv::Columns::Gdfl,
                 request: &request,
-                encoding: pull::vendor::TimestampEncoding::EpochSecondsUtc,
+                // FROM THE DESCRIPTOR, NOT FROM A LITERAL. Dhan stamps epoch
+                // seconds and Groww's row says milliseconds; writing either one
+                // here makes the other vendor unfetchable, which is exactly
+                // what a hardcoded `EpochSecondsUtc` did to Groww.
+                encoding: spec.timestamps,
                 // `http::decode_body` already converted rupees to paisa, so the
                 // plan must say Paisa — `DECODED_PRICE_SCALE` names this trap.
                 scale: pull::http::DECODED_PRICE_SCALE,
                 timeframe: store::path::Timeframe::MINUTE_1,
-                vendor: brutex_core::vendor::Vendor::Dhan,
+                // Resolved through `Feed::store_vendor` in `broker_window`. A
+                // literal here files one broker's prices under another's prefix.
+                vendor: store_vendor,
                 exchange: brutex_core::instrument::Exchange::Nse.as_str(),
                 segment: brutex_core::instrument::Segment::Index.as_str(),
             };
@@ -1401,10 +1413,44 @@ async fn broker_answer(
 /// The credential, the client and one window — or the reason there is none.
 ///
 /// Returns the window, what to file it under, and where it came from.
-async fn broker_window(
-    asked: &ingest::SpotRequest,
-    _site: &Site,
-) -> Result<(pull::fetch::RawWindow, String, String), String> {
+/// A window from a broker, **carrying the descriptor row it came from**.
+///
+/// # Why the spec travels with the bars
+///
+/// This used to return `(RawWindow, String, String)` and drop the `HttpSpec` on
+/// the floor. The caller then had to state the timestamp encoding and the store
+/// vendor for itself, and it did — as two literals, `EpochSecondsUtc` and
+/// `Vendor::Dhan`, sixteen lines after the code above had resolved which vendor
+/// was actually asked for and refused an unknown one by name.
+///
+/// The effect was that `pull::vendor` governed six fields of the request and
+/// none of the answer. Every Groww window arrived stamped in milliseconds, was
+/// read as seconds, landed some six hundred thousand years out, and was refused
+/// at row 0 — so Groww was selectable on the form and could never return a bar.
+/// Correcting only that would then have filed Groww's prices under Dhan's store
+/// prefix, which `Feed::store_vendor`'s own documentation calls destroying
+/// D-0019's per-vendor independence irreversibly. That function existed the
+/// whole time and had no caller anywhere in the workspace.
+///
+/// Returning the spec is what makes the comment forty lines above true — "adding
+/// a broker is a row in `crate::vendor`, not an edit here". A literal at this
+/// seam is an edit here.
+struct BrokerWindow {
+    /// The bars, exactly as the vendor sent them.
+    raw: pull::fetch::RawWindow,
+    /// Which instrument they are.
+    instrument: String,
+    /// The URL they came from, for the receipt.
+    origin: String,
+    /// The row that describes this feed's wire format. Read for its timestamp
+    /// encoding rather than re-stated by the caller.
+    spec: pull::vendor::HttpSpec,
+    /// The store prefix these bars belong under, resolved through
+    /// [`pull::vendor::Feed::store_vendor`] and never assumed.
+    store_vendor: brutex_core::vendor::Vendor,
+}
+
+async fn broker_window(asked: &ingest::SpotRequest, _site: &Site) -> Result<BrokerWindow, String> {
     let Some(home) = std::env::var_os("HOME") else {
         return Err("HOME is unset, so ~/.brutex/credentials.toml cannot be located".to_owned());
     };
@@ -1476,9 +1522,27 @@ async fn broker_window(
         .window_async(&request)
         .await
         .map_err(|why| format!("the broker did not answer with a window: {why}"))?;
+    // WHICH PREFIX THESE BARS ARE FILED UNDER, ASKED RATHER THAN ASSUMED.
+    // `store_vendor` refuses the two archive feeds, which have no prefix, and
+    // it is the only thing that may answer this question — see `BrokerWindow`.
+    let Some(store_vendor) = feed.store_vendor() else {
+        return Err(format!(
+            "{} has no store prefix of its own, so there is nowhere to file its \
+             bars. Nothing is written rather than another vendor's prefix being \
+             borrowed.",
+            vendor.as_str()
+        ));
+    };
+
     // The two swept series are the engine surface; the first is what a spot
     // pull asks for until the form carries an instrument of its own.
-    Ok((raw, "NIFTY".to_owned(), origin))
+    Ok(BrokerWindow {
+        raw,
+        instrument: "NIFTY".to_owned(),
+        origin,
+        spec,
+        store_vendor,
+    })
 }
 
 /// The receipt for a run that reached the store, whichever side it came from.
