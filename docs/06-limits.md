@@ -1646,7 +1646,7 @@ Recorded so no reader mistakes an unexamined claim for an examined one.
   for every gate-8 row in the repository.
 - **Nothing in `crates/costs` has been checked against a broker contract note,
   an exchange bill or a broker statement.** A lens proved the Rust reproduces the
-  predecessor's Python to the paisa over 37,668 swept cases. That proves the
+  predecessor to the paisa over 37,668 swept cases. That proves the
   *port*. It says nothing about whether the source was right, and neither does
   any row in `docs/04-invariants.md`.
 - **The `crates/api` search figures are synthetic only.** Every measured needle
