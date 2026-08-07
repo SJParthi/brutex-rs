@@ -482,14 +482,7 @@ fn the_trade_size_does_not_change_the_charge_stack_cost() -> bool {
     };
 
     let time = |quantity: i64| {
-        cost_ps(|| {
-            charge_stack(
-                black_box(fills),
-                black_box(quantity),
-                black_box(Direction::Long),
-                black_box(&rates),
-            )
-        })
+        cost_ps(|| charge_stack(black_box(fills), black_box(quantity), black_box(&rates)))
     };
     let base = time(65);
     let mut ok = true;
@@ -505,14 +498,7 @@ fn the_trade_size_does_not_change_the_charge_stack_cost() -> bool {
         let Some(at) = flat_fills(entry, exit) else {
             return 0;
         };
-        cost_ps(|| {
-            charge_stack(
-                black_box(at),
-                black_box(65),
-                black_box(Direction::Long),
-                black_box(&rates),
-            )
-        })
+        cost_ps(|| charge_stack(black_box(at), black_box(65), black_box(&rates)))
     };
     let cheap = priced(5, 10);
     ok &= ratio(

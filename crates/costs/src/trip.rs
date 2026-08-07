@@ -877,7 +877,20 @@ struct Position {
 /// Shared by the charge-bearing and the signal-only arms, because "cost-free"
 /// removes the charge stack and nothing else — the fills and the gross are
 /// identical either way.
-fn position(fills: Fills, quantity: i64, direction: Direction) -> Result<Position, CostError> {
+///
+/// # There is deliberately no `direction` parameter
+///
+/// [`crate::fill::worst_case_fills`] has already resolved the direction into
+/// the anchors: the BUY leg is whichever side bought — the opening buy on a
+/// long, the cover on a short — and the SELL leg is whichever side sold.
+/// Proceeds minus cost is the gross in both cases.
+///
+/// This function used to take `direction` and branch on it, and the short arm
+/// negated a gross that was already correct, so every losing short reported a
+/// profit. Taking the parameter at all is what made that expressible. It is
+/// removed rather than left unread so the branch cannot be reintroduced by
+/// someone who sees an unused argument and assumes it was meant to be used.
+fn position(fills: Fills, quantity: i64) -> Result<Position, CostError> {
     if quantity <= 0 {
         return Err(CostError::NotPositive {
             quantity: "quantity",
@@ -893,10 +906,21 @@ fn position(fills: Fills, quantity: i64, direction: Direction) -> Result<Positio
     // above already refused anything that left `i64`. The difference of two
     // values in `[0, i64::MAX]` is in `[-i64::MAX, i64::MAX]`, so this
     // subtraction cannot overflow and there is no branch pretending it can.
-    let gross = match direction {
-        Direction::Long => sell_notional.raw() - buy_notional.raw(),
-        Direction::Short => buy_notional.raw() - sell_notional.raw(),
-    };
+    // ONE expression, both directions, and the absence of a match is the point.
+    //
+    // `fill::worst_case_fills` already encodes the direction in the anchors: on
+    // a short the BUY leg is the *cover* (exit high plus a tick) and the SELL
+    // leg is the *opening sell* (entry low less a tick). Proceeds minus cost is
+    // therefore the short's P&L exactly as it is the long's, and a second
+    // direction test here is not a refinement — it is a second negation.
+    //
+    // The `Direction::Short => buy - sell` arm that used to sit here reported a
+    // PROFIT on every losing short. Its test passed because the fixture rose
+    // (101/99 → 121/119, a real loss of ₹1,436.50) while the assertion demanded
+    // `+1_436_50` under the comment "a short profits when it falls". The test
+    // pinned the output rather than the economics, so 100% coverage and a
+    // zero-survivor mutation run both certified the inversion.
+    let gross = sell_notional.raw() - buy_notional.raw();
 
     let slippage = fills
         .realized_slip_per_unit()
@@ -976,18 +1000,13 @@ fn both_legs(
 ///     Direction::Long,
 /// )?;
 /// let rates = Rates::resolve(Broker::Groww, Exchange::Nse, TradeDay::new(2026, 5, 15)?)?;
-/// let charges = charge_stack(fills, 65, Direction::Long, &rates)?;
+/// let charges = charge_stack(fills, 65, &rates)?;
 /// assert_eq!(charges.total_charges().raw(), 6_712);
 /// assert_eq!(charges.net_pnl().raw(), 122_638);
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-pub fn charge_stack(
-    fills: Fills,
-    quantity: i64,
-    direction: Direction,
-    rates: &Rates,
-) -> Result<Charges, CostError> {
-    let position = position(fills, quantity, direction)?;
+pub fn charge_stack(fills: Fills, quantity: i64, rates: &Rates) -> Result<Charges, CostError> {
+    let position = position(fills, quantity)?;
 
     // Brokerage: per executed ORDER, flat, both legs. It does not scale with
     // the quantity and nothing below multiplies it.
@@ -1068,8 +1087,8 @@ pub fn charge_stack(
 ///
 /// It touches no rate at all — which is what lets an index spot round trip in
 /// 2019 be priced, in a window where every exchange transaction charge refuses.
-fn signal_only(fills: Fills, quantity: i64, direction: Direction) -> Result<Charges, CostError> {
-    let position = position(fills, quantity, direction)?;
+fn signal_only(fills: Fills, quantity: i64) -> Result<Charges, CostError> {
+    let position = position(fills, quantity)?;
     Charges {
         buy_fill: fills.buy(),
         sell_fill: fills.sell(),
@@ -1148,14 +1167,14 @@ pub fn price(trip: &RoundTrip) -> Result<Charges, CostError> {
     }
     let fills = worst_case_fills(trip.entry().bar(), trip.exit().bar(), trip.direction())?;
     if is_cost_free(trip.contract().segment()) {
-        return signal_only(fills, trip.quantity(), trip.direction());
+        return signal_only(fills, trip.quantity());
     }
     let rates = Rates::resolve(
         trip.broker(),
         trip.contract().exchange(),
         trip.entry().day(),
     )?;
-    charge_stack(fills, trip.quantity(), trip.direction(), &rates)
+    charge_stack(fills, trip.quantity(), &rates)
 }
 
 #[cfg(test)]
@@ -1353,13 +1372,8 @@ mod tests {
         assert_eq!(bse.exchange(), BSE_EXCHANGE_CHARGE);
         assert_eq!(bse.ipft().get(), 0, "the BSE IPFT is the UNVERIFIED zero");
 
-        let charges = charge_stack(
-            flat_fills(80_00, 100_00, Direction::Long),
-            20,
-            Direction::Long,
-            &bse,
-        )
-        .expect("in range");
+        let charges =
+            charge_stack(flat_fills(80_00, 100_00, Direction::Long), 20, &bse).expect("in range");
         assert_eq!(charges.buy_notional().raw(), 1_601_00);
         assert_eq!(charges.sell_notional().raw(), 1_999_00);
         assert_eq!(charges.stt().raw(), 3_00);
@@ -1399,13 +1413,8 @@ mod tests {
     fn the_transaction_tax_reads_the_sell_premium_and_nothing_else() {
         // Trap 1, three ways.
         let rates = rates_on(Exchange::Nse, example_day());
-        let charges = charge_stack(
-            flat_fills(100_00, 120_00, Direction::Long),
-            65,
-            Direction::Long,
-            &rates,
-        )
-        .expect("in range");
+        let charges = charge_stack(flat_fills(100_00, 120_00, Direction::Long), 65, &rates)
+            .expect("in range");
 
         // (a) It is the SELL notional, not the buy and not the sum.
         assert_eq!(
@@ -1506,13 +1515,8 @@ mod tests {
             stamp_duty(OrderSide::Buy),
             GST_ON_FEE_BASE,
         );
-        let charges = charge_stack(
-            flat_fills(100_00, 120_00, Direction::Long),
-            65,
-            Direction::Long,
-            &loud_sebi,
-        )
-        .expect("in range");
+        let charges = charge_stack(flat_fills(100_00, 120_00, Direction::Long), 65, &loud_sebi)
+            .expect("in range");
 
         assert_eq!(charges.brokerage().raw(), 40_00);
         assert_eq!(charges.exchange().raw(), 5_02);
@@ -1794,12 +1798,33 @@ mod tests {
         assert!(charges.brokerage().raw() > charges.gross_pnl().raw());
     }
 
+    /// A short earns when the market falls and loses when it rises.
+    ///
+    /// # Why this asserts a symmetry rather than four numbers
+    ///
+    /// The test this replaces pinned `short.gross_pnl() == 1_436_50` against a
+    /// fixture that ROSE, under the comment "a short profits when it falls". It
+    /// was self-consistent with an inverted sign and therefore survived both
+    /// 100% coverage and a zero-survivor mutation run: every assertion was
+    /// derived from the same expression it was checking.
+    ///
+    /// The fix is to assert something the code cannot define into existence.
+    /// Run the *same two bars* in both orders and the economics fix all four
+    /// answers from outside:
+    ///
+    /// - a long on a rising market and a short on a falling one are the same trade
+    ///   mirrored, so they must earn the *same* gross;
+    /// - a long on a falling market and a short on a rising one must lose it;
+    /// - and the loss is the larger magnitude, because worst-case fills are
+    ///   adverse on both legs in both directions.
+    ///
+    /// No arm of `position()` can satisfy that set while negating one direction.
     #[test]
-    fn a_short_round_trip_inverts_the_gross_and_fills_off_the_other_two_bars() {
+    fn a_short_profits_when_the_market_falls_and_loses_when_it_rises() {
         let contract = option_contract("NIFTY");
-        let entry = ranged_leg(example_day(), 101_00, 99_00);
-        let exit = ranged_leg(example_day(), 121_00, 119_00);
-        let build = |direction: Direction| {
+        let low_bar = || ranged_leg(example_day(), 101_00, 99_00);
+        let high_bar = || ranged_leg(example_day(), 121_00, 119_00);
+        let build = |direction: Direction, entry, exit| {
             price(
                 &RoundTrip::new(
                     contract,
@@ -1815,30 +1840,67 @@ mod tests {
             .expect("verified")
         };
 
-        let long = build(Direction::Long);
-        let short = build(Direction::Short);
+        // The market RISES: 101/99 then 121/119.
+        let rising_long = build(Direction::Long, low_bar(), high_bar());
+        let rising_short = build(Direction::Short, low_bar(), high_bar());
+        // The market FALLS: the same two bars, the other way round.
+        let falling_long = build(Direction::Long, high_bar(), low_bar());
+        let falling_short = build(Direction::Short, high_bar(), low_bar());
 
-        // Long: buy the entry HIGH plus a tick, sell the exit LOW less a tick.
-        assert_eq!(long.buy_fill().raw(), 101_05);
-        assert_eq!(long.sell_fill().raw(), 118_95);
-        assert_eq!(long.gross_pnl().raw(), 1_163_50);
-        // Short: the cover buys the exit HIGH plus a tick and the opening sell
-        // takes the entry LOW less a tick. Adverse on both legs.
-        assert_eq!(short.buy_fill().raw(), 121_05);
-        assert_eq!(short.sell_fill().raw(), 98_95);
-        assert_eq!(
-            short.gross_pnl().raw(),
-            short.buy_notional().raw() - short.sell_notional().raw()
+        // --- the fills, which were never in doubt -------------------------
+        // Long buys the entry HIGH plus a tick and sells the exit LOW less one.
+        assert_eq!(rising_long.buy_fill().raw(), 101_05);
+        assert_eq!(rising_long.sell_fill().raw(), 118_95);
+        // Short covers at the exit HIGH plus a tick and opened at the entry LOW
+        // less one. Adverse on both legs, which is the reconciled §8 rule.
+        assert_eq!(rising_short.buy_fill().raw(), 121_05);
+        assert_eq!(rising_short.sell_fill().raw(), 98_95);
+        // The tax reads the SELL notional, which on a short is the OPENING leg.
+        assert_eq!(rising_short.sell_notional().raw(), 6_431_75);
+
+        // --- the direction, which was --------------------------------------
+        assert!(
+            rising_short.gross_pnl().raw() < 0,
+            "the market rose from 101/99 to 121/119 and this short covered at \
+             121.05 having sold at 98.95. That is a loss, and reporting it as a \
+             profit is the defect this test exists to catch."
         );
-        assert_eq!(short.gross_pnl().raw(), 1_436_50);
-        assert!(short.gross_pnl().raw() > 0, "a short profits when it falls");
-        // The tax still reads the SELL notional on a short, which is the
-        // OPENING leg there.
-        assert_eq!(short.sell_notional().raw(), 6_431_75);
-        assert_eq!(
-            short.net_pnl().raw(),
-            short.gross_pnl().raw() - short.total_charges().raw()
+        assert!(
+            falling_short.gross_pnl().raw() > 0,
+            "a short profits when it falls"
         );
+        assert!(rising_long.gross_pnl().raw() > 0);
+        assert!(falling_long.gross_pnl().raw() < 0);
+
+        // --- the mirror, which pins the magnitudes from outside -------------
+        assert_eq!(
+            rising_long.gross_pnl(),
+            falling_short.gross_pnl(),
+            "a long on a rising market and a short on the mirrored fall are the \
+             same trade and must earn the same gross"
+        );
+        assert_eq!(
+            falling_long.gross_pnl(),
+            rising_short.gross_pnl(),
+            "and the mirrored losses must match too"
+        );
+        assert_eq!(rising_long.gross_pnl().raw(), 1_163_50);
+        assert_eq!(rising_short.gross_pnl().raw(), -1_436_50);
+        // The loss is the larger magnitude in both directions: worst-case fills
+        // give up a tick on entry AND on exit, so the adverse case is punished
+        // twice while the favourable one is only trimmed twice.
+        assert!(
+            rising_short.gross_pnl().raw().abs() > rising_long.gross_pnl().raw(),
+            "worst-case fills must cost more than they give"
+        );
+
+        // Net still reconciles against the charge stack, in both signs.
+        for priced in [&rising_short, &falling_short] {
+            assert_eq!(
+                priced.net_pnl().raw(),
+                priced.gross_pnl().raw() - priced.total_charges().raw()
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2048,12 +2110,7 @@ mod tests {
         // a caller can reach it without a `RoundTrip` at all.
         let rates = rates_on(Exchange::Nse, example_day());
         assert_eq!(
-            charge_stack(
-                flat_fills(100_00, 120_00, Direction::Long),
-                0,
-                Direction::Long,
-                &rates
-            ),
+            charge_stack(flat_fills(100_00, 120_00, Direction::Long), 0, &rates),
             Err(CostError::NotPositive {
                 quantity: "quantity",
                 value: 0
@@ -2159,7 +2216,6 @@ mod tests {
             charge_stack(
                 flat_fills(1_000_000_000_000, 1_000_000_000_000, Direction::Long),
                 1_000_000_000,
-                Direction::Long,
                 &tame,
             ),
             Err(CostError::Overflow {
@@ -2176,7 +2232,7 @@ mod tests {
         )
         .expect("in range");
         assert_eq!(
-            charge_stack(lopsided, 1_000_000_000, Direction::Long, &tame),
+            charge_stack(lopsided, 1_000_000_000, &tame),
             Err(CostError::Overflow {
                 operation: "the sell notional"
             })
@@ -2195,7 +2251,7 @@ mod tests {
         )
         .expect("in range");
         assert_eq!(
-            charge_stack(slippery, 1_000, Direction::Long, &tame),
+            charge_stack(slippery, 1_000, &tame),
             Err(CostError::Overflow {
                 operation: "the slippage line"
             })
@@ -2209,7 +2265,7 @@ mod tests {
         )
         .expect("in range");
         assert_eq!(
-            charge_stack(ruinous, 1, Direction::Long, &rates(0, 0, 0)),
+            charge_stack(ruinous, 1, &rates(0, 0, 0)),
             Err(CostError::Overflow {
                 operation: "the net profit and loss"
             })
@@ -2223,12 +2279,7 @@ mod tests {
         // (3) The transaction tax, at a rate that leaves i64 on a real notional.
         let big = flat_fills(1_000_000_000, 1_000_000_000, Direction::Long);
         assert_eq!(
-            charge_stack(
-                big,
-                1_000_000_000,
-                Direction::Long,
-                &rates(1_000_000_000, 0, 0)
-            ),
+            charge_stack(big, 1_000_000_000, &rates(1_000_000_000, 0, 0)),
             Err(CostError::Overflow {
                 operation: "flooring a statutory levy to the paisa"
             })
@@ -2236,12 +2287,7 @@ mod tests {
 
         // (4) The exchange charge's per-leg ceiling.
         assert_eq!(
-            charge_stack(
-                big,
-                1_000_000_000,
-                Direction::Long,
-                &rates(0, 1_000_000_000, 0)
-            ),
+            charge_stack(big, 1_000_000_000, &rates(0, 1_000_000_000, 0)),
             Err(CostError::Overflow {
                 operation: "ceiling a levy to the paisa"
             })
@@ -2251,7 +2297,7 @@ mod tests {
         //     Each leg is about 5e18; their sum is not.
         let both_legs_overflow = rates(0, 50_000_000, 0);
         assert_eq!(
-            charge_stack(big, 1_000_000_000, Direction::Long, &both_legs_overflow),
+            charge_stack(big, 1_000_000_000, &both_legs_overflow),
             Err(CostError::Overflow {
                 operation: "the exchange transaction charge"
             })
@@ -2260,12 +2306,7 @@ mod tests {
         // (6) The IPFT, reached only because the exchange charge succeeded
         //     first — so the ordering of the stack is being asserted too.
         assert_eq!(
-            charge_stack(
-                big,
-                1_000_000_000,
-                Direction::Long,
-                &rates(0, 0, 50_000_000)
-            ),
+            charge_stack(big, 1_000_000_000, &rates(0, 0, 50_000_000)),
             Err(CostError::Overflow {
                 operation: "the investor protection fund"
             })
@@ -2274,12 +2315,7 @@ mod tests {
         // (7) The GST base: the exchange charge and the IPFT each fit, and
         //     their sum does not.
         assert_eq!(
-            charge_stack(
-                big,
-                1_000_000_000,
-                Direction::Long,
-                &rates(0, 25_000_000, 25_000_000)
-            ),
+            charge_stack(big, 1_000_000_000, &rates(0, 25_000_000, 25_000_000)),
             Err(CostError::Overflow {
                 operation: "the GST base"
             })
@@ -2291,7 +2327,6 @@ mod tests {
             charge_stack(
                 flat_fills(1_000_000_000, 1_000_000_000, Direction::Long),
                 9_000_000_000,
-                Direction::Long,
                 &rates(5_500_000, 2_800_000, 0),
             ),
             Err(CostError::Overflow {
@@ -2316,7 +2351,6 @@ mod tests {
             charge_stack(
                 big,
                 1_000_000_000,
-                Direction::Long,
                 &Rates::with_all(Broker::Groww, quiet, quiet, quiet, loud, quiet, quiet),
             ),
             Err(CostError::Overflow {
@@ -2329,7 +2363,6 @@ mod tests {
             charge_stack(
                 big,
                 1_000_000_000,
-                Direction::Long,
                 &Rates::with_all(Broker::Groww, quiet, quiet, quiet, quiet, loud, quiet),
             ),
             Err(CostError::Overflow {
@@ -2343,7 +2376,6 @@ mod tests {
             charge_stack(
                 flat_fills(1_000_000_000, 1_000_000_000, Direction::Long),
                 1_000_000,
-                Direction::Long,
                 &Rates::with_all(
                     Broker::Groww,
                     quiet,
@@ -2411,7 +2443,7 @@ mod tests {
             1_000
         );
         assert_eq!(
-            charge_stack(lopsided, 1, Direction::Long, &rates),
+            charge_stack(lopsided, 1, &rates),
             Err(CostError::Overflow {
                 operation: "ceiling a levy to the paisa"
             })
@@ -2506,7 +2538,7 @@ mod tests {
             BpsX100::ZERO,
         );
         assert_eq!(
-            charge_stack(fills, 1, Direction::Long, &rates),
+            charge_stack(fills, 1, &rates),
             Err(CostError::Overflow {
                 operation: "ceiling a statutory levy to the rupee"
             })
@@ -2619,6 +2651,7 @@ mod tests {
         let rates = rates_on(Exchange::Nse, example_day());
         let mut checked = 0_u32;
         let mut losses = 0_u32;
+        let mut diagonal_losses = 0_u32;
         let mut swamped = 0_u32;
 
         for entry in [5_i64, 55, 100_00, 2_500_00, 10_000_000_00] {
@@ -2626,8 +2659,8 @@ mod tests {
                 for quantity in [1_i64, 15, 65, 75_000] {
                     for direction in [Direction::Long, Direction::Short] {
                         let fills = flat_fills(entry, exit, direction);
-                        let charges = charge_stack(fills, quantity, direction, &rates)
-                            .expect("inside the envelope");
+                        let charges =
+                            charge_stack(fills, quantity, &rates).expect("inside the envelope");
 
                         // The two internal laws.
                         assert_eq!(
@@ -2669,12 +2702,42 @@ mod tests {
                         }
                         assert!(charges.total_charges().raw() >= 40_00);
 
+                        // On the diagonal the trip opens and closes at the same
+                        // price, so BOTH directions must lose: worst-case fills
+                        // give up a tick entering and another leaving, and that
+                        // is true of a short exactly as it is of a long. This is
+                        // the assertion the inverted-sign defect could not have
+                        // satisfied — it turned all twenty diagonal shorts into
+                        // profits, which is what dropped `losses` to 100.
+                        if entry == exit {
+                            assert!(
+                                charges.gross_pnl().raw() < 0,
+                                "a {direction} trip that opened and closed at \
+                                 {entry} paisa reported {} — a flat market cannot \
+                                 pay for two adverse fills",
+                                charges.gross_pnl().raw()
+                            );
+                            diagonal_losses += 1;
+                        }
+
                         if charges.gross_pnl().raw() < 0 {
                             losses += 1;
                         }
                         if charges.gross_pnl().raw() > 0
                             && charges.total_charges().raw() > charges.gross_pnl().raw()
                         {
+                            // What "swamped" MEANS: the trip made money and the
+                            // charge stack took more than it made. Asserting the
+                            // consequence keeps the counter below honest — a
+                            // tally alone would happily count trips that were
+                            // never profitable in the first place, which is
+                            // precisely what it did while shorts were inverted.
+                            assert!(
+                                charges.net_pnl().raw() < 0,
+                                "a trip whose charges exceed its gross must net \
+                                 negative, and this one netted {}",
+                                charges.net_pnl().raw()
+                            );
                             swamped += 1;
                         }
                         checked += 1;
@@ -2685,8 +2748,29 @@ mod tests {
         assert_eq!(checked, 5 * 5 * 4 * 2);
         assert!(losses > 0, "the sweep must include losing trips");
         assert!(swamped > 0, "and trips whose charges exceed the gross");
-        assert_eq!(losses, 100);
-        assert_eq!(swamped, 24);
+
+        // The loss count is DERIVED from the grid, not read off a run:
+        //
+        //   5 prices x 5 prices = 25 pairs, of which 5 are the diagonal.
+        //   - the 20 off-diagonal pairs move, so exactly one direction of each
+        //     loses ..................................... 20 x 4 quantities = 80
+        //   - the 5 diagonal pairs are flat, so BOTH directions lose,
+        //     asserted individually above ........... 5 x 4 x 2 directions = 40
+        //                                                                 -----
+        //                                                                   120
+        //
+        // The figure this replaced was 100 — exactly 120 less the twenty
+        // diagonal shorts that the inverted `Direction::Short` arm reported as
+        // profits. A tally copied off a green run cannot tell you that; the
+        // derivation can, which is the whole reason it is written down here.
+        assert_eq!(diagonal_losses, 5 * 4 * 2, "every flat trip must lose");
+        assert_eq!(losses, 80 + diagonal_losses);
+        assert_eq!(losses, 120);
+        // 24 before the sign fix, 6 after. The missing 18 were never profits at
+        // all: they were losing shorts the inverted arm reported as gains small
+        // enough for the charge stack to swallow. Each of the 6 that remain had
+        // its net asserted negative at the point of counting, above.
+        assert_eq!(swamped, 6);
     }
 
     #[test]
@@ -2711,11 +2795,11 @@ mod tests {
 
                         let fills = flat_fills(100_00, 120_00, direction);
                         let expected = if is_cost_free(segment) {
-                            signal_only(fills, 50, direction).expect("in range")
+                            signal_only(fills, 50).expect("in range")
                         } else {
                             let rates =
                                 Rates::resolve(Broker::Zerodha, Exchange::Nse, on).expect("ok");
-                            charge_stack(fills, 50, direction, &rates).expect("in range")
+                            charge_stack(fills, 50, &rates).expect("in range")
                         };
                         assert_eq!(priced, expected, "{underlying} {on} {segment} {direction}");
                         checked += 1;
