@@ -182,6 +182,7 @@ jobs:
           k7f2p9q1w8e3-5t6y0u4i2o9 k7f2p9q1w8e3r5t6y0u4i2o
           k7f2p9q1w8e3r5t6y0u4i2o9 kfpqwerstyuioasdfghjklzx
           hunter2 hunter2-and-then-some stale fresh 9876
+          shhh the-token default-secret other-token
           '
 
           # ---- group 5: test scaffolding — expect() messages, assert labels,
@@ -210,6 +211,9 @@ jobs:
           brutex-no-such-dir-ever
           x nz snapshots decodes unchanged records
           cached stolen redirect window_async
+          b h 2026 half nope other reads signs forwards readable
+          bars empty idempotent lands paise shared lock-held
+          brutex-ssm-no-such-file-ever
           '
 
           # ---- group 6: granularity and session tokens. `Granularity::dir`
@@ -243,7 +247,7 @@ jobs:
           # the category this group exists for.
           record_field='
           open high low close volume timestamp open_interest payload csv
-          data from to
+          data from to candles
           '
 
           # ---- group 9: an HTTP HEADER NAME, not a value. One broker sends
@@ -294,10 +298,53 @@ jobs:
           # names an account, an environment, a vendor or a field.
           wire_date='20250701 01072025'
 
+          # ---- group 13: AWS SigV4's own wire vocabulary, crates/pull/src/ssm.rs.
+          # Every word here is published by AWS and fixed by the signing
+          # algorithm. None is an operator's choice, so none can be one of their
+          # path segments. `ssm` is the service code that appears in the
+          # credential scope; `aws4_request` is the terminator the algorithm
+          # mandates; the rest are HTTP header names AWS defines.
+          #
+          # `us-east-1`, `20150830` and `20150831` are lifted VERBATIM from
+          # AWS's own published SigV4 test vectors, which is what ssm.rs checks
+          # the implementation against — they are the only external proof this
+          # repository has that the signature is computed correctly, and
+          # changing them to something invented would delete that proof.
+          # CLAUDE.md §8 names ap-south-1 as the region this repository reads
+          # from; us-east-1 appears nowhere but inside those vectors.
+          aws_sigv4='
+          ssm aws4_request authorization content-type host
+          x-amz-date x-amz-target x-amz-security-token
+          us-east-1 20150830 20150831
+          '
+
+          # ---- group 14: the AWS shared-credentials file format. These are the
+          # INI keys and the default profile name AWS itself defines for
+          # ~/.aws/credentials, read by `AwsIdentity::from_credentials_file`.
+          # Only the names of the keys are here; gate 1c already refuses the
+          # file itself from ever being tracked.
+          aws_shared='
+          credentials profiles default
+          aws_access_key_id aws_secret_access_key aws_session_token
+          '
+
+          # ---- group 15: the redacting `Debug`'s own field labels.
+          # `AwsIdentity` hand-writes `Debug` so the secret and the session
+          # token render as `<redacted>`; these are the labels printed beside
+          # them. That `secret` and `session_token` appear as literals AT ALL is
+          # that redaction working, not a value escaping.
+          redact_label='key_id secret session_token'
+
+          # ---- group 16: published hash test vectors. `abc` is the NIST
+          # SHA-256 input whose digest ssm.rs pins, and `000fff` is the
+          # three-byte lower-case hex-padding check beside it.
+          hash_vector='abc 000fff'
+
           allowed="${seg_shape} ${vendor_wire} ${config_fixture}
           ${secret_fixture} ${scaffold} ${timeframe} ${governor}
           ${record_field} ${header_name} ${bound_number}
-          ${debug_label} ${wire_date}"
+          ${debug_label} ${wire_date} ${aws_sigv4} ${aws_shared}
+          ${redact_label} ${hash_vector}"
           bad=0
           while IFS= read -r word; do
             if [ -z "$word" ]; then continue; fi
