@@ -744,6 +744,46 @@ async fn health(
 /// `api::server::tests::the_ingest_page_names_what_exists_and_what_does_not` is
 /// what stops it going stale silently a second time — which is exactly what it
 /// caught when `reqwest` was added.
+/// What the page says when the broker IS reachable from this process.
+///
+/// # This constant exists because its sibling went stale twice
+///
+/// [`HTTP_UNAVAILABLE`] says "no credential has been read and no vendor is
+/// contacted from this process". That was true when it was written. It stopped
+/// being true when `broker_answer` landed: the served process sets
+/// [`Broker::Live`], reads the token out of Parameter Store, and gets an answer
+/// from Dhan — and the page went on saying the opposite, because the constant
+/// was rendered unconditionally and nothing consulted [`Site::broker`].
+///
+/// Its own documentation predicted this. It says an operator "told the first
+/// when the second is true will look in the wrong place", and names a test as
+/// what "stops it going stale silently a second time". The test asserted the
+/// SENTENCE, not the FACT — so it could catch someone editing the words and
+/// could not catch the words becoming false. That is the same shape as every
+/// other defect found in this repository this week: the check verifies the code
+/// against itself.
+///
+/// The repair is not a better sentence. It is that the two texts are now chosen
+/// by [`Site::broker`], which is the value that actually decides, and the test
+/// asserts the correspondence rather than either string.
+pub const HTTP_LIVE: &str = "THE HTTP PATH IS WIRED TO THIS ROUTE. The credential \
+     is read from AWS Parameter Store through pull::ssm, the vendor is chosen \
+     from the request and resolved to a row in pull::vendor, and \
+     pull::http::HttpSource::window_async puts the request on a socket. A spot \
+     pull that names a local vendor folder still reads that folder instead. \
+     WHAT IS STILL MISSING, so this sentence does not overstate itself the way \
+     its predecessor did: pull::vendor::HttpSpec carries no request-parameter \
+     map, so the broker is reached and answers DH-905 'securityId is required'; \
+     pull::rate::Governor has no caller, so nothing is admitted against a \
+     budget before the socket opens; and the expired-F&O endpoints are not \
+     modelled at all.";
+
+/// What the page says when the broker is NOT reachable from this process.
+///
+/// Every test site is [`Broker::Refused`], so this is the text the suite sees.
+/// It is still accurate for that state — and it is now reached only through
+/// [`halt_for`], never rendered unconditionally, which is the whole repair.
+/// See [`HTTP_LIVE`] for what went wrong and why the choice moved to a value.
 pub const HTTP_UNAVAILABLE: &str = "THE LOCAL-ARCHIVE PATH RUNS. THE HTTP PATH \
      IS BUILT BUT NOT YET WIRED TO THIS ROUTE. crates/pull/src/fetch.rs, \
      crates/pull/src/rate.rs and crates/pull/src/http.rs are all present — \
@@ -1130,10 +1170,28 @@ pub fn pull_html(site: &Site, today: Day) -> String {
         capture,
         no_capture,
         journal: journal_note(&path, &log, &trouble),
-        halt: Some(HTTP_UNAVAILABLE),
+        // CHOSEN FROM THE VALUE THAT DECIDES, not stated as a constant. The
+        // predecessor rendered `HTTP_UNAVAILABLE` unconditionally and therefore
+        // told a served process — which sets `Broker::Live`, reads the token and
+        // reaches Dhan — that no vendor is contacted from it.
+        halt: Some(halt_for(site.broker)),
         notes: &site.read.notes,
         folders: &site.folders,
     })
+}
+
+/// Which sentence describes this process, from the value that decides.
+///
+/// One function so the two texts cannot be chosen differently in two places,
+/// and so a test can assert the CORRESPONDENCE — `Live` gets the live text,
+/// `Refused` gets the other — rather than pinning either string. Pinning the
+/// string is what let the old sentence stay green while it became false.
+#[must_use]
+pub const fn halt_for(broker: Broker) -> &'static str {
+    match broker {
+        Broker::Live => HTTP_LIVE,
+        Broker::Refused => HTTP_UNAVAILABLE,
+    }
 }
 
 /// The page a refused request answers with.
@@ -1154,12 +1212,12 @@ pub fn refusal_html(scope: &str, why: &ingest::Refusal) -> String {
 }
 
 /// The page a valid request answers with, given that nothing can run.
-fn accepted_html(scope: &str, mut facts: Vec<(&'static str, String)>) -> String {
+fn accepted_html(scope: &str, mut facts: Vec<(&'static str, String)>, broker: Broker) -> String {
     facts.push(("Status", "NOT STARTED".to_owned()));
     render::receipt_page(&render::Receipt {
         scope,
         verdict: "NOT STARTED",
-        reason: HTTP_UNAVAILABLE,
+        reason: halt_for(broker),
         good: false,
         facts: &facts,
         footnote: "Nothing here was written to the store.",
@@ -1350,7 +1408,7 @@ async fn broker_answer(
         facts.push(recorded_fact(journal, &record));
         return (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            accepted_html("Spot pull", facts),
+            accepted_html("Spot pull", facts, site.broker),
         );
     }
 
@@ -1367,7 +1425,7 @@ async fn broker_answer(
         let mut facts = facts;
         facts.push(("Refused because", why.to_owned()));
         facts.push(recorded_fact(journal, &record));
-        (code, accepted_html("Spot pull", facts))
+        (code, accepted_html("Spot pull", facts, site.broker))
     };
 
     match broker_window(&asked, site).await {
@@ -1786,6 +1844,9 @@ fn fno_answer(
     today: Day,
     now: std::time::SystemTime,
     journal: &audit::Journal,
+    // Which sentence this process is entitled to print. Taken rather than
+    // assumed, for the reason `halt_for` documents.
+    broker: Broker,
 ) -> (axum::http::StatusCode, String) {
     match ingest::parse_fno(body, today) {
         Err(why) => {
@@ -1823,7 +1884,7 @@ fn fno_answer(
             facts.push(recorded_fact(journal, &record));
             (
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                accepted_html("Expired F&O pull", facts),
+                accepted_html("Expired F&O pull", facts, broker),
             )
         }
     }
@@ -1837,7 +1898,7 @@ async fn pull_fno(
     let now = std::time::SystemTime::now();
     let journal = site.journal();
     let (code, page) = dated(ingest::ist_day(now), "Expired F&O pull", |today| {
-        fno_answer(&body, today, now, &journal)
+        fno_answer(&body, today, now, &journal, site.broker)
     });
     (code, axum::response::Html(page))
 }
@@ -4162,6 +4223,7 @@ mod tests {
             day(2026, 8, 7),
             moment(),
             &journal,
+            Broker::Refused,
         );
         assert_eq!(code, axum::http::StatusCode::SERVICE_UNAVAILABLE);
         assert!(page.contains("NOT STARTED"), "{page}");
@@ -4179,6 +4241,7 @@ mod tests {
             day(2026, 8, 7),
             moment(),
             &journal,
+            Broker::Refused,
         );
         assert_eq!(code, axum::http::StatusCode::BAD_REQUEST);
         assert!(page.contains("LIVE CONTRACT IS NEVER STORED"), "{page}");
@@ -4701,13 +4764,60 @@ mod tests {
         // call the vendor. A test that only checked the client exists would
         // pass just as happily once the wiring landed, and the banner would
         // then be telling an operator nothing is contacted while it was.
-        let me = std::fs::read_to_string(Path::new(file!()))
-            .or_else(|_| std::fs::read_to_string("crates/api/src/server.rs"))
-            .unwrap_or_default();
+        // HOW THIS READ USED TO DEFEAT ITSELF, kept as the reason it is written
+        // the way it is now.
+        //
+        // It was:
+        //     let me = read_to_string(Path::new(file!()))
+        //         .or_else(|_| read_to_string("crates/api/src/server.rs"))
+        //         .unwrap_or_default();
+        //     assert!(!me.contains("HttpSource::new"), ...);
+        //
+        // `file!()` is workspace-relative and the test process runs with its CWD
+        // at `crates/api`, so BOTH reads fail. `unwrap_or_default()` then hands
+        // back an empty string, and `!"".contains(..)` is trivially true — so
+        // the assertion passed no matter what the file said. It was passing at
+        // the moment `broker_window` began calling `HttpSource::new` forty lines
+        // above, which is the exact event it existed to catch.
+        //
+        // Two `CLAUDE.md` §4 bans in four lines: a test that asserts nothing,
+        // and a fallback that hides a failure. The read is now a hard failure
+        // and the path is built from CARGO_MANIFEST_DIR, which always resolves.
+        let me =
+            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/server.rs"))
+                .expect(
+                    "this module's own source must be readable, or the check below proves nothing",
+                );
         assert!(
-            !me.contains("HttpSource::new"),
-            "the banner says this route never contacts a vendor; constructing \
-             an HttpSource here makes that false"
+            me.contains("fn broker_window"),
+            "sanity: the source really was read"
+        );
+
+        // AND THE CORRESPONDENCE, which is the thing worth asserting.
+        //
+        // Whether this process reaches a vendor is decided by `Site::broker`,
+        // not by a sentence. So: if the source constructs an `HttpSource` at
+        // all, a LIVE site must not be told that nothing is contacted. Pinning
+        // either string is what let the old sentence rot while green.
+        let constructs_a_client = me.contains("HttpSource::new");
+        assert!(
+            constructs_a_client,
+            "broker_window builds the client; if that stops being true the \
+             banner texts below need revisiting"
+        );
+        assert!(
+            !halt_for(Broker::Live).contains("no vendor is contacted"),
+            "a process that constructs an HttpSource and sets Broker::Live must \
+             not tell an operator that no vendor is contacted from it"
+        );
+        assert!(
+            halt_for(Broker::Refused).contains("no vendor is contacted"),
+            "and a refused process must still say so"
+        );
+        assert_ne!(
+            halt_for(Broker::Live),
+            halt_for(Broker::Refused),
+            "the two states must read differently or the choice is decoration"
         );
 
         // AND THE PAGE SAYS EXACTLY THAT, with none of the old sentence left.
@@ -4717,7 +4827,23 @@ mod tests {
         assert!(html.contains("crates/pull/src/fetch.rs"), "{html}");
         assert!(html.contains("crates/pull/src/rate.rs"), "{html}");
         assert!(html.contains("crates/pull/src/http.rs"), "{html}");
-        assert!(html.contains("no credential has been read"), "{html}");
+        // A test site is `Broker::Refused`, so it gets the unavailable text — but
+        // assert that through `halt_for` rather than by quoting the sentence, so
+        // rewording the copy does not require editing the test.
+        // The first sentence, TAKEN FROM the constant rather than quoted here,
+        // so rewording the copy does not require editing the test. The whole
+        // string cannot be compared: `render::escape` turns the `&` of "F&O"
+        // into `&amp;` on the way to the page.
+        let head = halt_for(site.broker)
+            .split('.')
+            .next()
+            .expect("the banner has a first sentence");
+        assert!(html.contains(head), "expected {head:?} in {html}");
+        assert_eq!(
+            site.broker,
+            Broker::Refused,
+            "a test never reaches a vendor"
+        );
         for stale in [
             "no vendor fetch and",
             "there is no pull::fetch",
