@@ -1815,8 +1815,8 @@ mod tests {
     /// - a long on a rising market and a short on a falling one are the same trade
     ///   mirrored, so they must earn the *same* gross;
     /// - a long on a falling market and a short on a rising one must lose it;
-    /// - and the loss is the larger magnitude, because worst-case fills are
-    ///   adverse on both legs in both directions.
+    /// - and the loss is the larger magnitude, because the adverse-fill rule
+    ///   gives up a tick on entry AND on exit, whichever way the trip is taken.
     ///
     /// No arm of `position()` can satisfy that set while negating one direction.
     #[test]
