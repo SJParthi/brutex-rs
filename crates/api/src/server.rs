@@ -15,7 +15,6 @@
 
 use crate::catalog::{Catalog, PAGE_ROWS, Selection};
 use crate::{audit, census, ingest, master, merge, render};
-use brutex_core::instrument::InstrumentKey;
 use brutex_core::vendor::Vendor;
 use pull::session::{Day, IstMoment};
 use std::fmt::Write as _;
@@ -775,8 +774,10 @@ pub struct Site {
     pub read: Read,
     /// One manifest census per vendor, in [`Vendor::ALL`] order.
     pub censuses: Vec<census::VendorCensus>,
-    /// The instruments the coverage grid is built over, sorted.
-    pub indices: Vec<InstrumentKey>,
+    /// The coverage grid's instrument axis — every series the censuses hold,
+    /// plus the two the engine sweeps. Sorted, so a row's ordinal is stable
+    /// across reloads and restarts.
+    pub series: Vec<census::Series>,
     /// How many instruments each spot target covers, in
     /// [`ingest::SpotTarget::ALL`] order.
     ///
@@ -815,19 +816,26 @@ impl Site {
                 }
             }
         }
-        // THE GRID FALLS BACK TO THE TWO SWEPT SERIES WHEN THERE IS NO
-        // UNIVERSE, and that is not a fallback that hides anything: a missing
-        // master is already `UNAVAILABLE` in `read.notes`, which the store page
-        // renders. Showing an empty grid instead would hide the two instruments
-        // whose coverage is the entire point of the page.
-        let mut indices = census::grid_instruments(read.merged.by_key.keys());
-        if indices.is_empty() {
-            indices = census::swept_instruments();
-        }
+        // THE GRID'S AXIS IS READ OFF THE CENSUSES, NOT OUT OF THE MASTER.
+        //
+        // It used to be `grid_instruments(read.merged.by_key.keys())` — the
+        // instrument master filtered to spot indices — and the store on this
+        // operator's disk holds 194 months of expired futures under the vendor
+        // archive's own names. The two vocabularies never met, so every probe
+        // missed and the page reported `0 of 200 held` beside `62,978 rows`.
+        // `census::held_series` takes the keys the manifests actually contain
+        // and adds the two swept series so a fresh install still names what it
+        // is missing; there is no longer a universe to fall back FROM, because
+        // the universe was never the right source for this page.
+        //
+        // Computed here, once, for the reason the censuses themselves are
+        // (D-0039): it is O(keys log keys), and that belongs at startup beside
+        // the manifest load rather than inside a request.
+        let series = census::held_series(&censuses);
         Self {
             read,
             censuses,
-            indices,
+            series,
             targets,
             store_root,
             loaded_at: ingest::epoch_secs(std::time::SystemTime::now()),
@@ -1672,11 +1680,11 @@ pub fn store_html(site: &Site, today: Day, page: usize) -> String {
     // The grid is instruments × months and both factors are bounded, so the
     // last page is a division rather than a walk, and `?page=999` clamps to
     // somewhere real for the same reason `/instruments` does.
-    let total = census::grid_rows(site.indices.len());
+    let total = census::grid_rows(site.series.len());
     let last_page = total.saturating_sub(1) / PAGE_ROWS;
     let page = page.min(last_page);
     let rows = census::coverage_page(
-        &site.indices,
+        &site.series,
         &site.censuses,
         today,
         page.saturating_mul(PAGE_ROWS),
@@ -3209,7 +3217,7 @@ mod tests {
         // says zero" are different claims.
         assert!(html.contains("<div class=\"cv\">—</div>"), "{html}");
         // The grid still shows the instruments, with every cell a miss.
-        assert!(html.contains("NSE-NIFTY"), "{html}");
+        assert!(html.contains("NSE-INDEX-NIFTY"), "{html}");
         assert!(html.contains("class=\"num miss\""), "{html}");
     }
 
@@ -3250,7 +3258,10 @@ mod tests {
         let first = store_html(&site, day(2026, 8, 7), 0);
         let past = store_html(&site, day(2026, 8, 7), 999);
         assert_eq!(past, first, "an out-of-range page clamps to the last one");
-        assert!(past.contains("NSE-NIFTY"), "and still has rows: {past}");
+        assert!(
+            past.contains("NSE-INDEX-NIFTY"),
+            "and still has rows: {past}"
+        );
         // The fixture's one index × 36 months fits one page, so there is no
         // pager at all — navigation that leads nowhere is worse than none.
         assert!(!first.contains("class=\"pager\""), "{first}");
@@ -3263,16 +3274,17 @@ mod tests {
         // test enters.
         let dir = agreeing("storepager");
         let mut site = site("storepager", &dir);
-        site.indices = (0..10)
+        site.series = (0..10)
             .filter_map(|i| {
-                brutex_core::instrument::InstrumentKey::index(
-                    brutex_core::instrument::Exchange::Nse,
-                    &format!("IDX{i:02}"),
-                )
-                .ok()
+                Some(census::Series {
+                    exchange: brutex_core::instrument::Exchange::Nse,
+                    segment: brutex_core::instrument::Segment::Index,
+                    symbol: brutex_core::symbol::Symbol::new(&format!("IDX{i:02}")).ok()?,
+                    timeframe: store::path::Timeframe::MINUTE_1,
+                })
             })
             .collect();
-        assert_eq!(census::grid_rows(site.indices.len()), 360);
+        assert_eq!(census::grid_rows(site.series.len()), 360);
 
         let first = store_html(&site, day(2026, 8, 7), 0);
         assert!(first.contains("page 1 of 2"), "{first}");
@@ -3553,19 +3565,18 @@ mod tests {
 
     #[test]
     fn a_site_with_no_universe_still_shows_the_two_instruments_that_matter() {
-        // The masters were never read, so the merge is empty and the coverage
-        // grid would otherwise have no rows at all — hiding exactly the two
-        // series the whole page exists for. It falls back to them, and the
-        // missing master is still `UNAVAILABLE` on the page, so nothing is
-        // hidden by the fall-back.
+        // Nothing has been ingested and no master was read, so the axis has only
+        // the swept pair on it — which is the answer, not an absence of one. The
+        // grid's axis no longer comes from the masters at all (see
+        // `census::held_series`), so an empty merge cannot empty it.
         let empty = masters("nomasters", None, None);
         let site = site("nomasters", &empty);
-        assert_eq!(site.indices.len(), 2, "the engine surface, exactly");
+        assert_eq!(site.series.len(), 2, "the engine surface, exactly");
         assert_eq!(site.targets, [0, 0, 0], "and no target has members");
 
         let html = store_html(&site, day(2026, 8, 7), 0);
         assert!(
-            html.contains("NSE-NIFTY") && html.contains("NSE-BANKNIFTY"),
+            html.contains("NSE-INDEX-NIFTY") && html.contains("NSE-INDEX-BANKNIFTY"),
             "{html}"
         );
         assert!(
@@ -4541,11 +4552,11 @@ mod tests {
         );
         // One index instrument in the fixture universe × 36 months back.
         assert!(
-            html.contains("36 instrument-month(s) in the grid"),
+            html.contains("72 instrument-month(s) in the grid"),
             "{html}"
         );
         assert!(
-            html.contains("<b>1 of 36</b> shown row(s) are held"),
+            html.contains("<b>1 of 72</b> shown row(s) are held"),
             "{html}"
         );
         assert!(html.contains("quartiles of 8250"), "{html}");

@@ -1636,6 +1636,40 @@ impl Manifest {
         self.index.get(key).copied()
     }
 
+    /// Every key this census holds, in no particular order.
+    ///
+    /// # Why a census needs to be readable and not only probeable
+    ///
+    /// [`Self::entry`] answers *is this key held*, which is the right question
+    /// when the caller already knows which key to ask about. `crates/api`'s
+    /// coverage grid did not: it built its own keys out of the instrument
+    /// master and probed those, and **every probe missed**. The store held 194
+    /// months of expired futures under the names the vendor archive used —
+    /// `ABB-III`, segment `FNO` — and the grid was asking about `NIFTY` in
+    /// segment `INDEX`, a key nothing had ever written. The page therefore
+    /// reported `0 of 200 held` on the same screen as `62,978 rows`, which is
+    /// two contradictory claims about one file and exactly the silent shape
+    /// `CLAUDE.md` §4 bans.
+    ///
+    /// A census that cannot be enumerated can only confirm a guess. This is how
+    /// a caller asks *what is here* instead.
+    ///
+    /// # Cost, stated
+    ///
+    /// **O(keys), and it allocates nothing.** That makes it the one operation on
+    /// this type that is not O(1), so it belongs where `Manifest::open` already
+    /// is — read once, at startup — and not inside a request. `crates/api`'s
+    /// `Site` holds the sorted result for the process's lifetime, which is the
+    /// same bargain D-0039 struck for the censuses themselves.
+    /// `docs/06-limits.md` §32 records it.
+    ///
+    /// The order is a `HashMap`'s and therefore **not stable between runs**. A
+    /// caller that renders these must sort them, or it will address a different
+    /// row on every reload — see `api::census::held_series`.
+    pub fn held_keys(&self) -> impl Iterator<Item = &EntryKey> {
+        self.index.keys()
+    }
+
     /// Records one month, returning the two writes that publish it.
     ///
     /// The manifest is append-only: an update to a key that already exists is a

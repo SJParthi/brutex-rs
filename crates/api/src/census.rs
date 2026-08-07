@@ -29,7 +29,7 @@
 
 use std::path::{Path, PathBuf};
 
-use brutex_core::instrument::{Exchange, InstrumentKey, Kind, Segment};
+use brutex_core::instrument::{Exchange, Segment};
 use brutex_core::symbol::Symbol;
 use brutex_core::vendor::Vendor;
 use pull::manifest::{ENTRY_STRIDE, EntryKey, HEADER_LEN, MAX_ENTRIES, Manifest, manifest_path};
@@ -329,31 +329,92 @@ pub fn month_back(today: Day, back: usize) -> Option<YearMonth> {
     YearMonth::new(year, month).ok()
 }
 
-/// The manifest key for one instrument's month of one-minute bars.
+/// One row of the coverage grid's instrument axis: an [`EntryKey`] without its
+/// month.
 ///
-/// `None` for an instrument the manifest cannot key — an option or a future
-/// carries an expiry the manifest's key does not, and the coverage grid is
-/// about spot series.
-#[must_use]
-pub fn entry_key(key: &InstrumentKey, month: YearMonth) -> Option<EntryKey> {
-    match key.kind {
-        Kind::Index | Kind::Equity => Some(EntryKey {
+/// # Why this exists rather than an `InstrumentKey`
+///
+/// The grid used to be built from [`InstrumentKey`]s taken out of the instrument
+/// master, and turned each one into an [`EntryKey`] to probe with. **That
+/// translation cannot be made faithfully, and the /store page was the proof.**
+///
+/// An `InstrumentKey` names an instrument the way an exchange master does:
+/// an underlying plus a [`Kind`], so a futures contract is `(ABB, Future{expiry})`.
+/// A manifest entry names it the way the *store* does: whatever string the pull
+/// plan called it, which for the 194 months on this operator's disk is `ABB-III`
+/// — a vendor archive's own continuous-contract spelling, in segment `FNO`. No
+/// function maps `(ABB, Future{expiry})` to `ABB-III`, because `III` is not an
+/// expiry; it is a position in a roll. So the old `entry_key` returned `None`
+/// for every future and option, the grid filtered its axis down to spot indices,
+/// and the probes it did issue asked about `(NSE, INDEX, NIFTY)` — a key nothing
+/// had ever written.
+///
+/// Every cell missed. The page said `0 of 200 held` beside a counter reading
+/// `62,978 rows`, and both numbers were computed correctly from the same file.
+/// That is not a display bug; it is the page answering a question about the
+/// master while claiming to describe the store.
+///
+/// This type is the store's own spelling, so the axis and the probes are the
+/// same values and a miss means *not held* rather than *not askable*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Series {
+    /// Trading venue.
+    pub exchange: Exchange,
+    /// Exchange segment.
+    pub segment: Segment,
+    /// The symbol, as the store names it — a contract name, not an underlying.
+    pub symbol: Symbol,
+    /// The bar length.
+    pub timeframe: Timeframe,
+}
+
+impl Series {
+    /// This series in one month, as the manifest keys it.
+    #[must_use]
+    pub const fn at(&self, month: YearMonth) -> EntryKey {
+        EntryKey {
+            exchange: self.exchange,
+            segment: self.segment,
+            symbol: self.symbol,
+            timeframe: self.timeframe,
+            month,
+        }
+    }
+
+    /// The series a held key belongs to — the same key with its month dropped.
+    #[must_use]
+    pub const fn of(key: &EntryKey) -> Self {
+        Self {
             exchange: key.exchange,
             segment: key.segment,
-            symbol: key.underlying,
-            timeframe: Timeframe::MINUTE_1,
-            month,
-        }),
-        Kind::Future { .. } | Kind::Option { .. } => None,
+            symbol: key.symbol,
+            timeframe: key.timeframe,
+        }
     }
 }
 
-/// One cell of the coverage grid: an instrument, a month, and each vendor's
-/// row count for it.
+impl std::fmt::Display for Series {
+    /// `NSE-FNO-ABB-III`, which is the store path with the separators changed.
+    ///
+    /// Sorting the text sorts by venue, then segment, then symbol — the order
+    /// [`Ord`] gives the struct, so the grid's rows read in the order they sort.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}-{}-{}",
+            self.exchange.as_str(),
+            self.segment.as_str(),
+            self.symbol
+        )
+    }
+}
+
+/// One cell of the coverage grid: a series, a month, and each vendor's row
+/// count for it.
 #[derive(Debug, Clone)]
 pub struct Coverage {
-    /// The instrument the row is about.
-    pub key: InstrumentKey,
+    /// The series the row is about.
+    pub series: Series,
     /// The month.
     pub month: YearMonth,
     /// One entry per vendor, in [`Vendor::ALL`] order. `None` is "not held".
@@ -383,7 +444,7 @@ impl Coverage {
 /// collection: nothing is built for the rows that are not shown.
 #[must_use]
 pub fn coverage_page(
-    instruments: &[InstrumentKey],
+    series: &[Series],
     censuses: &[VendorCensus],
     today: Day,
     skip: usize,
@@ -391,17 +452,15 @@ pub fn coverage_page(
 ) -> Vec<Coverage> {
     let mut out = Vec::with_capacity(take);
     for ordinal in skip..skip.saturating_add(take) {
-        let Some(key) = instruments.get(ordinal / GRID_MONTHS) else {
+        let Some(row) = series.get(ordinal / GRID_MONTHS) else {
             break;
         };
         let Some(month) = month_back(today, ordinal % GRID_MONTHS) else {
             continue;
         };
-        let Some(entry) = entry_key(key, month) else {
-            continue;
-        };
+        let entry = row.at(month);
         out.push(Coverage {
-            key: *key,
+            series: *row,
             month,
             rows: censuses
                 .iter()
@@ -416,41 +475,72 @@ pub fn coverage_page(
 ///
 /// A multiplication, so the pager knows the last page without building it.
 #[must_use]
-pub fn grid_rows(instruments: usize) -> usize {
-    instruments.saturating_mul(GRID_MONTHS)
+pub fn grid_rows(series: usize) -> usize {
+    series.saturating_mul(GRID_MONTHS)
 }
 
-/// The instruments the coverage grid is built over, in a fixed order.
+/// The grid's instrument axis: **everything the censuses actually hold**, plus
+/// the two series the engine sweeps.
 ///
-/// The index series, which is what the store holds spot bars for. Sorted, so
-/// the grid is byte-identical between reloads — a `HashMap` iteration order is
-/// not, and the ordinal arithmetic above would then address a different row
-/// every time.
+/// # Read from the store, not guessed from the master
+///
+/// This replaces an axis built by filtering the instrument master down to spot
+/// indices and hoping the store had used the same names for them. It had not —
+/// see [`Series`] for the 194 entries that proved it — and a grid whose axis
+/// comes from somewhere other than the thing it describes can be entirely empty
+/// while the thing is entirely full.
+///
+/// The union has two halves and both are needed:
+///
+/// * **Held.** Every key in every vendor's census, month dropped. This is what
+///   makes the grid show the store. A vendor whose manifest is absent or
+///   unreadable contributes nothing and says so elsewhere — [`VendorCensus::note`]
+///   is already loud about it, and inventing rows for it here would be a
+///   different lie from the one just fixed.
+/// * **Swept.** `NSE-INDEX-NIFTY` and `NSE-INDEX-BANKNIFTY`, always. `CLAUDE.md`
+///   §1 fixes the engine surface at exactly these two, so their absence is the
+///   single most important thing this page can report. Before the first ingest
+///   there is nothing held at all, and a blank grid would say nothing where
+///   "two rows, neither held" says what to do next.
+///
+/// # Cost
+///
+/// **O(keys log keys)** — one pass to collect and one sort. Not O(1), and it is
+/// not on a request path: `api::server::Site` computes it once at startup beside
+/// the manifest load that is already O(entries), and every `/store` request is
+/// arithmetic and hash probes off the result. `docs/06-limits.md` §32.
+///
+/// Sorted, because the pager addresses a row by **ordinal** — `HashMap`
+/// iteration order is not stable between runs, so an unsorted axis would put a
+/// different instrument on page 3 every time the process restarted, and two
+/// reloads would disagree about what is held.
 #[must_use]
-pub fn grid_instruments<'a>(keys: impl Iterator<Item = &'a InstrumentKey>) -> Vec<InstrumentKey> {
-    let mut out: Vec<InstrumentKey> = keys
-        .filter(|k| k.segment == Segment::Index && k.kind == Kind::Index)
-        .copied()
-        .collect();
+pub fn held_series(censuses: &[VendorCensus]) -> Vec<Series> {
+    let mut out: Vec<Series> = swept_series();
+    for census in censuses {
+        if let Census::Held { ref manifest } = census.state {
+            out.extend(manifest.held_keys().map(Series::of));
+        }
+    }
     out.sort_unstable();
+    out.dedup();
     out
 }
 
-/// The two instruments the engine sweeps, for a page that has no universe.
+/// The two series the engine sweeps, as the store spells them.
 ///
-/// `CLAUDE.md` §1 fixes the surface at exactly these two. Used when the masters
-/// were never read, so the coverage grid still shows the two rows that matter
-/// rather than nothing at all.
+/// `CLAUDE.md` §1 fixes the surface at exactly these two. They are always on the
+/// axis, held or not, so an empty store still names what it is missing.
 #[must_use]
-pub fn swept_instruments() -> Vec<InstrumentKey> {
+pub fn swept_series() -> Vec<Series> {
     ["BANKNIFTY", "NIFTY"]
         .into_iter()
         .filter_map(|s| Symbol::new(s).ok())
-        .map(|underlying| InstrumentKey {
+        .map(|symbol| Series {
             exchange: Exchange::Nse,
             segment: Segment::Index,
-            underlying,
-            kind: Kind::Index,
+            symbol,
+            timeframe: Timeframe::MINUTE_1,
         })
         .collect()
 }
@@ -470,8 +560,59 @@ mod tests {
         Day::new(y, m, d).expect("a real date")
     }
 
-    fn nifty() -> InstrumentKey {
-        InstrumentKey::index(Exchange::Nse, "NIFTY").expect("valid")
+    /// The spot index series, as the store spells it.
+    fn nifty() -> Series {
+        series(Segment::Index, "NIFTY")
+    }
+
+    /// Any series, so a test can name the store's own vocabulary directly.
+    fn series(segment: Segment, symbol: &str) -> Series {
+        Series {
+            exchange: Exchange::Nse,
+            segment,
+            symbol: Symbol::new(symbol).expect("valid"),
+            timeframe: Timeframe::MINUTE_1,
+        }
+    }
+
+    /// A manifest holding exactly `held`, written under `dir` for `vendor`.
+    fn census_of(dir: &Path, vendor: Vendor, held: &[(Series, YearMonth, u64)]) -> VendorCensus {
+        let mut entries = Vec::new();
+        let mut total = 0;
+        for &(s, month, rows) in held {
+            total += rows;
+            entries.extend_from_slice(
+                &Entry {
+                    key: s.at(month),
+                    rows,
+                    first_ts_micros: 1,
+                    last_ts_micros: 2,
+                }
+                .image(),
+            );
+        }
+        let n = u64::try_from(held.len()).expect("a small fixture");
+        let header = ManifestHeader {
+            // EVEN, because `file` writes the image at byte zero and a commit
+            // lives in slot `generation % 2`. An odd generation here is refused
+            // as "slot 0 holds a commit belonging in 1", which is the manifest
+            // being right about a fixture that was wrong.
+            generation: 2,
+            n_valid: n,
+            n_keys: n,
+            total_rows: total,
+            ..ManifestHeader::genesis(vendor)
+        };
+        write(dir, vendor, &file(&header.image(), &entries));
+        let got = read_vendor(dir, vendor);
+        // A fixture that does not load would otherwise fail whatever assertion
+        // came next, naming the wrong thing.
+        assert!(
+            !matches!(got.state, Census::Unreadable { .. }),
+            "this fixture is not a manifest: {}",
+            got.note()
+        );
+        got
     }
 
     /// A directory to put a manifest in, named after the test.
@@ -515,7 +656,7 @@ mod tests {
             "the path that was looked at is named: {note}"
         );
         // And a probe against an absent census answers "not held", not zero.
-        let key = entry_key(&nifty(), YearMonth::new(2026, 7).expect("valid")).expect("keyable");
+        let key = nifty().at(YearMonth::new(2026, 7).expect("valid"));
         assert_eq!(census.rows_for(&key), None);
     }
 
@@ -681,7 +822,7 @@ mod tests {
     fn a_census_that_holds_a_month_answers_a_probe_in_one_read() {
         let dir = root("held");
         let month = YearMonth::new(2026, 7).expect("valid");
-        let key = entry_key(&nifty(), month).expect("keyable");
+        let key = nifty().at(month);
         let entry = Entry {
             key,
             rows: 8_250,
@@ -705,7 +846,7 @@ mod tests {
         assert_eq!(census.rows_for(&key), Some(8_250));
 
         // A month it does not hold answers "not held" rather than zero.
-        let other = entry_key(&nifty(), YearMonth::new(2026, 6).expect("valid")).expect("keyable");
+        let other = nifty().at(YearMonth::new(2026, 6).expect("valid"));
         assert_eq!(census.rows_for(&other), None);
 
         // And it reaches the grid.
@@ -771,10 +912,10 @@ mod tests {
     fn the_grid_is_addressed_by_arithmetic_and_pages_without_building_the_rest() {
         let dir = root("grid");
         let census = vec![read_vendor(&dir, Vendor::Groww)];
-        let two = swept_instruments();
+        let two = swept_series();
         assert_eq!(two.len(), 2, "the engine surface is exactly two");
-        assert_eq!(two[0].underlying.as_str(), "BANKNIFTY");
-        assert_eq!(two[1].underlying.as_str(), "NIFTY");
+        assert_eq!(two[0].symbol.as_str(), "BANKNIFTY");
+        assert_eq!(two[1].symbol.as_str(), "NIFTY");
         assert_eq!(grid_rows(two.len()), 2 * GRID_MONTHS);
         assert_eq!(grid_rows(0), 0);
 
@@ -783,11 +924,11 @@ mod tests {
         // ordinal: the row at `GRID_MONTHS` is instrument 1, month 0.
         let second = coverage_page(&two, &census, today, GRID_MONTHS, 1);
         assert_eq!(second.len(), 1);
-        assert_eq!(second[0].key, two[1]);
+        assert_eq!(second[0].series, two[1]);
         assert_eq!(second[0].month.to_string(), "2026-08");
         // And the row before it is instrument 0's oldest month.
         let boundary = coverage_page(&two, &census, today, GRID_MONTHS - 1, 1);
-        assert_eq!(boundary[0].key, two[0]);
+        assert_eq!(boundary[0].series, two[0]);
         assert_eq!(boundary[0].month.to_string(), "2023-09");
 
         // Asking past the end of the product yields nothing rather than
@@ -804,56 +945,119 @@ mod tests {
         assert_eq!(early.len(), 2, "only 1970-02 and 1970-01 exist");
     }
 
+    /// **`62,978 ROWS` AND `0 OF 200 HELD`, ON ONE PAGE, BOTH COMPUTED RIGHT.**
+    ///
+    /// This is the shape of the real store, shrunk: every entry an expired
+    /// future in segment `FNO`, under the vendor archive's own contract names.
+    /// The grid used to take its axis from the instrument master, filter it to
+    /// spot indices, and probe `(NSE, INDEX, NIFTY)` — a key nothing had ever
+    /// written. So the counters read the file correctly and the grid probed a
+    /// vocabulary the file does not use, and the page made two contradictory
+    /// claims about one manifest without either half being wrong on its own.
+    ///
+    /// The axis now comes out of the census, so a miss means *not held*.
     #[test]
-    fn the_grid_is_built_over_index_series_only_and_in_a_fixed_order() {
-        let equity = InstrumentKey {
-            exchange: Exchange::Nse,
-            segment: Segment::Cash,
-            underlying: Symbol::new("RELIANCE").expect("valid"),
-            kind: Kind::Equity,
-        };
-        let banknifty = InstrumentKey::index(Exchange::Nse, "BANKNIFTY").expect("valid");
-        // BOTH HALVES OF THE FILTER ARE LOAD-BEARING, and this is the row that
-        // proves it: a key whose segment says index and whose kind says equity
-        // is a malformed identity, and it belongs in the coverage grid no more
-        // than a share does. Without it the `&&` could be an `||` with the
-        // suite green.
-        let mismatched = InstrumentKey {
-            exchange: Exchange::Nse,
-            segment: Segment::Index,
-            underlying: Symbol::new("NIFTY").expect("valid"),
-            kind: Kind::Equity,
-        };
-        let keys = [nifty(), equity, banknifty, mismatched];
-        let grid = grid_instruments(keys.iter());
-        assert_eq!(
-            grid.len(),
-            2,
-            "the equity is not an index series, and neither is a key that \
-             claims to be both: {grid:?}"
-        );
-        assert!(
-            !grid.contains(&mismatched),
-            "an index segment with an equity kind is not an index series"
-        );
-        assert!(!grid.contains(&equity));
-        assert!(grid.windows(2).all(|w| w[0] < w[1]), "sorted: {grid:?}");
-
-        // An option carries an expiry the manifest key does not, so it is not
-        // keyable and the grid never asks for it.
+    fn a_store_of_nothing_but_futures_still_reaches_the_grid() {
+        let dir = root("futures");
         let month = YearMonth::new(2026, 7).expect("valid");
-        assert!(entry_key(&equity, month).is_some(), "an equity is keyable");
-        assert!(entry_key(&nifty(), month).is_some());
-        let opt = InstrumentKey {
-            exchange: Exchange::Nse,
-            segment: Segment::Fno,
-            underlying: Symbol::new("NIFTY").expect("valid"),
-            kind: Kind::Future {
-                expiry: brutex_core::instrument::Expiry::new(2026, 7, 30).expect("valid"),
-            },
-        };
-        assert_eq!(entry_key(&opt, month), None);
-        // And a grid built over one is empty rather than wrong.
-        assert!(coverage_page(&[opt], &[], day(2026, 8, 7), 0, 4).is_empty());
+        let (abb, voltas) = (
+            series(Segment::Fno, "ABB-III"),
+            series(Segment::Fno, "VOLTAS-III"),
+        );
+        let census = census_of(
+            &dir,
+            Vendor::Dhan,
+            &[(abb, month, 20_000), (voltas, month, 42_978)],
+        );
+        assert_eq!(
+            census.counters(),
+            Some((2, 62_978, 2)),
+            "the counters were never the broken half"
+        );
+
+        let axis = held_series(std::slice::from_ref(&census));
+        assert!(
+            axis.contains(&abb),
+            "a held future must be on the axis: {axis:?}"
+        );
+        assert!(axis.contains(&voltas));
+        // And the two swept series are still named, held or not, so a fresh
+        // install says what it is missing rather than showing nothing.
+        assert!(axis.contains(&nifty()));
+        assert!(axis.contains(&series(Segment::Index, "BANKNIFTY")));
+        assert_eq!(axis.len(), 4);
+        assert!(axis.windows(2).all(|w| w[0] < w[1]), "sorted: {axis:?}");
+
+        // THE CONTRADICTION, ASSERTED AWAY. Rows held and cells held must agree
+        // about whether this store has anything in it.
+        let grid = coverage_page(
+            &axis,
+            std::slice::from_ref(&census),
+            day(2026, 7, 15),
+            0,
+            200,
+        );
+        let filled = grid.iter().filter(|c| c.is_held()).count();
+        assert_eq!(
+            filled,
+            2,
+            "the manifest holds 62,978 rows; a grid showing 0 of {} is the \
+             defect this test exists for",
+            grid.len()
+        );
+        let (_, rows, _) = census.counters().expect("held");
+        assert!(
+            rows == 0 || filled > 0,
+            "rows held and cells held cannot disagree about an empty store"
+        );
+
+        // The row reads as the store spells it, not as a master would.
+        let held: Vec<String> = grid
+            .iter()
+            .filter(|c| c.is_held())
+            .map(|c| c.series.to_string())
+            .collect();
+        assert_eq!(held, ["NSE-FNO-ABB-III", "NSE-FNO-VOLTAS-III"]);
+    }
+
+    /// A census that never loaded contributes no rows and invents none.
+    ///
+    /// The swept pair still appears, because their absence is the one thing this
+    /// page most needs to say — and `VendorCensus::note` is separately loud about
+    /// why the vendor is missing.
+    #[test]
+    fn an_unloadable_census_adds_nothing_to_the_axis() {
+        let dir = root("axisabsent");
+        let absent = read_vendor(&dir, Vendor::Groww);
+        assert_eq!(absent.state.name(), "absent");
+        assert_eq!(held_series(&[absent]), swept_series());
+        assert_eq!(held_series(&[]), swept_series(), "and no census at all");
+        // Two vendors holding the same series contribute one row, not two.
+        let month = YearMonth::new(2026, 7).expect("valid");
+        let shared = series(Segment::Fno, "ABB-III");
+        let a = census_of(&root("axisa"), Vendor::Groww, &[(shared, month, 5)]);
+        let b = census_of(&root("axisb"), Vendor::Dhan, &[(shared, month, 7)]);
+        let axis = held_series(&[a, b]);
+        assert_eq!(axis.iter().filter(|s| **s == shared).count(), 1);
+        assert_eq!(axis.len(), 3, "the shared series plus the swept pair");
+    }
+
+    /// A series renders as the store path with its separators changed, and the
+    /// text sorts the way the struct does.
+    #[test]
+    fn a_series_reads_back_as_the_store_names_it() {
+        assert_eq!(nifty().to_string(), "NSE-INDEX-NIFTY");
+        assert_eq!(
+            series(Segment::Fno, "ABB-III").to_string(),
+            "NSE-FNO-ABB-III"
+        );
+        assert_eq!(
+            series(Segment::Cash, "RELIANCE").to_string(),
+            "NSE-CASH-RELIANCE"
+        );
+        // `of` and `at` are inverses, which is what lets the axis and the probe
+        // be the same values.
+        let month = YearMonth::new(2026, 7).expect("valid");
+        assert_eq!(Series::of(&nifty().at(month)), nifty());
     }
 }
