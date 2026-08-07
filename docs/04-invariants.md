@@ -19,6 +19,13 @@ cell that the name is a plan rather than a proof. The names are deliberately
 **left in the backticks** so CI gate 10 goes on reporting them by name every
 run; removing the token would make the gate green by blinding it.
 
+**Six of the ten rows gate 10 reported now name a test that runs. Four still do
+not, and the gate is still red on exactly those four.** What changed and what
+did not is in *The ten phantom rows, one at a time* near the end of this file.
+The four that remain — P-03, X-01, X-02, X-13 — kept their phantom names for the
+reason the paragraph above gives, and a red gate whose four lines a reader can
+name is worth more than a green one bought by deleting them.
+
 **X-07 and X-08 were narrowed by D-0036, not weakened.** X-07 sat at `—`, which
 this legend defines as "the crate does not exist" — untrue once `crates/pull`
 existed, and `CLAUDE.md` §9's mutation bullet had simply not been run. It is now
@@ -37,15 +44,15 @@ the crate where the gap matters, and `docs/06-limits.md` §18 records the rest.
 | # | Must hold | Proven by | |
 |---|---|---|---|
 | S-01 | `size_of::<Bar>() == 56` and `align_of::<Bar>() == 8` | `const _: () = assert!(…)` — a compile error, not a test | — |
-| S-02 | `read(i)` returns the bytes `write(i, b)` wrote, for every *i* | **NOT PROVEN.** `store::proptest::roundtrip` exists in no file, and no `proptest` dependency exists in this workspace. What *is* proven is the record codec, not the file: S-18 asserts `decode(image(r)) == r` over 4,276 records. The gap is the disk round trip | ✗ |
+| S-02 | `read(i)` returns the bytes `write(i, b)` wrote, for every *i* | `store::roundtrip::every_committed_index_returns_the_record_that_was_written` · `store::roundtrip::the_open_interest_sentinel_survives_the_disk_and_is_not_a_zero` — **every** index of a 160-record file, across three appends, two block boundaries and a close-and-reopen, asserted twice at each index: the record `read_record` returns, and the 56 raw bytes the file holds at `Layout::offset_of(i)`. The second is the half a codec test cannot make. This row named a `proptest` module for which this workspace has no dependency; S-18's `decode(image(r)) == r` over 4,276 records is still the codec's proof and was never the file's | ✓ |
 | S-03 | A reader never observes a record beyond `n_valid` | `store::fault::commit_counter_publishes_last` — the module was written `store::loom::`, and there is **no `loom` module and no `loom` dependency**; the test is a plain `#[test]` walking all 65 commit prefixes | ✓ |
 | S-04 | A crash between data write and counter publish loses the tail and corrupts nothing | `store::fault::kill_between_write_and_commit` | — |
-| S-05 | A full disk during append returns `Err`, never a signal | **NOT PROVEN.** `store::fault::enospc_returns_error` exists in no file. `crates/store/tests/fault.rs` is tracked and holds 18 tests; this is not one of them. No test in this repository fills a filesystem | ✗ |
+| S-05 | A full disk during append returns `Err`, never a signal | **PROVEN AT THE CLASSIFIER, NOT AT THE KERNEL.** `store::file::a_full_disk_mid_write_is_returned_and_never_signalled` · `store::file::every_classified_kind_gets_its_own_name` — a scripted host returns `ErrorKind::StorageFull` part way through a write and the loop hands back `StoreError::DiskFull` as a **value**, which is the whole argument for banning a writable mapping. That loop is the only write path `append` has. **UNVERIFIED: that a real full disk produces that kind on this store's write.** No test in this repository fills a filesystem, and `crates/store/tests/write.rs` names this and the read-only mount as the two conditions it will not fake. The row named a `fault` module test that exists in no file | ◐ |
 | S-06 | A flipped bit in any block is detected on the next read of that block | `store::fault::bitflip_detected` | — |
 | S-07 | A file whose length does not divide by the stride truncates to the last whole record and logs | `store::fault::ragged_tail_truncates_loudly` | — |
 | S-08 | `i64::MIN` in `open_interest` is never confused with `0`, and round-trips as null through the record image | `store::unit::oi_sentinel_distinct` — the module was written `store::proptest::`, and **no `proptest` dependency exists**; it is a plain `#[test]`, and it proves the *distinctness* half only. The *round-trip* half is `store::unit::decoding_the_image_returns_the_record_byte_for_byte` (S-18), which walks `i64::MIN` in every field | ✓ |
 | S-09 | Opening a file with an unknown `format_version` refuses; it never guesses | `store::unit::unknown_version_refuses` | — |
-| S-10 | Two concurrent writers on one file are refused by the advisory lock | **NOT PROVEN.** `store::integration::second_writer_refused` exists in no file, and `crates/store/tests/integration.rs` does not exist either. No advisory lock is exercised anywhere in this repository | ✗ |
+| S-10 | Two concurrent writers on one file are refused by the advisory lock | `store::write::a_second_writer_is_refused_while_the_month_is_held` — the test **exists and passes**, and this row named an `integration` module that does not exist while claiming no lock was exercised anywhere. A second `BarFile` on a held month is `StoreError::Locked` naming the lock file, the month opens again once the first is dropped, and the lock file is not deleted. Two open descriptions in **one process**; a second *process* is exercised nowhere here, and `crates/store/src/file.rs` lists what an advisory lock does not protect against | ✓ |
 | S-11 | The checksum reproduces a hardcoded value at every length a wide kernel can break on — 0, 1, 8, 15, 16, 56, 60, 64, 4087, 4088, 4089 bytes, and the all-zero and all-ones block | `store::unit::the_crc_reproduces_a_hardcoded_value_at_every_length_that_can_break` | ✓ |
 | S-12 | The shipped checksum kernel agrees with an independent bit-by-bit reference at every length across a stride boundary, on every target | `store::unit::the_fast_kernel_agrees_with_a_bit_by_bit_reference_on_every_length` | ✓ |
 | S-13 | The header slot's covered domain is exactly bytes `0..56 ‖ 60..64`; filling the four-byte hole is a different number and is refused as such | `store::unit::the_covered_domain_is_the_slot_minus_its_checksum` | ✓ |
@@ -154,10 +161,20 @@ measured is the map the claim is about, and
 the reservation comes from as a number.
 
 C-01 was previously stated as "bar read cost is flat from 1× to 100× file size"
-and proven by `store::bench::read_ratio`, which did not exist — there is no bar
-reader in `crates/store` yet. D-0034 restated it as the flatness that **is**
-measurable today and named a bench that runs. The bar-read row returns when the
-reader does.
+and proven by `store::bench::read_ratio`, which did not exist — there was no bar
+reader in `crates/store` then. D-0034 restated it as the flatness that **is**
+measurable today and named a bench that runs.
+
+**The reader has since shipped and this paragraph's last sentence has not.**
+`BarFile::read_record` is one multiply, one add and one 56-byte positional read,
+and S-02 walks it at every index of a 160-record file. C-01 still names the
+header read rather than the bar read, and deliberately: **no bench in this
+repository times a syscall.** `crates/store/benches/ratio.rs` measures the
+arithmetic and the checksum, which is what `crates/store/src/file.rs` says in as
+many words beside `read_record` — the operation is constant and the device
+latency underneath it is UNVERIFIED. A bar-read ratio row that timed a `pread`
+would be measuring the operator's disk, so the row returns when there is a bench
+that separates the two, not merely when the reader exists.
 
 **Ceiling.** A ratio is a failure above **1.4×** on dedicated hardware,
 **3.0×** on shared CI. The gap is measurement noise on shared vCPU, not a
@@ -174,10 +191,10 @@ directory, found none, and exited zero — see `docs/06-limits.md` §7b and §7c
 
 | # | Must hold | Proven by | |
 |---|---|---|---|
-| P-01 | A rate governor never issues above the configured ceiling, under any concurrency | **NOT PROVEN.** `pull::loom::governor_ceiling` exists in no file, and **`loom` appears in no `Cargo.toml` in this repository** — there is no concurrency checker here to run it. The single-caller arithmetic *is* proven, by P-20 through P-35. The words that stay unproven are *under any concurrency* | ✗ |
-| P-02 | A bar outside the requested window is never stored | **NOT PROVEN as written.** `pull::unit::window_boundary` exists in no file. The *window arithmetic* is proven — `pull::unit::a_window_is_inclusive_at_both_ends_and_refuses_to_run_backwards`, `pull::unit::every_second_of_a_day_falls_on_exactly_one_side_of_the_session`, `pull::unit::an_inclusive_window_survives_the_vendors_exclusive_to_date`. The words that stay unproven are **"never stored"**: no path in this repository writes a pulled bar to `crates/store` yet | ✗ |
-| P-03 | A bar on a non-trading date is dropped and counted | **NOT PROVEN, and the code says so first.** `pull::unit::calendar_filter` exists in no file, and `crates/pull/src/session.rs` states plainly that there is **no trading calendar and no holiday list** here — so there is nothing yet to prove. A weekend rule without a holiday list would be wrong, which is why `pull::unit::a_saturday_is_a_full_session_because_there_is_no_weekend_rule` asserts the *absence* as the current behaviour | ✗ |
-| P-04 | Re-running an ingest stores nothing new and reports zero net-new | **NOT PROVEN.** `pull::integration::idempotent_repull` exists in no file, and `crates/pull/tests/integration.rs` does not exist. Nothing stores a bar yet, so there is no re-run to be idempotent | ✗ |
+| P-01 | A rate governor never issues above the configured ceiling, under any concurrency | `pull::concurrency::the_ceiling_holds_however_many_threads_share_the_governor` · `pull::concurrency::a_throttle_recorded_by_one_thread_binds_every_other` — 512 requests from eight real threads at one fixed instant are issued exactly the allowance between them, three times over, and a throttle one caller records binds the rest. `Governor::admit` takes `&mut self`, the type holds no interior mutability and the crate is `#![forbid(unsafe_code)]`, so exclusive access is the **only** sharing safe Rust admits and no two `admit` calls can interleave — which is why the `loom` module this row named is not merely absent but would have nothing to enumerate. **What is not bounded: two separate `Governor` values.** The type is `Copy`; nothing here or in the crate holds the sum of two of them to one ceiling | ◐ |
+| P-02 | A bar outside the requested window is never stored | `pull::integration::a_bar_outside_the_window_or_the_session_is_never_stored` · `pull::integration::a_narrower_window_stores_strictly_fewer_bars_and_says_why` — **"never stored" is now checkable**, because `pull::ingest::from_dir` takes a vendor's folder all the way to an append. Both tests reopen the month afterwards and read **every** committed record back, asserting each one is inside the operator's window and inside the exchange's session, from a fixture carrying a row on each side of every boundary — 15:29:59 in, 15:30:00 out. The narrower window stores strictly fewer bars off the same bytes, so the filter is keyed on the request rather than on the file. The window *arithmetic* remains `pull::unit::a_window_is_inclusive_at_both_ends_and_refuses_to_run_backwards`, `pull::unit::every_second_of_a_day_falls_on_exactly_one_side_of_the_session` and `pull::unit::an_inclusive_window_survives_the_vendors_exclusive_to_date`. One member, one month, one instrument | ✓ |
+| P-03 | A bar on a non-trading date is dropped and counted | **NOT PROVEN, and the code says so first.** `pull::unit::calendar_filter` exists in no file, and `crates/pull/src/session.rs` states plainly that there is **no trading calendar and no holiday list** here — so there is nothing yet to prove. A weekend rule without a holiday list would be wrong, which is why `pull::unit::a_saturday_is_a_full_session_because_there_is_no_weekend_rule` asserts the *absence* as the current behaviour. **The name stays in the backticks and CI gate 10 goes on reporting it by name every run.** That is the intent, not an oversight: this row is one of the four the gate is deliberately red on | ✗ |
+| P-04 | Re-running an ingest stores nothing new and reports zero net-new | **THE DISK HALF HOLDS. THE REPORTING HALF DOES NOT, AND THE TEST PINS THAT RATHER THAN HIDING IT.** `pull::integration::idempotent_repull_leaves_the_file_byte_identical` · `pull::integration::a_second_window_over_the_same_month_appends_rather_than_rewrites` — a second run over the same folder and window leaves the bar file **byte for byte** what it was, and a run that brings bars the file does not hold still appends them, so idempotence is not bought by refusing every second run. What is **false today** is "reports zero net-new": `Ingested::bars_stored` counts the bars a member *offered*, `BarFile::append`'s already-present answer never reaches it, and the re-run therefore reports 3 stored where it wrote 0. The test asserts that 3. Fixing it is a `crates/pull/src/ingest.rs` change this row does not own | ◐ |
 | P-05 | A credential is read, never written; no token is ever minted | `pull::unit::readonly_credentials` (a write attempt must panic the test double) | ✓ |
 | P-06 | An auth failure halts the pull loudly rather than degrading | `pull::unit::auth_halt` | ✓ |
 | P-07 | A missing, unreadable, or incomplete credential configuration halts the pull and names the absent segment; it never defaults | `pull::unit::credential_config_absent_halts` · `pull::unit::a_missing_table_or_key_is_a_halt` | ✓ |
@@ -193,6 +210,17 @@ means *the crate does not exist*. `crates/pull` is tracked and compiled.
 Corrected to `✗` by D-0045, each row saying which half is proven and which half
 is not. Only the calendar filter is still genuinely absent from the code, and
 `crates/pull/src/session.rs` is where that is decided and said.
+
+**Three of those four rows have since been given tests, and the fourth has not.**
+`crates/pull/src/ingest.rs` shipped the join — a vendor's folder to
+`BarFile::append` — which is what made "stored" a checkable word for the first
+time, so P-02 and P-04 are now driven end to end by
+`crates/pull/tests/integration.rs`, and P-01 by
+`crates/pull/tests/concurrency.rs`. **P-03 is unchanged and stays `✗`**: there
+is still no trading calendar, and `crates/pull/src/session.rs` and
+`crates/pull/src/lib.rs` both still say P-03 keeps its `—` where the table has
+said `✗` since D-0045. Those two headers are stale on the glyph and right on the
+substance; they are not this change's files to edit.
 
 | # | Must hold | Proven by | |
 |---|---|---|---|
@@ -223,11 +251,16 @@ those tests sleeps or reads a clock** — `pull::rate::Governor::admit` takes th
 instant as an argument, so every boundary below is asserted at the exact
 microsecond rather than near it.
 
-`P-01` keeps its `—`, narrowed rather than satisfied. It claims the ceiling
-holds *under any concurrency*; `Governor` takes `&mut self` and has no interior
-mutability, so it cannot be shared across tasks without a lock that this crate
-does not supply, and the loom test named beside it does not exist. What is
-proven here is the single-caller arithmetic.
+**That paragraph read "`P-01` keeps its `—`, narrowed rather than satisfied",
+and the glyph was wrong twice over** — D-0045 moved it to `✗`, and it is now
+`◐`. The reasoning it gave is still the right reasoning and is now the
+*argument* rather than the excuse: `Governor` takes `&mut self` and has no
+interior mutability, so it cannot be shared across tasks without a lock this
+crate does not supply — and that is exactly why an interleaving checker has
+nothing to enumerate here. `crates/pull/tests/concurrency.rs` supplies the lock
+in the test, races eight threads through it, and asserts the pool is held to the
+allowance one caller would have had. The single-caller arithmetic below is
+unchanged and is still where every boundary is asserted at the microsecond.
 
 | # | Must hold | Proven by | |
 |---|---|---|---|
@@ -390,8 +423,8 @@ Added by D-0038. Every row here is proven by a test that runs today.
 
 | # | Must hold | Proven by | |
 |---|---|---|---|
-| X-01 | Run identity changes if any loaded bar differs by one field | **NOT PROVEN.** `core::proptest::identity_sensitivity` exists in no file; no `proptest` dependency exists. There is also no run-identity function yet — `blake3` appears in no manifest — so this row has neither the test nor the code | ✗ |
-| X-02 | Prices never touch a float on any path from wire to store to result | **PARTLY PROVEN, and the row overstated both halves.** `core::lint::no_float_in_price` exists in no file, so the *source check* does not exist. The *lint* is `float_arithmetic`, and in `Cargo.toml` it is `"warn"`, **not** `"deny"` — it fails a build only because CI passes `-D warnings`, and it fires on float *arithmetic*, never on a float *type* held in a price. What is genuinely proven is X-11: `Price` has a private field, so the one checked conversion is the only constructor | ✗ |
+| X-01 | Run identity changes if any loaded bar differs by one field | **NOT PROVEN, AND THERE IS NOTHING TO PROVE IT AGAINST.** `core::proptest::identity_sensitivity` exists in no file; no `proptest` dependency exists. There is no run-identity function either: `blake3` sits in the workspace dependency table and **no member takes it**, and no crate holds a function that hashes `CLAUDE.md` §3 rule 3's eight inputs. So this row has neither the test nor the code, and the name stays in the backticks — gate 10 is deliberately red on it | ✗ |
+| X-02 | Prices never touch a float on any path from wire to store to result | **PARTLY PROVEN, and the row overstated both halves.** `core::lint::no_float_in_price` exists in no file, so the *source check* does not exist. The *lint* is `float_arithmetic`, and in `Cargo.toml` it is `"warn"`, **not** `"deny"` — it fails a build only because CI passes `-D warnings`, and it fires on float *arithmetic*, never on a float *type* held in a price. What is genuinely proven is X-11: `Price` has a private field, so the one checked conversion is the only constructor. **No test was written for this row and none is claimed.** A source scan is CI gate 11's mechanism, not a test's, and a Rust test that grepped the tree would assert a spelling rather than the property; the name stays in the backticks and gate 10 is deliberately red on it | ✗ |
 | X-03 | Every tracked file has an allowed extension | CI gate 1 | ✓ |
 | X-04 | No build script invokes an external process | CI gate 2 | ✓ |
 | X-05 | `web` depends on `core` alone | CI gate 7 | ✓ |
@@ -401,9 +434,9 @@ Added by D-0038. Every row here is proven by a test that runs today.
 | X-08 | No tracked file contains a **slash-joined** credential path whose environment segment is a well-known one | CI gate 1c | ✓ |
 | X-08b | No literal under `crates/pull` that could be a path segment is undeclared | CI gate 1d | ✓ |
 | X-09 | `core` declares no dependency at all | CI gate 9 | ✓ |
-| X-10 | Every reachable row in this file names a test that exists | CI gate 10 | ✓ |
+| X-10 | Every reachable row in this file names a test that exists | **THE GATE EXITS 1 ON THIS TREE, AND THIS ROW SAID `✓` WHILE IT DID.** Measured by running gate 10's own script at this commit: 293 rows read, 294 named tests checked against a tracked crate, 17 skipped for a crate that is not a workspace member, **4 missing** — P-03, X-01, X-02, X-13. It read **10 missing** before this pass. The four are `✗` in their own rows, each saying what is absent, and CI gate 10 goes on naming them every run. This row is `✗` and not `◐` on the same argument X-06 makes: a tick beside a red gate is the defect, whatever the reason for the red | ✗ |
 | X-12 | Each vendor writes only under its own path prefix; no vendor can overwrite another | `store::unit::vendor_prefix_isolated` — the test **exists and passes**, and this row wore `—` anyway. It proves the claim *lexically*: the first segment is a `Vendor` rather than a string, and no segment can hold a separator. It does not touch a filesystem | ✓ |
-| X-13 | A bar-for-bar mismatch between two vendors refuses the window and names the timestamp | **NOT PROVEN.** `store::unit::vendor_disagreement_refuses` exists in no file. Nothing in this repository compares two vendors' bars against each other; `crates/store` has no bar reader yet (see C-01), so there is nothing to compare | ✗ |
+| X-13 | A bar-for-bar mismatch between two vendors refuses the window and names the timestamp | **NOT PROVEN, AND THE REASON HAS CHANGED.** `store::unit::vendor_disagreement_refuses` exists in no file. `crates/store` **does** have a bar reader now — `BarFile::read_record`, walked at every index by S-02 — so the missing piece is no longer the reader. What is missing is the comparison: nothing in this repository opens two vendors' months and matches them bar for bar, so there is no code for a test to drive. The name stays in the backticks and gate 10 is deliberately red on it | ✗ |
 | X-11 | A price is constructible from a float only through the one checked conversion | `core::price::refuses_an_out_of_range_price_instead_of_saturating` (private field; no other path exists) | ✓ |
 
 ### X-06, measured rather than asserted — D-0045
@@ -498,6 +531,15 @@ adding either tool is a workspace-manifest change nobody has made or decided on.
 Those four rows are naming an implementation that would have to be chosen first.
 No row here now claims a property-based or a concurrency proof that has ever run.
 
+**Two of those nine have since moved, and the tool count did not change.**
+`loom` and `proptest` are still in **no** `Cargo.toml` in this workspace, and
+neither was added to satisfy a row — re-checked with the same command. S-02 is
+now proven by `store::roundtrip::…`, ordinary `#[test]`s that walk *every* index
+rather than sampling random ones, and P-01 by `pull::concurrency::…`, ordinary
+`#[test]`s with real threads. X-01 is unchanged and still `✗`. A property-based
+proof and an interleaving proof remain things this repository has never run, and
+no row claims either.
+
 ### Why gate 10 could not see any of this — D-0045
 
 Gate 10's own comment says it: *"The module segment. `store::unit::x` and
@@ -507,6 +549,64 @@ at modules that do not exist, and the ten genuinely-absent tests were caught
 only when the gate stopped honouring the `—` glyph as a skip. A row can still
 name the wrong module and stay green. That gap is now recorded rather than
 rediscovered.
+
+### The ten phantom rows, one at a time
+
+*Written as bullets, not a table, for the reason the section above gives: a
+`| id |` line here would be read by CI gate 10 as a real invariant row.*
+
+**No decision id is claimed for this pass.** `docs/05-decisions.md` ends at
+D-0045 and is not this change's file; the ledger entry it owes is named at the
+foot of this section.
+
+Two of the ten were **already proven and pointing at the wrong name** — the
+worst of the three cases, because such a row reads as a gap when the property
+holds, and the next person writes the test twice:
+
+- **S-10** named `store::integration::second_writer_refused` and said "no
+  advisory lock is exercised anywhere in this repository".
+  `store::write::a_second_writer_is_refused_while_the_month_is_held` had been
+  exercising one, and passing. Row corrected; nothing was written.
+- **S-05** named `store::fault::enospc_returns_error`.
+  `store::file::a_full_disk_mid_write_is_returned_and_never_signalled` proves
+  the classifier and the write loop against a scripted host. Row corrected to
+  `◐`, because the kernel half is not proven and cannot be here.
+
+Four had **no test and all four turned out to be writable** — three test files,
+eight tests, and not one new dependency. Two of them were writable only because
+code landed after the row was last read: `crates/store/src/file.rs` gave the
+crate a bar file at all, and `crates/pull/src/ingest.rs` gave this repository
+its first path from a vendor's folder to a stored bar:
+
+- **S-02** — `crates/store/tests/roundtrip.rs`. Every index of a 160-record
+  file, the decoded record and the raw bytes at its computed offset, across
+  three appends and a reopen.
+- **P-01** — `crates/pull/tests/concurrency.rs`. Eight threads, one fixed
+  instant, exactly the allowance issued between them. `◐`: two separate
+  governors are two budgets and nothing bounds their sum.
+- **P-02**, **P-04** — `crates/pull/tests/integration.rs`. A vendor's folder
+  through `pull::ingest::from_dir` to a file, then the file reopened and every
+  record read back. P-04 is `◐` and the reason is a finding rather than a
+  caveat: the re-run **writes** nothing and **reports** three.
+
+Four could not be proven and were **not** faked. Each keeps its name, its `✗`
+and its own account of what is missing:
+
+- **P-03** — there is no trading calendar and `docs/00-charter.md` records no
+  holiday list. A weekend rule would be wrong, which is a stronger reason than
+  "not yet".
+- **X-01** — no run-identity function exists in any crate; `blake3` is in the
+  workspace table and no member takes it.
+- **X-02** — the source check named is CI gate 11's job, not a test's. Writing
+  a Rust test that greps the tree would assert a spelling.
+- **X-13** — the bar reader arrived; the two-vendor comparison did not.
+
+**CI gate 10 therefore still exits 1, on four lines, by choice.** The one lever
+that would silence them is the `allow_pending` allowlist in
+`.github/workflows/ci.yml`, which is deliberately empty and is not this change's
+file. Using it would be a decision to stop reporting four known gaps, and that
+is a `docs/05-decisions.md` entry somebody has to sign — which is the ledger
+entry this pass owes, alongside the three new test files.
 
 ---
 

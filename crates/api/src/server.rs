@@ -943,12 +943,103 @@ fn spot_answer(body: &str, today: Day, site: &Site) -> (axum::http::StatusCode, 
                 ),
             ];
             facts.extend(window_facts(asked.window));
-            (
-                axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                accepted_html("Spot pull", facts),
-            )
+
+            // THE LOCAL-ARCHIVE PATH. Half the vendors are not APIs: TrueData
+            // and GDFL sell folders of CSVs, so a pull from one needs no
+            // socket, no token and no rate governor. That half works today and
+            // this is where it runs.
+            //
+            // The field is optional and absent means the HTTP path, which does
+            // not exist yet — so an operator who leaves it blank gets the same
+            // loud 503 as before rather than a silent nothing.
+            let folder = param(body, "folder");
+            if folder.is_empty() {
+                return (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    accepted_html("Spot pull", facts),
+                );
+            }
+            match run_local(&folder, asked.window) {
+                Ok(done) => {
+                    facts.push(("Source", format!("local folder · {folder}")));
+                    facts.push(("Members read", done.members.to_string()));
+                    facts.push(("Rows read", done.rows_read.to_string()));
+                    facts.push(("Bars stored", done.bars_stored.to_string()));
+                    facts.push(("Bars dropped", done.census.total().to_string()));
+                    facts.push(("Members failed", done.failures.len().to_string()));
+                    // EVERY ROW ACCOUNTED FOR, or say so. A row that vanished
+                    // without landing in one of the three is indistinguishable
+                    // from a row the vendor never sent.
+                    facts.push((
+                        "Balances",
+                        if done.balances() {
+                            "yes — rows in equals bars out plus drops".to_owned()
+                        } else {
+                            format!(
+                                "NO — {} rows read, {} stored, {} dropped, {} members failed",
+                                done.rows_read,
+                                done.bars_stored,
+                                done.census.total(),
+                                done.failures.len()
+                            )
+                        },
+                    ));
+                    for f in done.failures.iter().take(5) {
+                        facts.push(("Failed", format!("{} — {}", f.instrument, f.why)));
+                    }
+                    (
+                        axum::http::StatusCode::OK,
+                        accepted_html("Spot pull", facts),
+                    )
+                }
+                Err(why) => {
+                    facts.push(("Source", format!("local folder · {folder}")));
+                    facts.push(("Refused", why));
+                    (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        accepted_html("Spot pull", facts),
+                    )
+                }
+            }
         }
     }
+}
+
+/// Ingests one local vendor folder into the store.
+///
+/// Split out so the handler stays a handler. Every knob comes from
+/// `pull::vendor` rather than being decided here — the column layout, the
+/// timestamp encoding and the price scale are descriptor fields, so adding a
+/// feed is a row in that table and not an edit in this function.
+fn run_local(
+    folder: &str,
+    window: pull::session::Window,
+) -> Result<pull::ingest::Ingested, String> {
+    let request = pull::fetch::BarRequest {
+        window,
+        cadence: pull::session::Cadence::Minute,
+    };
+    let plan = pull::ingest::Plan {
+        columns: pull::csv::Columns::Gdfl,
+        request: &request,
+        encoding: pull::vendor::TimestampEncoding::EpochSecondsUtc,
+        scale: pull::vendor::PriceScale::Paisa,
+        timeframe: store::path::Timeframe::MINUTE_1,
+        vendor: brutex_core::vendor::Vendor::Dhan,
+        exchange: "NSE",
+        segment: "FUT",
+    };
+    pull::ingest::from_dir(std::path::Path::new(folder), &default_store_dir(), plan)
+        .map_err(|why| why.to_string())
+}
+
+/// Where bars are written when nothing says otherwise.
+fn default_store_dir() -> std::path::PathBuf {
+    std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default()
+        .join(".brutex")
+        .join("store")
 }
 
 /// Starting a spot pull. **POST only.**
@@ -1966,8 +2057,19 @@ mod tests {
         assert!(ingest_page.contains("action=\"/pull/spot\""));
         assert!(ingest_page.contains("action=\"/pull/fno\""));
         let store_page = get(addr, "/store").await;
-        assert!(store_page.contains("200 OK"), "{store_page}");
-        assert!(!store_page.contains("500"), "{store_page}");
+        // THE STATUS LINE, NOT THE WHOLE RESPONSE. `contains("500")` over the
+        // body matched the scratch directory's name, which carries this
+        // process's id — so the assertion failed whenever that id happened to
+        // hold those three digits, and passed the rest of the time. A test
+        // that depends on a process id is a test that fails at random and
+        // teaches everyone to rerun rather than to read.
+        let status = store_page.lines().next().unwrap_or_default();
+        assert!(status.contains("200 OK"), "{store_page}");
+        assert!(
+            !status.contains("500"),
+            "an absent manifest is the ordinary state before the first ingest \
+             and must never be a 500: {store_page}"
+        );
         assert!(store_page.contains("UNAVAILABLE"), "{store_page}");
 
         // A GET ON A POST ROUTE STARTS NOTHING. A crawler follows links and a
@@ -2896,5 +2998,204 @@ mod tests {
         assert_ne!(DEGRADED, OK, "a refused universe is not a success");
         assert_ne!(DEGRADED, FAILED, "the run worked; its ANSWER is refused");
         assert_ne!(DEGRADED, MISUSED);
+    }
+
+    // =======================================================================
+    // The local-archive pull, which is the half of the vendor surface that
+    // works today
+    // =======================================================================
+
+    /// GDFL's header, character for character, and the shape `run_local`
+    /// declares: ten fields, a header row, `DD/MM/YYYY`.
+    const GDFL_MEMBER_HEAD: &str =
+        "Ticker,Date,Time,LTP,BuyPrice,BuyQty,SellPrice,SellQty,LTQ,OpenInterest\n";
+
+    /// A folder holding one GDFL member, named after the test.
+    fn vendor_folder(name: &str, body: &str) -> PathBuf {
+        let dir = crate::scratch::path(&format!("vendor-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let mut f = std::fs::File::create(dir.join("NIFTY.NFO.csv")).expect("create");
+        f.write_all(body.as_bytes()).expect("write");
+        dir
+    }
+
+    /// A spot form body over one local folder.
+    fn spot_form(folder: &Path, from: &str, to: &str) -> String {
+        format!(
+            "target=swept&from={from}&to={to}&folder={}",
+            folder.display()
+        )
+    }
+
+    /// A folder that is not there refuses the pull and names the folder.
+    ///
+    /// NOTHING IS WRITTEN TO THE STORE by any test in this section, and that is
+    /// arranged rather than hoped: `pull::ingest` opens a bar file only after a
+    /// member has produced at least one surviving bar, so a run whose members
+    /// all drop or all fail never reaches the store root at all. A test that
+    /// wrote into the operator's real `$HOME/.brutex/store` would be a test
+    /// with a side effect nobody asked for.
+    #[test]
+    fn a_local_folder_that_is_not_there_refuses_the_pull_and_names_it() {
+        let dir = agreeing("localabsent");
+        let site = site("localabsent", &dir);
+        let absent = crate::scratch::path("vendor-localabsent-NOT-THERE");
+        let _ = std::fs::remove_dir_all(&absent);
+
+        let (code, html) = spot_answer(
+            &spot_form(&absent, "2022-01-08", "2022-01-08"),
+            day(2026, 8, 7),
+            &site,
+        );
+        assert_eq!(
+            code,
+            axum::http::StatusCode::BAD_REQUEST,
+            "a folder that is not there is the operator's mistake, not the \
+             server's — {html}"
+        );
+        assert!(html.contains("Refused"), "the receipt says so: {html}");
+        assert!(
+            html.contains(&absent.display().to_string()),
+            "and names the folder it looked in: {html}"
+        );
+        assert!(
+            html.contains("local folder"),
+            "and which transport was used: {html}"
+        );
+    }
+
+    /// A folder whose every row falls outside the window stores nothing, says
+    /// nothing was stored, and reports that the run **balances**.
+    #[test]
+    fn a_local_pull_that_stores_nothing_still_accounts_for_every_row() {
+        let dir = agreeing("localdropped");
+        let site = site("localdropped", &dir);
+        // February rows against a January window: both are declined, neither
+        // is a failure, and no bar file is ever opened.
+        let folder = vendor_folder(
+            "localdropped",
+            &format!(
+                "{GDFL_MEMBER_HEAD}\
+                 NIFTY,08/02/2022,10:00:00,100.00,0,0,0,0,0,0\n\
+                 NIFTY,08/02/2022,10:00:01,100.50,0,0,0,0,0,0\n"
+            ),
+        );
+
+        let (code, html) = spot_answer(
+            &spot_form(&folder, "2022-01-08", "2022-01-08"),
+            day(2026, 8, 7),
+            &site,
+        );
+        assert_eq!(code, axum::http::StatusCode::OK, "{html}");
+        assert!(html.contains("Members read"), "{html}");
+        assert!(
+            html.contains("<th>Rows read</th><td>2</td>"),
+            "both rows were read: {html}"
+        );
+        assert!(
+            html.contains("<th>Bars stored</th><td>0</td>"),
+            "and neither was stored: {html}"
+        );
+        assert!(
+            html.contains("<th>Bars dropped</th><td>2</td>"),
+            "each one counted by the reason it was declined for: {html}"
+        );
+        assert!(
+            html.contains("<th>Members failed</th><td>0</td>"),
+            "a declined row is not a failure: {html}"
+        );
+        assert!(
+            html.contains("rows in equals bars out plus drops"),
+            "the run balances and the receipt says which arithmetic: {html}"
+        );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// A member that fails is named on the receipt, and the run is reported as
+    /// **not** balancing rather than as a success with a smaller number.
+    #[test]
+    fn a_local_pull_with_a_failed_member_says_it_does_not_balance_and_names_it() {
+        let dir = agreeing("localfailed");
+        let site = site("localfailed", &dir);
+        // File order is the only order there is, and this file's order
+        // descends — the fold refuses it rather than sorting it, and the
+        // member fails before any bar file is opened.
+        let folder = vendor_folder(
+            "localfailed",
+            &format!(
+                "{GDFL_MEMBER_HEAD}\
+                 NIFTY,08/01/2022,10:00:00,100.00,0,0,0,0,0,0\n\
+                 NIFTY,08/01/2022,09:30:00,100.50,0,0,0,0,0,0\n"
+            ),
+        );
+
+        let (code, html) = spot_answer(
+            &spot_form(&folder, "2022-01-08", "2022-01-08"),
+            day(2026, 8, 7),
+            &site,
+        );
+        assert_eq!(
+            code,
+            axum::http::StatusCode::OK,
+            "the RUN completed; one member did not — those are different \
+             answers and the page gives both: {html}"
+        );
+        assert!(html.contains("<th>Members failed</th><td>1</td>"), "{html}");
+        assert!(
+            html.contains("2 rows read, 0 stored"),
+            "the receipt spells out WHY it does not balance rather than \
+             printing a smaller number as if it were the answer: {html}"
+        );
+        assert!(
+            html.contains("NIFTY"),
+            "and names the member that failed: {html}"
+        );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// Without a folder the HTTP path is what is being asked for, and it does
+    /// not exist — so the pull is refused loudly rather than silently doing
+    /// nothing.
+    #[test]
+    fn a_spot_pull_with_no_folder_is_still_the_loud_unavailable() {
+        let dir = agreeing("localnofolder");
+        let site = site("localnofolder", &dir);
+        let (code, html) = spot_answer(
+            "target=swept&from=2022-01-08&to=2022-01-08",
+            day(2026, 8, 7),
+            &site,
+        );
+        assert_eq!(
+            code,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "an absent folder means the HTTP path, which does not exist: {html}"
+        );
+        assert!(
+            !html.contains("Bars stored"),
+            "and nothing was counted, because nothing ran: {html}"
+        );
+    }
+
+    /// Bars land under the home directory unless something says otherwise.
+    #[test]
+    fn the_default_store_directory_is_named_under_the_home_directory() {
+        let root = default_store_dir();
+        // Rendered BEFORE the assertions rather than inside their messages: a
+        // message argument is evaluated only when the assertion fails, so a
+        // `root.display()` on its own line is a line the passing run never
+        // executes — and the coverage gate is right to say so.
+        let shown = root.display().to_string();
+        assert!(root.ends_with("store"), "the leaf is the store: {shown}");
+        assert!(
+            root.parent().is_some_and(|p| p.ends_with(".brutex")),
+            "under this build's own dot directory, not loose in home: {shown}"
+        );
+        assert_eq!(
+            root,
+            default_store_dir(),
+            "and it is a pure function of the environment — two calls in one \
+             process cannot disagree about where the bars went"
+        );
     }
 }

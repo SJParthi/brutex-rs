@@ -595,18 +595,27 @@ impl SessionRow {
 
     /// A row for an era whose circular was never retrieved.
     ///
-    /// Has no caller today: on 2026-08-07 the three outstanding rows were
-    /// filled from NSE/CMTR/74466 and NSE/FAOP/74467, so every shipped row
+    /// Has no *shipping* caller today: on 2026-08-07 the three outstanding rows
+    /// were filled from NSE/CMTR/74466 and NSE/FAOP/74467, so every shipped row
     /// now carries a citation. It is kept because the NEXT gap is a matter of
     /// when, not whether — a circular that cannot be retrieved must remain
     /// expressible, or the pressure at that moment is to guess a number
     /// instead. Deleting this constructor would remove the honest option and
     /// leave only the dishonest one.
-    #[expect(
-        dead_code,
-        reason = "the refusal constructor is part of the contract, not a \
-                  leftover: every era whose source is unretrievable must stay \
-                  representable. See the doc comment above."
+    ///
+    /// The tests below DO call it, against a table built for the purpose, so
+    /// the refusal path is proven rather than merely available — which is why
+    /// the `dead_code` expectation is scoped to builds without `cfg(test)`.
+    /// An unconditional `expect` would be unfulfilled the moment a test used
+    /// it, and `-D warnings` turns that into a red build.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the refusal constructor is part of the contract, not a \
+                      leftover: every era whose source is unretrievable must \
+                      stay representable. See the doc comment above."
+        )
     )]
     const fn unverified(start: Day, kind: SessionKind, source: &'static str) -> Self {
         Self {
@@ -1919,3 +1928,1280 @@ const _: () = {
     assert!(!gdfl.transport.needs_credential());
     assert!(!gdfl.transport.needs_governor());
 };
+
+// ---------------------------------------------------------------------------
+// tests
+// ---------------------------------------------------------------------------
+//
+// THESE LIVE IN THE FILE RATHER THAN IN `tests/` FOR ONE REASON. Most of what
+// this module is *made of* is private and `const`: `str_eq`, `has_content`,
+// `day_const`, `SessionRow` and `SessionTable` are exercised only by the
+// `const` assertions above, and a `const` assertion is evaluated by the
+// compiler — it is invisible to runtime instrumentation and proves nothing
+// about the code an operator's process actually runs. An integration test
+// cannot reach a private item at all, so the choice is here or nowhere.
+//
+// Every `const fn` below is called through `black_box` so the call cannot be
+// folded back into a compile-time constant and disappear again.
+//
+// NO STRING LITERAL HERE IS SHAPED LIKE A PARAMETER-PATH SEGMENT. CI gate 1d
+// walks this crate for lower-case quoted words; the assertions are written
+// against the table's own accessors (`dir()`, `wire()`, `label()`) and against
+// `store::path::Timeframe`, which is both stronger than pinning a spelling and
+// leaves nothing new to declare.
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    reason = "a test that cannot panic cannot fail, and these lints exist to \
+              keep panics out of the crate rather than out of its tests"
+)]
+mod tests {
+    use std::collections::HashSet;
+    use std::hint::black_box;
+
+    use super::*;
+
+    /// A real date, or the test fails on its own literal.
+    fn day(year: u16, month: u8, of_month: u8) -> Day {
+        Day::new(year, month, of_month).expect("the test's own date literal is real")
+    }
+
+    // -- the const helpers ---------------------------------------------------
+
+    /// `str_eq` is byte equality including length, in both directions.
+    #[test]
+    fn str_eq_compares_every_byte_and_the_length_in_both_directions() {
+        assert!(
+            str_eq(black_box(""), black_box("")),
+            "two empty strings are equal"
+        );
+
+        let minute = Granularity::Minute1.dir();
+        assert!(
+            str_eq(black_box(minute), black_box(Timeframe::MINUTE_1.as_str())),
+            "the rung's directory name and the store's timeframe name are the \
+             same bytes — this is the equality the const assertion above rests on"
+        );
+        assert!(
+            !str_eq(black_box(minute), black_box(Granularity::Minute3.dir())),
+            "same length, first byte differs"
+        );
+
+        // A prefix relationship, which is the only way to reach the arm where
+        // one side runs out of bytes before the other.
+        let doubled = format!("{minute}{minute}");
+        assert!(
+            !str_eq(black_box(minute), black_box(doubled.as_str())),
+            "a prefix is not equal to the whole"
+        );
+        assert!(
+            !str_eq(black_box(doubled.as_str()), black_box(minute)),
+            "and the whole is not equal to its prefix"
+        );
+    }
+
+    /// A citation of nothing but whitespace is no citation.
+    #[test]
+    fn has_content_refuses_a_blank_citation() {
+        assert!(!has_content(black_box("")), "empty says nothing");
+        assert!(
+            !has_content(black_box(" \t\r\n ")),
+            "whitespace says nothing either — this is the check that keeps a \
+             row from wearing a citation field it never filled in"
+        );
+        assert!(
+            has_content(black_box("  X")),
+            "one non-blank byte anywhere is content"
+        );
+        assert!(
+            has_content(black_box(CHARTER_SESSION)),
+            "and every shipped row's citation has content"
+        );
+    }
+
+    /// An unreal date collapses to the epoch instead of panicking — and the
+    /// `const` assertion beside each shipped date is what catches it.
+    #[test]
+    fn day_const_falls_back_to_the_epoch_rather_than_panicking() {
+        assert_eq!(
+            day_const(black_box(2026), black_box(8), black_box(3)),
+            AUG_3_2026,
+            "a real date round-trips"
+        );
+        assert_eq!(
+            day_const(black_box(2026), black_box(2), black_box(30)),
+            EPOCH_DAY,
+            "30 February is not a date, so the fallback fires — and the const \
+             assertion beside every shipped date is what turns that into a \
+             build failure rather than a wrong window"
+        );
+        assert_eq!(EPOCH_DAY.days_from_epoch(), 0);
+        assert_eq!(
+            (AUG_3_2026.year(), AUG_3_2026.month(), AUG_3_2026.day()),
+            (2026, 8, 3)
+        );
+    }
+
+    // -- the granularity ladder ---------------------------------------------
+
+    /// Every rung has its own directory, its own grid, and a `Display` that is
+    /// the directory.
+    #[test]
+    fn every_granularity_rung_has_a_distinct_directory_and_one_grid() {
+        let mut dirs = HashSet::with_capacity(GRANULARITY_COUNT);
+        let mut intraday = 0_usize;
+        let mut aggregate = 0_usize;
+
+        for rung in Granularity::ALL {
+            let dir = rung.dir();
+            assert!(!dir.is_empty(), "a rung with no directory name");
+            assert!(dirs.insert(dir), "{dir} is claimed by two rungs");
+            assert_eq!(rung.to_string(), dir, "Display is the directory name");
+
+            match rung.grid() {
+                Grid::Event => {
+                    assert!(rung.is_intraday(), "an event grid is intraday");
+                    intraday += 1;
+                }
+                Grid::Intraday(secs) => {
+                    assert!(secs > 0, "{dir} claims a zero-second interval");
+                    assert!(rung.is_intraday());
+                    intraday += 1;
+                }
+                Grid::Daily | Grid::Weekly => {
+                    assert!(
+                        !rung.is_intraday(),
+                        "{dir} is an aggregate bar and carries no intraday time"
+                    );
+                    aggregate += 1;
+                }
+            }
+        }
+
+        assert_eq!(dirs.len(), GRANULARITY_COUNT, "eleven distinct rungs");
+        assert_eq!(aggregate, 2, "exactly the daily and weekly rungs aggregate");
+        assert_eq!(intraday, GRANULARITY_COUNT - 2);
+    }
+
+    /// One rung has a store timeframe and the rest refuse by absence.
+    #[test]
+    fn only_the_one_minute_rung_carries_a_store_timeframe() {
+        let mut carried = 0_usize;
+        for rung in Granularity::ALL {
+            match rung.store_timeframe() {
+                Some(timeframe) => {
+                    assert_eq!(rung, Granularity::Minute1);
+                    assert_eq!(timeframe.as_str(), rung.dir());
+                    assert_eq!(rung.grid(), Grid::Intraday(timeframe.secs()));
+                    carried += 1;
+                }
+                None => assert_ne!(
+                    rung,
+                    Granularity::Minute1,
+                    "a None is a refusal at the write boundary, never a substitution"
+                ),
+            }
+        }
+        assert_eq!(carried, 1, "crates/store ships exactly one rung");
+    }
+
+    /// A bitset holds what was put in it, and adding twice is adding once.
+    #[test]
+    fn a_granularity_set_is_a_bitset_over_the_ladder() {
+        let empty = GranularitySet::EMPTY;
+        assert!(empty.is_empty());
+        assert_eq!(GranularitySet::default(), empty, "default is empty");
+        for rung in Granularity::ALL {
+            assert!(!empty.contains(rung), "the empty set holds nothing");
+        }
+
+        let one = empty.with(Granularity::Minute1);
+        assert!(!one.is_empty());
+        assert!(one.contains(Granularity::Minute1));
+        assert_eq!(
+            one.with(Granularity::Minute1),
+            one,
+            "adding twice is adding once"
+        );
+
+        let two = one.with(Granularity::Week1);
+        let held = Granularity::ALL
+            .iter()
+            .filter(|g| two.contains(**g))
+            .count();
+        assert_eq!(held, 2, "exactly the two rungs that were added");
+        assert!(two.contains(Granularity::Week1) && two.contains(Granularity::Minute1));
+        assert!(!two.contains(Granularity::Tick));
+    }
+
+    /// The segment bitset, and the free function that gives each segment a bit.
+    #[test]
+    fn a_segment_set_gives_each_segment_its_own_bit() {
+        let empty = SegmentSet::EMPTY;
+        assert!(empty.is_empty());
+        assert_eq!(SegmentSet::default(), empty);
+
+        let every = [Segment::Index, Segment::Cash, Segment::Fno];
+        let mut bits = HashSet::with_capacity(every.len());
+        for segment in every {
+            assert!(!empty.contains(segment));
+            assert!(
+                bits.insert(segment_bit(segment)),
+                "two segments share a bit, so a set could not tell them apart"
+            );
+        }
+
+        let index_only = empty.with(Segment::Index);
+        assert!(!index_only.is_empty());
+        assert!(index_only.contains(Segment::Index));
+        assert!(!index_only.contains(Segment::Cash) && !index_only.contains(Segment::Fno));
+        assert_eq!(index_only.with(Segment::Index), index_only);
+
+        let all = index_only.with(Segment::Cash).with(Segment::Fno);
+        assert!(every.iter().all(|s| all.contains(*s)));
+    }
+
+    // -- venues, and the dated session table --------------------------------
+
+    /// Every venue answers for its own `(exchange, segment)` pair, and BSE is
+    /// refused by absence rather than mapped onto an NSE row.
+    #[test]
+    fn a_venue_is_chosen_by_exchange_and_segment_and_bse_has_none() {
+        let mut labels = HashSet::with_capacity(VENUE_COUNT);
+        for venue in Venue::ALL {
+            assert!(!venue.label().is_empty());
+            assert!(labels.insert(venue.label()), "two venues share a label");
+            assert_eq!(venue.to_string(), venue.label());
+        }
+        assert_eq!(labels.len(), VENUE_COUNT);
+
+        assert_eq!(
+            Venue::for_segment(Exchange::Nse, Segment::Index),
+            Some(Venue::NseIndex)
+        );
+        assert_eq!(
+            Venue::for_segment(Exchange::Nse, Segment::Cash),
+            Some(Venue::NseCash)
+        );
+        assert_eq!(
+            Venue::for_segment(Exchange::Nse, Segment::Fno),
+            Some(Venue::NseDerivatives)
+        );
+        for segment in [Segment::Index, Segment::Cash, Segment::Fno] {
+            assert_eq!(
+                Venue::for_segment(Exchange::Bse, segment),
+                None,
+                "CLAUDE.md section 1 does not pull BSE, and two exchanges \
+                 sharing one window is a claim nothing here has a source for"
+            );
+        }
+    }
+
+    /// The anchor is `crate::session`'s two constants for all three venues, and
+    /// the 2026-08-03 row moves only the venues whose circular says so.
+    #[test]
+    fn the_session_table_anchors_on_the_charter_and_moves_on_2026_08_03() {
+        let before = day(2026, 8, 2);
+        for venue in Venue::ALL {
+            let anchored = venue.hours_on(before).expect("every anchor is verified");
+            assert_eq!(anchored.open_minute(), SESSION_OPEN_MINUTE);
+            assert_eq!(anchored.close_minute(), SESSION_CLOSE_MINUTE);
+            assert_eq!(anchored.kind(), SessionKind::Continuous);
+            assert!(
+                has_content(anchored.source()),
+                "the anchor IS session.rs's two constants and cites the charter, \
+                 which is why that module's exhaustive day walk stays correct"
+            );
+            assert_eq!(
+                venue.table().anchor.hours,
+                Hours::Verified {
+                    open_minute: SESSION_OPEN_MINUTE,
+                    close_minute: SESSION_CLOSE_MINUTE,
+                },
+                "and the row it came from carries the hours, not a default"
+            );
+        }
+
+        let after = day(2026, 8, 3);
+        let index = Venue::NseIndex.hours_on(after).expect("verified row");
+        let cash = Venue::NseCash.hours_on(after).expect("verified row");
+        let fno = Venue::NseDerivatives.hours_on(after).expect("verified row");
+
+        assert_eq!(
+            index.close_minute(),
+            15 * 60 + 15,
+            "the swept index freezes EARLIEST — every constituent stops trading \
+             continuously at 15:15"
+        );
+        assert_eq!(
+            cash.close_minute(),
+            SESSION_CLOSE_MINUTE,
+            "a share with no derivative contract keeps its continuous close, so \
+             this row restates the anchor"
+        );
+        assert_eq!(
+            fno.close_minute(),
+            15 * 60 + 40,
+            "derivatives extend by ten"
+        );
+        assert!(
+            index.close_minute() < cash.close_minute() && cash.close_minute() < fno.close_minute(),
+            "the three did not move together, which is why there are three rows"
+        );
+        for session in [index, cash, fno] {
+            assert_eq!(session.open_minute(), SESSION_OPEN_MINUTE, "the open held");
+            assert!(has_content(session.source()), "each row cites its circular");
+        }
+    }
+
+    /// A verified table has no refusal window, and the lookup walks a number of
+    /// rows fixed at compile time.
+    #[test]
+    fn the_session_lookup_walks_a_fixed_number_of_rows() {
+        assert_eq!(
+            MAX_LATER_SESSION_ROWS, 2,
+            "the bound is the length of a fixed-size array, so no input raises it"
+        );
+        for venue in Venue::ALL {
+            let windows = venue.refusal_windows();
+            assert_eq!(
+                windows.len(),
+                MAX_LATER_SESSION_ROWS + 1,
+                "one slot per representable row"
+            );
+            assert!(
+                windows.iter().all(Option::is_none),
+                "{venue} ships no unverified row today, so it refuses no day"
+            );
+        }
+    }
+
+    /// Session arithmetic: length, membership, and the four record counts.
+    #[test]
+    fn a_session_reports_its_length_its_membership_and_its_record_count() {
+        let session = Venue::NseIndex
+            .hours_on(day(2024, 1, 2))
+            .expect("the anchor is verified");
+
+        assert_eq!(session.len_secs(), 22_500, "09:15 to 15:30 is 375 minutes");
+        assert!(
+            !session.contains_minute(SESSION_OPEN_MINUTE - 1),
+            "before open"
+        );
+        assert!(
+            session.contains_minute(SESSION_OPEN_MINUTE),
+            "open is inclusive"
+        );
+        assert!(
+            session.contains_minute(SESSION_CLOSE_MINUTE - 1),
+            "last minute"
+        );
+        assert!(
+            !session.contains_minute(SESSION_CLOSE_MINUTE),
+            "the close is EXCLUSIVE"
+        );
+
+        assert_eq!(
+            session.expected_count(Granularity::Minute1),
+            ExpectedCount::Exact(BARS_PER_REGULAR_SESSION),
+            "375 one-minute bars, derived rather than restated"
+        );
+        assert_eq!(
+            session.expected_count(Granularity::Tick),
+            ExpectedCount::Unbounded,
+            "a tick feed prints as often as the market prints"
+        );
+        assert_eq!(
+            session.expected_count(Granularity::Day1),
+            ExpectedCount::Aggregate
+        );
+        assert_eq!(
+            session.expected_count(Granularity::Week1),
+            ExpectedCount::Aggregate
+        );
+        assert_eq!(
+            session.expected_count(Granularity::Minute30),
+            ExpectedCount::Irregular {
+                session_secs: 22_500,
+                interval_secs: 1_800,
+            },
+            "375 minutes is twelve and a half half-hours — named rather than \
+             rounded, because a rounded count is a gap check that is wrong by a \
+             fixed amount every single day"
+        );
+        assert_eq!(
+            session.expected_count(Granularity::Second1),
+            ExpectedCount::Exact(22_500)
+        );
+    }
+
+    /// A row with no verified hours refuses by name, and the refusal carries
+    /// the venue, the day, the window and the citation gap.
+    #[test]
+    fn a_row_with_no_verified_hours_refuses_and_names_the_gap() {
+        const GAP: &str = "TEST ROW: no circular was retrieved for this window";
+        let start = day(2030, 1, 1);
+        let resumes = day(2031, 1, 1);
+
+        let table = SessionTable {
+            venue: Venue::NseCash,
+            anchor: SessionRow::verified(
+                EPOCH_DAY,
+                SESSION_OPEN_MINUTE,
+                SESSION_CLOSE_MINUTE,
+                SessionKind::Continuous,
+                CHARTER_SESSION,
+            ),
+            later: [
+                Some(SessionRow::unverified(
+                    start,
+                    SessionKind::ClosingAuction,
+                    GAP,
+                )),
+                Some(SessionRow::verified(
+                    resumes,
+                    SESSION_OPEN_MINUTE,
+                    SESSION_CLOSE_MINUTE,
+                    SessionKind::Continuous,
+                    CHARTER_SESSION,
+                )),
+            ],
+        };
+
+        assert!(
+            table.is_shipping_shape(),
+            "the row is unverified, not malformed — an unverified row is a \
+             legal row and that is the whole point of the arm"
+        );
+
+        table
+            .hours_on(day(2029, 12, 31))
+            .expect("before the gap the anchor still answers");
+        table
+            .hours_on(resumes)
+            .expect("after the gap the later row answers");
+
+        let refusal = table
+            .hours_on(day(2030, 6, 1))
+            .expect_err("inside the gap there is nothing to answer with");
+        assert_eq!(refusal.venue(), Venue::NseCash);
+        assert_eq!(refusal.day(), day(2030, 6, 1));
+        assert_eq!(refusal.row_start(), start);
+        assert_eq!(
+            refusal.verified_from(),
+            Some(resumes),
+            "the window has an end, and the refusal names it"
+        );
+        assert_eq!(refusal.source(), GAP);
+
+        let text = refusal.to_string();
+        for fragment in [
+            Venue::NseCash.label(),
+            &day(2030, 6, 1).to_string(),
+            &start.to_string(),
+            &resumes.to_string(),
+            GAP,
+        ] {
+            assert!(
+                text.contains(fragment),
+                "the refusal must carry {fragment:?} — got {text:?}"
+            );
+        }
+
+        let windows = table.refusal_windows();
+        let named: Vec<_> = windows.into_iter().flatten().collect();
+        assert_eq!(named.len(), 1, "one unverified row, one window");
+        assert_eq!(named[0].venue(), Venue::NseCash);
+        assert_eq!(named[0].start(), start);
+        assert_eq!(named[0].verified_from(), Some(resumes));
+    }
+
+    /// A sink that accepts `remaining` writes and then refuses.
+    ///
+    /// Exists for one reason: every `write!(f, …)?` in a `Display` impl carries
+    /// an error edge, and against a `String` — which is what `to_string` uses —
+    /// that edge is unreachable, because writing to a `String` cannot fail. A
+    /// formatter over THIS refuses on demand, so each `?` in
+    /// [`SessionRefusal::fmt`] is proven to propagate rather than to swallow.
+    struct FailingSink {
+        remaining: usize,
+    }
+
+    impl fmt::Write for FailingSink {
+        fn write_str(&mut self, _text: &str) -> fmt::Result {
+            match self.remaining.checked_sub(1) {
+                Some(left) => {
+                    self.remaining = left;
+                    Ok(())
+                }
+                None => Err(fmt::Error),
+            }
+        }
+    }
+
+    /// Every `?` in the refusal's own `Display` propagates the sink's failure.
+    #[test]
+    fn a_refusal_propagates_a_sink_that_stops_accepting_it() {
+        use std::fmt::Write as _;
+
+        let ended = SessionRefusal {
+            venue: Venue::NseCash,
+            day: day(2030, 6, 1),
+            row_start: day(2030, 1, 1),
+            verified_from: Some(day(2031, 1, 1)),
+            source: SOURCE,
+        };
+        let open_ended = SessionRefusal {
+            verified_from: None,
+            ..ended
+        };
+
+        for refusal in [ended, open_ended] {
+            let full = refusal.to_string();
+            let mut accepted = FailingSink {
+                remaining: usize::MAX,
+            };
+            write!(accepted, "{refusal}").expect("a sink that never refuses");
+
+            // Walk the budget from zero upward. Every prefix length short of
+            // the whole message must surface as an error rather than a
+            // truncated line an operator would read as complete.
+            let mut refused = 0_usize;
+            for budget in 0..64 {
+                let mut sink = FailingSink { remaining: budget };
+                if write!(sink, "{refusal}").is_err() {
+                    refused += 1;
+                }
+            }
+            assert!(
+                refused > 0,
+                "a sink that refuses must make the whole write fail — {full:?}"
+            );
+            assert!(
+                refused < 64,
+                "and a sink with room enough must succeed, or the loop is \
+                 proving nothing"
+            );
+        }
+    }
+
+    /// An unverified row that nothing follows is open-ended, and the refusal
+    /// says so in words rather than inventing an end.
+    #[test]
+    fn an_unverified_row_with_no_successor_is_open_ended() {
+        const GAP: &str = "TEST ROW: the era after this one was never verified";
+        let start = day(2040, 4, 1);
+        let table = SessionTable {
+            venue: Venue::NseDerivatives,
+            anchor: SessionRow::verified(
+                EPOCH_DAY,
+                SESSION_OPEN_MINUTE,
+                SESSION_CLOSE_MINUTE,
+                SessionKind::Continuous,
+                CHARTER_SESSION,
+            ),
+            later: [
+                Some(SessionRow::unverified(start, SessionKind::Continuous, GAP)),
+                None,
+            ],
+        };
+
+        let refusal = table.hours_on(start).expect_err("the row has no hours");
+        assert_eq!(refusal.verified_from(), None, "nothing follows it");
+        let text = refusal.to_string();
+        assert!(
+            text.contains(" onward"),
+            "an open-ended window says onward rather than naming an end it does \
+             not have — got {text:?}"
+        );
+
+        let windows = table.refusal_windows();
+        let named: Vec<_> = windows.into_iter().flatten().collect();
+        assert_eq!(named.len(), 1);
+        assert_eq!(named[0].verified_from(), None);
+    }
+
+    /// The citation every row built for a test carries. Never a segment.
+    const SOURCE: &str = "TEST ROW";
+
+    /// A row starting on `start` with the charter's own hours.
+    fn later(start: Day) -> SessionRow {
+        SessionRow::verified(
+            start,
+            SESSION_OPEN_MINUTE,
+            SESSION_CLOSE_MINUTE,
+            SessionKind::Continuous,
+            SOURCE,
+        )
+    }
+
+    /// The anchor every table built for a test starts from.
+    fn anchor_row() -> SessionRow {
+        later(EPOCH_DAY)
+    }
+
+    /// A table, so the contract can be driven from outside the shipped rows.
+    fn table(
+        anchor: SessionRow,
+        later: [Option<SessionRow>; MAX_LATER_SESSION_ROWS],
+    ) -> SessionTable {
+        SessionTable {
+            venue: Venue::NseIndex,
+            anchor,
+            later,
+        }
+    }
+
+    /// The ordering half of the contract: the anchor covers every day and the
+    /// rows ascend with no hole, driven through each arm a shipped table never
+    /// takes.
+    #[test]
+    fn the_table_shape_contract_refuses_a_table_whose_rows_do_not_ascend() {
+        let anchor = anchor_row();
+
+        assert!(
+            table(anchor, [None, None]).is_shipping_shape(),
+            "bare anchor"
+        );
+        assert!(
+            table(anchor, [Some(later(day(2020, 1, 1))), None]).is_shipping_shape(),
+            "one later row"
+        );
+        assert!(
+            table(
+                anchor,
+                [Some(later(day(2020, 1, 1))), Some(later(day(2021, 1, 1)))]
+            )
+            .is_shipping_shape(),
+            "two later rows, ascending"
+        );
+
+        // An anchor that does not start at the epoch leaves days uncovered.
+        let late_anchor = SessionRow::verified(
+            day(1971, 1, 1),
+            SESSION_OPEN_MINUTE,
+            SESSION_CLOSE_MINUTE,
+            SessionKind::Continuous,
+            SOURCE,
+        );
+        assert!(!table(late_anchor, [None, None]).anchor_covers_all_days());
+        assert!(!table(late_anchor, [None, None]).is_shipping_shape());
+
+        // Rows that do not ascend, in each of the three shapes that can fail.
+        assert!(
+            !table(anchor, [Some(anchor), None]).rows_ascend(),
+            "equal starts"
+        );
+        assert!(
+            !table(
+                anchor,
+                [Some(later(day(2021, 1, 1))), Some(later(day(2020, 1, 1)))]
+            )
+            .rows_ascend(),
+            "descending later rows"
+        );
+        assert!(
+            !table(anchor, [None, Some(later(day(2020, 1, 1)))]).rows_ascend(),
+            "a hole before a populated slot — `rows()` would silently close it"
+        );
+    }
+
+    /// The soundness half: a row is ill-shaped when its window is inverted, out
+    /// of range, or its citation says nothing — and every slot is checked, not
+    /// just the first.
+    #[test]
+    fn the_table_shape_contract_refuses_a_row_with_no_window_and_no_citation() {
+        let anchor = anchor_row();
+        let inverted = SessionRow::verified(
+            day(2020, 1, 1),
+            SESSION_CLOSE_MINUTE,
+            SESSION_OPEN_MINUTE,
+            SessionKind::Continuous,
+            SOURCE,
+        );
+        let past_midnight = SessionRow::verified(
+            day(2020, 1, 1),
+            SESSION_OPEN_MINUTE,
+            24 * 60 + 1,
+            SessionKind::Continuous,
+            SOURCE,
+        );
+        let uncited = SessionRow::verified(
+            day(2020, 1, 1),
+            SESSION_OPEN_MINUTE,
+            SESSION_CLOSE_MINUTE,
+            SessionKind::Continuous,
+            "   ",
+        );
+        assert!(!inverted.is_well_shaped(), "close before open");
+        assert!(!past_midnight.is_well_shaped(), "a close past midnight");
+        assert!(!uncited.is_well_shaped(), "a blank citation is no citation");
+        assert!(anchor.is_well_shaped());
+        assert!(
+            SessionRow::unverified(day(2020, 1, 1), SessionKind::Continuous, SOURCE)
+                .is_well_shaped(),
+            "an unverified row has no window to be wrong"
+        );
+
+        assert!(!table(uncited, [None, None]).rows_are_well_shaped());
+        assert!(!table(anchor, [Some(inverted), None]).rows_are_well_shaped());
+        assert!(
+            !table(anchor, [Some(anchor), Some(inverted)]).rows_are_well_shaped(),
+            "the SECOND slot is checked too"
+        );
+        assert!(
+            !table(anchor, [None, Some(inverted)]).rows_are_well_shaped(),
+            "and so is a second slot with a hole before it"
+        );
+        assert!(table(anchor, [Some(anchor), Some(anchor)]).rows_are_well_shaped());
+
+        // The anchor must be session.rs's two constants, and an unverified
+        // anchor can never be.
+        assert!(table(anchor, [None, None]).anchor_matches_session_constants());
+        let moved = SessionRow::verified(
+            EPOCH_DAY,
+            SESSION_OPEN_MINUTE + 1,
+            SESSION_CLOSE_MINUTE,
+            SessionKind::Continuous,
+            SOURCE,
+        );
+        assert!(!table(moved, [None, None]).anchor_matches_session_constants());
+        let unverified_anchor = SessionRow::unverified(EPOCH_DAY, SessionKind::Continuous, SOURCE);
+        assert!(
+            !table(unverified_anchor, [None, None]).anchor_matches_session_constants(),
+            "an anchor with no hours cannot equal two constants"
+        );
+    }
+
+    /// Every shipped table satisfies the contract at run time as well as at
+    /// compile time, and `rows()` yields the anchor first.
+    #[test]
+    fn every_shipped_session_table_is_in_shipping_shape() {
+        for venue in Venue::ALL {
+            let table = venue.table();
+            assert!(table.is_shipping_shape(), "{venue} ships a malformed table");
+            assert!(table.anchor_matches_session_constants(), "{venue}");
+            let rows: Vec<_> = table.rows().collect();
+            assert!(!rows.is_empty(), "the anchor is always a row");
+            assert_eq!(
+                rows[0].start.days_from_epoch(),
+                0,
+                "the anchor comes first and starts at the epoch"
+            );
+            for pair in rows.windows(2) {
+                assert!(
+                    pair[0].start.days_from_epoch() < pair[1].start.days_from_epoch(),
+                    "{venue}'s rows must ascend strictly"
+                );
+            }
+        }
+    }
+
+    /// A session kind has a stable label, and both arms exist so an auction can
+    /// be refused by name rather than mis-filtered as continuous trading.
+    #[test]
+    fn a_session_kind_has_a_label_for_each_arm() {
+        assert_ne!(
+            SessionKind::Continuous.label(),
+            SessionKind::ClosingAuction.label()
+        );
+        for kind in [SessionKind::Continuous, SessionKind::ClosingAuction] {
+            assert!(!kind.label().is_empty());
+            assert_eq!(kind.to_string(), kind.label());
+        }
+    }
+
+    // -- the transport rows --------------------------------------------------
+
+    /// The verb and the auth prefix are data, one row each.
+    #[test]
+    fn the_wire_verb_and_the_auth_prefix_are_rows_not_branches() {
+        assert_eq!(Method::Get.as_str(), "GET");
+        assert_eq!(Method::Post.as_str(), "POST");
+        assert!(
+            AuthScheme::Raw.prefix().is_empty(),
+            "a raw token has no prefix"
+        );
+        assert_eq!(AuthScheme::Bearer.prefix(), "Bearer ");
+    }
+
+    /// Row *i* of the table describes variant *i*, and a lookup is that index.
+    #[test]
+    fn the_descriptor_table_is_indexed_by_the_discriminant() {
+        assert_eq!(DESCRIPTORS.len(), FEED_COUNT);
+        assert_eq!(Feed::ALL.len(), FEED_COUNT);
+
+        let mut wires = HashSet::with_capacity(FEED_COUNT);
+        let mut names = HashSet::with_capacity(FEED_COUNT);
+        for (index, feed) in Feed::ALL.into_iter().enumerate() {
+            let row = feed.descriptor();
+            assert_eq!(row.feed, feed, "row {index} describes another variant");
+            assert_eq!(
+                DESCRIPTORS[index], row,
+                "the lookup is the discriminant, not a search"
+            );
+            assert!(wires.insert(feed.wire()), "two feeds share a wire name");
+            assert!(
+                names.insert(feed.display()),
+                "two feeds share a display name"
+            );
+            assert_eq!(feed.display(), row.display);
+            assert_eq!(feed.wire(), row.wire);
+            assert_eq!(feed.to_string(), row.display);
+            assert!(
+                !row.granularities.is_empty() && !row.segments.is_empty(),
+                "{feed} could never answer a request"
+            );
+            assert_eq!(row.exchange, Exchange::Nse);
+        }
+        assert_eq!(wires.len(), FEED_COUNT);
+    }
+
+    /// The bridge to the store's own vendor prefix refuses rather than invents.
+    #[test]
+    fn a_feed_with_no_store_prefix_refuses_instead_of_borrowing_one() {
+        assert_eq!(Feed::Dhan.store_vendor(), Some(Vendor::Dhan));
+        assert_eq!(Feed::Groww.store_vendor(), Some(Vendor::Groww));
+        for archive in [Feed::TrueData, Feed::Gdfl] {
+            assert_eq!(
+                archive.store_vendor(),
+                None,
+                "filing an archive vendor's bars under a broker's prefix would \
+                 destroy D-0019's per-vendor independence irreversibly"
+            );
+        }
+    }
+
+    /// A feed serves the rungs its row names and no others.
+    #[test]
+    fn a_feed_serves_only_the_rungs_its_row_declares() {
+        for feed in Feed::ALL {
+            let declared = feed.descriptor().granularities;
+            for rung in Granularity::ALL {
+                assert_eq!(
+                    feed.serves(rung),
+                    declared.contains(rung),
+                    "{feed} disagrees with its own row about {rung}"
+                );
+            }
+        }
+        assert!(Feed::Dhan.serves(Granularity::Minute1));
+        assert!(Feed::Dhan.serves(Granularity::Day1));
+        assert!(
+            !Feed::Dhan.serves(Granularity::Minute5),
+            "an unserved rung refuses by name; the wider ladder was never read live"
+        );
+        assert!(Feed::Gdfl.serves(Granularity::Second1));
+        assert!(!Feed::Gdfl.serves(Granularity::Minute1));
+    }
+
+    /// The HTTP half of a transport, or [`None`] for an archive.
+    ///
+    /// A function taking BOTH arms rather than a `let … else { panic!() }` at
+    /// each call site: the `else` of a let-else that never fires is a branch no
+    /// test can reach, and a test file full of unreachable arms is exactly the
+    /// hole this workflow exists to close. Called below for every feed, so both
+    /// arms are taken.
+    const fn http_spec(transport: Transport) -> Option<HttpSpec> {
+        match transport {
+            Transport::Http(spec) => Some(spec),
+            Transport::LocalArchive(_) => None,
+        }
+    }
+
+    /// The archive half, same shape and same reason.
+    const fn archive_spec(transport: Transport) -> Option<ArchiveSpec> {
+        match transport {
+            Transport::LocalArchive(spec) => Some(spec),
+            Transport::Http(_) => None,
+        }
+    }
+
+    /// The envelope key a response shape hangs its bars under, whichever shape
+    /// it is.
+    const fn envelope_of(shape: ResponseShape) -> Option<&'static str> {
+        match shape {
+            ResponseShape::ParallelArrays { envelope }
+            | ResponseShape::ArrayOfObjects { envelope } => envelope,
+        }
+    }
+
+    /// How an archive's file name renders its date, whichever pattern it uses.
+    const fn archive_date(name: ArchiveName) -> DateFormat {
+        match name {
+            ArchiveName::SegmentAndDate { date, .. } | ArchiveName::DateOnly { date, .. } => date,
+        }
+    }
+
+    /// A member's extension, whichever nesting it sits in.
+    const fn member_suffix(member: MemberPattern) -> &'static str {
+        match member {
+            MemberPattern::SymbolAtRoot { suffix } | MemberPattern::StemGroupSymbol { suffix } => {
+                suffix
+            }
+        }
+    }
+
+    /// An HTTP row carries a credential and a governor; an archive row has
+    /// nowhere to put either.
+    #[test]
+    fn only_an_http_transport_needs_a_credential_and_a_governor() {
+        let mut http = 0_usize;
+        let mut archives = 0_usize;
+        for feed in Feed::ALL {
+            let transport = feed.descriptor().transport;
+            assert!(!transport.label().is_empty());
+            assert_eq!(
+                transport.needs_credential(),
+                transport.needs_governor(),
+                "{feed}: a token and a ceiling are needed by the same transports"
+            );
+            assert_eq!(
+                archive_spec(transport).is_some(),
+                !transport.needs_credential(),
+                "{feed}: a transport is one of the two, never both and never neither"
+            );
+            if let Some(spec) = http_spec(transport) {
+                assert!(transport.needs_credential());
+                assert!(!spec.auth.header.is_empty(), "{feed} names no auth header");
+                assert!(spec.base_url.starts_with("https://"), "{feed}");
+                assert!(spec.bars_path.starts_with('/'), "{feed}");
+                http += 1;
+            } else {
+                let spec =
+                    archive_spec(transport).expect("a transport that is not HTTP is an archive");
+                assert!(
+                    !transport.needs_credential(),
+                    "a local file has no rate limit and needs no credential"
+                );
+                assert!(!spec.layouts.is_empty(), "{feed} decodes nothing");
+                archives += 1;
+            }
+        }
+        assert_eq!((http, archives), (2, 2), "two brokers, two archive vendors");
+        assert_ne!(
+            Feed::Dhan.descriptor().transport.label(),
+            Feed::Gdfl.descriptor().transport.label()
+        );
+    }
+
+    /// The two brokers differ in every field this module exists to make data.
+    #[test]
+    fn the_two_http_rows_disagree_in_every_field_that_used_to_be_a_branch() {
+        let dhan = http_spec(Feed::Dhan.descriptor().transport)
+            .expect("the secondary broker is an HTTP feed");
+        let groww = http_spec(Feed::Groww.descriptor().transport)
+            .expect("the primary broker is an HTTP feed");
+
+        assert_ne!(dhan.method, groww.method, "POST against GET");
+        assert_ne!(dhan.auth.header, groww.auth.header);
+        assert_ne!(dhan.auth.scheme, groww.auth.scheme);
+        assert_eq!(
+            dhan.range_end,
+            RangeEnd::Exclusive,
+            "toDate is NOT inclusive — one field, one conversion site"
+        );
+        assert_eq!(groww.range_end, RangeEnd::Inclusive);
+        assert_ne!(dhan.timestamps, groww.timestamps, "seconds against millis");
+        assert_ne!(dhan.pooling, groww.pooling);
+        assert_eq!(dhan.date_format, DateFormat::DashedYmd);
+        assert_eq!(dhan.prices, PriceScale::Rupees);
+        assert_eq!(groww.prices, PriceScale::Rupees);
+
+        assert_eq!(
+            dhan.response,
+            ResponseShape::ParallelArrays { envelope: None },
+            "seven arrays at the top level, which is the shape `zip` silently \
+             truncates"
+        );
+        let envelope = envelope_of(groww.response)
+            .expect("the primary broker nests its bars under an envelope");
+        assert!(!envelope.is_empty(), "an envelope key of nothing is no key");
+        assert_eq!(
+            groww.response,
+            ResponseShape::ArrayOfObjects {
+                envelope: Some(envelope),
+            },
+            "one object per bar, under that envelope"
+        );
+        assert_eq!(
+            envelope_of(dhan.response),
+            None,
+            "and the other broker's arrays are at the top level"
+        );
+
+        assert!(dhan.fields.open_interest.is_some());
+        assert_eq!(
+            groww.fields.open_interest, None,
+            "absent open interest becomes the null sentinel; zero means zero"
+        );
+        for names in [dhan.fields, groww.fields] {
+            for field in [
+                names.open,
+                names.high,
+                names.low,
+                names.close,
+                names.volume,
+                names.timestamp,
+            ] {
+                assert!(!field.is_empty());
+            }
+        }
+
+        assert_eq!(dhan.budget.per_second, Some(crate::rate::DHAN_PER_SECOND));
+        assert_eq!(
+            dhan.budget.per_minute, None,
+            "no published per-minute bound"
+        );
+        assert_eq!(dhan.budget.per_day, Some(crate::rate::DHAN_PER_DAY));
+        assert_eq!(groww.budget.per_minute, Some(crate::rate::GROWW_PER_MINUTE));
+        assert_eq!(
+            groww.budget.per_second,
+            Some(crate::rate::GROWW_PER_SECOND_UNVERIFIED),
+            "the constant's own name says the figure is not confirmed, and it \
+             is not quietly promoted here"
+        );
+        assert_eq!(groww.budget.per_day, None);
+    }
+
+    /// An archive row addresses its files by pattern, and a segment nobody
+    /// measured is refused rather than decoded against a guessed layout.
+    #[test]
+    fn an_unmeasured_segment_layout_is_refused_by_name() {
+        let truedata = archive_spec(Feed::TrueData.descriptor().transport)
+            .expect("this feed is a folder of archives");
+        let gdfl = archive_spec(Feed::Gdfl.descriptor().transport)
+            .expect("this feed is a folder of archives");
+
+        let index = truedata
+            .layout(Segment::Index)
+            .expect("the index layout was measured");
+        assert_eq!(index.segment, Segment::Index);
+        assert_eq!(
+            index.columns.len(),
+            5,
+            "five columns, measured not documented"
+        );
+        assert_eq!(
+            truedata.layout(Segment::Fno),
+            None,
+            "the futures archives were measured at nine columns and their \
+             MEANINGS were never established — a missing layout refuses"
+        );
+        assert_eq!(truedata.layout(Segment::Cash), None);
+
+        let fno = gdfl
+            .layout(Segment::Fno)
+            .expect("the F&O layout was measured");
+        assert_eq!(fno.columns.len(), 10);
+        assert_eq!(gdfl.layout(Segment::Index), None);
+
+        // Group folders and segment tokens, both directions.
+        assert_eq!(truedata.group_folder(ArchiveGroup::Options), None);
+        assert_eq!(truedata.group_folder(ArchiveGroup::Flat), None);
+        assert!(gdfl.group_folder(ArchiveGroup::Options).is_some());
+        assert!(gdfl.group_folder(ArchiveGroup::Futures).is_some());
+        assert_eq!(
+            gdfl.group_folder(ArchiveGroup::Flat),
+            None,
+            "the archive is not flat, so there is no flat folder"
+        );
+        assert!(truedata.segment_token(Segment::Index).is_some());
+        assert_eq!(
+            truedata.segment_token(Segment::Fno),
+            None,
+            "the archives carry both futures and options tokens, and one token \
+             for the pair would be wrong half the time"
+        );
+        assert_eq!(gdfl.segment_token(Segment::Fno), None);
+
+        assert_eq!(truedata.header, HeaderRow::Absent);
+        assert_eq!(gdfl.header, HeaderRow::Present(GDFL_HEADER));
+        assert_eq!(truedata.delimiter, b',');
+        assert_eq!(gdfl.delimiter, b',');
+        assert_eq!(truedata.nesting, Nesting::ZipOfDailyZips);
+        assert_eq!(gdfl.nesting, Nesting::ZipOfSegmentFolders);
+        assert_eq!(
+            gdfl.date_format,
+            DateFormat::SlashedDmy,
+            "01/07/2025 is 1 July, and reading it the other way shifts every \
+             bar by months"
+        );
+        assert_eq!(truedata.date_format, DateFormat::CompactYmd);
+        assert_eq!(truedata.prices, PriceScale::Rupees);
+        assert_eq!(gdfl.prices, PriceScale::Rupees);
+
+        // The two archives are addressed by DIFFERENT patterns, which is the
+        // whole reason the pattern is a field. Compared by discriminant so the
+        // assertion does not have to spell a file-name prefix out.
+        assert_ne!(
+            std::mem::discriminant(&truedata.archive),
+            std::mem::discriminant(&gdfl.archive),
+            "one names its segment in the file name and the other only its date"
+        );
+        assert_ne!(
+            std::mem::discriminant(&truedata.member),
+            std::mem::discriminant(&gdfl.member),
+            "one member sits at the archive root and the other under two folders"
+        );
+        assert_eq!(archive_date(truedata.archive), DateFormat::CompactYmd);
+        assert_eq!(
+            archive_date(gdfl.archive),
+            DateFormat::CompactDmy,
+            "DDMMYYYY in the archive name, DD/MM/YYYY inside the file — reading \
+             either the other way shifts every bar by months"
+        );
+        assert_ne!(
+            archive_date(gdfl.archive),
+            gdfl.date_format,
+            "and those two are deliberately not the same format"
+        );
+        for member in [truedata.member, gdfl.member] {
+            let suffix = member_suffix(member);
+            assert!(suffix.starts_with('.'), "an extension begins with a dot");
+        }
+    }
+
+    /// Both archive feeds are snapshots, both brokers are OHLCV, and the
+    /// distinction is what keeps a snapshot out of the bar format.
+    #[test]
+    fn a_snapshot_feed_is_never_declared_as_a_bar_feed() {
+        assert_eq!(Feed::Dhan.descriptor().record, RecordShape::Ohlcv);
+        assert_eq!(Feed::Groww.descriptor().record, RecordShape::Ohlcv);
+        assert_eq!(Feed::TrueData.descriptor().record, RecordShape::Snapshot);
+        assert_eq!(Feed::Gdfl.descriptor().record, RecordShape::Snapshot);
+        assert_ne!(RecordShape::Ohlcv, RecordShape::Snapshot);
+    }
+
+    /// The column vocabulary, and the honest arm inside it.
+    #[test]
+    fn the_column_vocabulary_carries_an_arm_for_a_meaning_nobody_established() {
+        let every = [
+            Column::Ticker,
+            Column::Date,
+            Column::Time,
+            Column::LastPrice,
+            Column::Open,
+            Column::High,
+            Column::Low,
+            Column::Close,
+            Column::Volume,
+            Column::OpenInterest,
+            Column::BidPrice,
+            Column::BidQty,
+            Column::AskPrice,
+            Column::AskQty,
+            Column::LastQty,
+            Column::Ignored,
+            Column::Unverified,
+        ];
+        let distinct: HashSet<_> = every.iter().collect();
+        assert_eq!(distinct.len(), every.len(), "every column means one thing");
+        assert!(
+            !TRUEDATA_INDEX.columns.contains(&Column::Volume)
+                && !TRUEDATA_INDEX.columns.contains(&Column::OpenInterest),
+            "an index has neither, so the two trailing zeros are Ignored rather \
+             than mapped onto fields it does not have"
+        );
+        assert!(GDFL_FNO.columns.contains(&Column::OpenInterest));
+        assert_eq!(
+            GDFL_FNO.columns.len(),
+            GDFL_HEADER.split(',').count(),
+            "the layout and the header row it was read from agree in width"
+        );
+    }
+
+    /// The values this module hands around are inspectable, comparable and
+    /// hashable — a refusal nobody can print is a refusal nobody can act on.
+    #[test]
+    fn the_reported_values_can_be_printed_compared_and_hashed() {
+        let session = Venue::NseIndex
+            .hours_on(day(2024, 1, 2))
+            .expect("the anchor is verified");
+        let refusal = SessionRefusal {
+            venue: Venue::NseIndex,
+            day: day(2030, 1, 1),
+            row_start: day(2029, 1, 1),
+            verified_from: None,
+            source: "TEST ROW",
+        };
+        let window = RefusalWindow {
+            venue: Venue::NseIndex,
+            start: day(2029, 1, 1),
+            verified_from: None,
+        };
+
+        let printed = format!(
+            "{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}",
+            Granularity::Minute1,
+            Granularity::Minute1.grid(),
+            GranularitySet::EMPTY,
+            SegmentSet::EMPTY,
+            Venue::NseIndex,
+            SessionKind::Continuous,
+            Hours::Unverified,
+            session,
+            session.expected_count(Granularity::Tick),
+            refusal,
+            window,
+            Feed::Dhan,
+            Feed::Dhan.descriptor(),
+            Method::Get,
+            AuthScheme::Raw,
+            DateFormat::DashedYmd,
+            RangeEnd::Inclusive,
+            TimestampEncoding::EpochSecondsUtc,
+            PriceScale::Paisa,
+            Pooling::PerVendor,
+        );
+        assert!(!printed.is_empty(), "every reported value is inspectable");
+
+        let more = format!(
+            "{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}",
+            ResponseShape::ParallelArrays { envelope: None },
+            Nesting::ZipOfDailyZips,
+            ArchiveName::DateOnly {
+                prefix: "",
+                suffix: "",
+                date: DateFormat::CompactDmy,
+            },
+            MemberPattern::SymbolAtRoot { suffix: "" },
+            ArchiveGroup::Flat,
+            HeaderRow::Absent,
+            Column::Ticker,
+            TRUEDATA_INDEX,
+            RecordShape::Ohlcv,
+            Feed::Dhan.descriptor().transport,
+            SessionRow::verified(
+                EPOCH_DAY,
+                SESSION_OPEN_MINUTE,
+                SESSION_CLOSE_MINUTE,
+                SessionKind::Continuous,
+                "TEST ROW",
+            ),
+        );
+        assert!(!more.is_empty());
+
+        // Ord and Hash, which the sets and the tables both rely on.
+        assert!(Granularity::Tick < Granularity::Week1, "coarsest last");
+        assert!(Venue::NseIndex < Venue::NseDerivatives);
+        assert!(Feed::Dhan < Feed::Gdfl);
+        let mut seen = HashSet::with_capacity(4);
+        assert!(seen.insert(Feed::Dhan));
+        assert!(!seen.insert(Feed::Dhan), "the same feed hashes the same");
+        assert!(seen.insert(Feed::Groww));
+        let mut spans = HashSet::with_capacity(2);
+        assert!(spans.insert(session), "a session hashes");
+        assert!(!spans.insert(session), "and the same one hashes the same");
+        assert_eq!(
+            refusal.venue(),
+            window.venue(),
+            "both reported values name the venue they came from"
+        );
+        let cloned = *Feed::Dhan.descriptor();
+        assert_eq!(cloned, *Feed::Dhan.descriptor(), "a row is Copy and equal");
+    }
+}

@@ -616,12 +616,25 @@ mod tests {
 
         let far = parse_window("from=2026-08-01&to=2099-01-01", today)
             .expect_err("a window years ahead is refused too");
+        // It breaks both rules, and it is refused for the one that is checked
+        // first. Asserted exactly rather than as "one of two": a test that
+        // accepts either answer cannot tell the two gates apart, and would
+        // still pass if the order silently changed.
+        let span = Window::new(day(2026, 8, 1), day(2099, 1, 1))
+            .expect("a forward window")
+            .days();
         assert!(
-            matches!(
-                far,
-                Refusal::WindowTooLong { .. } | Refusal::WindowInFuture { .. }
-            ),
-            "refused for one of the two reasons it breaks, not accepted — got {far:?}"
+            span > MAX_WINDOW_DAYS,
+            "the fixture must break the length bound as well as the future one"
+        );
+        assert_eq!(
+            far,
+            Refusal::WindowTooLong {
+                days: span,
+                cap: MAX_WINDOW_DAYS,
+            },
+            "the length bound is checked before the future gate, so that is \
+             the refusal an operator sees — got {far:?}"
         );
     }
 

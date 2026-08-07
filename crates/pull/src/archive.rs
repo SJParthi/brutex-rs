@@ -232,10 +232,20 @@ pub fn read_dir(dir: &Path, columns: Columns) -> Result<Vec<Member>, ArchiveErro
             why,
         })?;
 
+        // THE NAME IS THE STEM TWICE, NEVER THE FIRST DOT. Splitting at the
+        // FIRST dot truncated every half-strike: both
+        // `ABCAPITAL31JUL25267.5CE.NFO.csv` and `...267.5PE.NFO.csv` became
+        // `ABCAPITAL31JUL25267`, so a CALL and a PUT merged into one price
+        // series under one name. Measured on the real folder: 11,490 files
+        // collapsed to 11,259 names — 228 collision groups, 459 files.
+        //
+        // `file_stem` strips ONE trailing extension, so two calls strip `.csv`
+        // and then the exchange suffix, leaving the strike decimal intact.
         let instrument = path
-            .file_name()
-            .map(|n| n.to_string_lossy())
-            .and_then(|n| n.split('.').next().map(str::to_owned))
+            .file_stem()
+            .map(std::path::Path::new)
+            .and_then(std::path::Path::file_stem)
+            .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
 
         out.push(Member {

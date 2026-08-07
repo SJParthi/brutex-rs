@@ -117,6 +117,20 @@ jobs:
           # doc examples are scanned too: a real segment pasted into a doc
           # example publishes it exactly as effectively as a constant does.
           #
+          # THE ONE SHAPE THAT IS NOT SCANNED, and why it is a tightening and
+          # not a hole: a literal that is EXACTLY `YYYY-MM-DD` is skipped. An
+          # ISO-8601 calendar date names no account, no environment, no vendor
+          # and no field — it carries zero bytes of the information this gate
+          # protects — and the crate's date arithmetic generates them without
+          # limit, one per boundary a test pins. Nine were on the list at the
+          # commit this exclusion was added: leap days, month rolls, a century
+          # non-leap year. Left in, they would have grown until the allowlist
+          # was a wall of dates and nobody read the words next to them, which
+          # is the failure mode of an allowlist. The exclusion is anchored at
+          # both ends and requires exactly four-two-two digits, so `2024-02`,
+          # `prod-2024-01-01` and any segment with a letter in it are still
+          # scanned. All-digit literals are still scanned — see group 10.
+          #
           # WHAT IT CANNOT CHECK. That the words below are not themselves an
           # operator's real segments. `groww` and `dhan` are on the list because
           # crates/core has tracked them since its first commit, and an operator
@@ -125,20 +139,109 @@ jobs:
           # operator-side and docs/06-limits.md §18 says so.
           #
           # A NEW ENTRY IS A DELIBERATE ACT. Adding a word here is the moment to
-          # ask whether it is invented. That is the whole mechanism.
-          allowed='
-          org env region vendor fields
-          ap-south-1
-          groww dhan
+          # ask whether it is invented. That is the whole mechanism, and it is
+          # why the list is split into NAMED GROUPS with a comment over each
+          # rather than one undifferentiated block: a reviewer has to read which
+          # group a new word joined, and a word that fits no group is the
+          # question this gate exists to ask. The comments live BETWEEN the
+          # assignments and never inside them — `printf '%s\n' $allowed`
+          # word-splits, so a `#` inside a string would silently become an
+          # allowed word, and so would every word after it on that line.
+          #
+          # ---- group 1: the shape's own vocabulary, and the one real region.
+          # `/<org>/<env>/<vendor>/<field>` written out, plus `ap-south-1`,
+          # which CLAUDE.md §8 states in the clear.
+          seg_shape='org env region vendor fields ap-south-1'
+
+          # ---- group 2: vendor wire names. THE ONES THIS GATE EXISTS FOR.
+          # Each is a data vendor's own public product name, written down here
+          # as the name its bars are filed under — `Descriptor::wire` in
+          # crates/pull/src/vendor.rs. `groww` and `dhan` carry the reasoning
+          # above. `truedata` and `gdfl` are the same case and were checked the
+          # same way before being added: both are already tracked and public in
+          # docs/08-vendor-samples.md and docs/05-decisions.md, so removing
+          # them from crates/pull would leak nothing back. Whether either is
+          # ALSO an operator's real `<vendor>` segment is operator-side and
+          # unknowable from inside this repository — docs/06-limits.md §18.
+          # Note for the reader: CLAUDE.md §8 says crates/pull "holds no org,
+          # env, or vendor literal". Four vendor literals are on this line. The
+          # sentence and the tree disagree and the tree is not being hidden.
+          vendor_wire='groww dhan truedata gdfl'
+
+          # ---- group 3: invented configuration fixtures. Nonsense by
+          # construction — no operator's path reads `orgone/testenv/vendorone`.
+          config_fixture='
           orgone testenv vendorone vendortwo fieldone fieldtwo fieldthree
           field-one_2 a-value
+          '
+
+          # ---- group 4: deliberately secret-SHAPED fixtures, which exist to
+          # prove the secret backstop rejects them. Keyboard walks and the
+          # oldest joke password in the trade; none is a credential.
+          secret_fixture='
           k7f2p9q1w8e3-5t6y0u4i2o9 k7f2p9q1w8e3r5t6y0u4i2o
           k7f2p9q1w8e3r5t6y0u4i2o9 kfpqwerstyuioasdfghjklzx
           hunter2 hunter2-and-then-some stale fresh 9876
+          '
+
+          # ---- group 5: test scaffolding — expect() messages, assert labels,
+          # fixture names and words quoted inside prose. The gate scans comments
+          # on purpose, so a word quoted in a doc comment lands here too.
+          # `brutex-no-such-dir-ever` is a path chosen to NOT exist.
+          scaffold='
           a v one no ok big good invalid genesis manifest write read-only deny
           anything mkdir notutf8 atthebound brutex-pull june july nifty
           core store pull ratio
+          real next small bounded three summed everything february
+          non-zero non-decreasing held centuries negative per-day per-second
+          brutex-no-such-dir-ever
           '
+
+          # ---- group 6: granularity and session tokens. `Granularity::dir`
+          # and `SessionKind::label` in crates/pull/src/vendor.rs. These name a
+          # bar interval and are the STABLE ON-DISK DIRECTORY NAMES, which
+          # CLAUDE.md §3 rule 8 forbids renaming.
+          timeframe='
+          tick 1s 5s 1min 3min 5min 15min 30min 1hr 1day 1week continuous
+          '
+
+          # ---- group 7: rate-governor display strings, crates/pull/src/rate.rs.
+          # `WindowSpan::{Second,Minute,Day}` and `RequestKind::{Live,
+          # Historical}` rendering themselves for a log line or a refusal.
+          # `live` IS one of the ten environment words gate 1c matches on, and
+          # that is why it was looked at rather than waved through: here it is
+          # the live-quote endpoint group as opposed to the historical one, in
+          # a two-variant enum, and it is joined to no path.
+          governor='second minute day live historical'
+
+          # ---- group 8: the vendors' own record field names. CLAUDE.md §8
+          # says in as many words that crates/pull "holds the shape and the
+          # field names". `FieldNames`/`ResponseShape` in vendor.rs, the
+          # column labels fetch.rs quotes back in a refusal, and the file
+          # extension archive.rs checks. None is a credential field.
+          record_field='
+          open high low close volume timestamp open_interest payload csv
+          '
+
+          # ---- group 9: an HTTP HEADER NAME, not a value. One broker sends
+          # its token in a header called `access-token`; the token itself is
+          # read from Parameter Store and never appears in this repository.
+          # Read this line twice before adding anything to it.
+          header_name='access-token'
+
+          # ---- group 10: bare integers a refusal message must contain, so the
+          # test asserts the refused value is IN the message. These are domain
+          # bounds — u32::MAX, the year-9999 epoch-millisecond ceiling, the two
+          # lengths of February. All-digit literals are NOT excluded from the
+          # scan by shape, deliberately: a twelve-digit account number is a
+          # perfectly ordinary `<org>` segment, and `253402281000` is twelve
+          # digits. It is on this list because it was read, not because a
+          # pattern let it past.
+          bound_number='10000 1970 9999 28 29 4294967295 253402281000'
+
+          allowed="${seg_shape} ${vendor_wire} ${config_fixture}
+          ${secret_fixture} ${scaffold} ${timeframe} ${governor}
+          ${record_field} ${header_name} ${bound_number}"
           bad=0
           while IFS= read -r word; do
             if [ -z "$word" ]; then continue; fi
@@ -150,7 +253,9 @@ jobs:
             fi
           done < <(git ls-files 'crates/pull' \
                    | xargs grep -ohE '"[a-z0-9][a-z0-9_-]{0,31}"' \
-                   | tr -d '"' | sort -u)
+                   | tr -d '"' \
+                   | { grep -Ev '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' || true; } \
+                   | sort -u)
           if [ "$bad" -ne 0 ]; then
             echo
             echo "Either the literal is invented — add it above — or it is a real"
@@ -1419,17 +1524,39 @@ jobs:
           #             appear in the bench, so a row id cannot be invented
           #             here to pad the table.
           #
-          # crates/api IS DELIBERATELY ABSENT AND THIS GATE IS RED BECAUSE OF
-          # IT. api makes cost claims in census.rs, merge.rs and render.rs, and
-          # no bench for it is tracked — render is one of the two operations
-          # this gate was written about. A row is added the moment the bench is
-          # tracked, by whoever tracks it. Pre-writing the row would have made
-          # the gate green over a bench that does not exist, which is the
-          # failure gate 8 shipped with.
+          # crates/api WAS DELIBERATELY ABSENT AND THIS GATE WAS RED BECAUSE OF
+          # IT. api makes cost claims in catalog.rs, census.rs, merge.rs and
+          # render.rs, and no bench for it was tracked — render is one of the
+          # two operations this gate was written about. The row below was added
+          # only after `crates/api/benches/ratio.rs` was tracked and read: it
+          # builds three universes of 2, 2,787 and 50,000 instruments, renders
+          # the real `instruments_html_from` and `dashboard_html` at each, and
+          # asserts three separate ceilings — the 2,787→50,000 ratio at a fixed
+          # 200 drawn rows, the marginal picoseconds per instrument (the audit's
+          # own 62,500 ps/instrument defect measured directly), and cost PER
+          # RENDERED ROW so flatness cannot be bought by drawing less. Adding
+          # the row before the bench existed would have made the gate green over
+          # nothing, which is the failure gate 8 shipped with.
+          #
+          # crates/costs likewise. `crates/costs/benches/ratio.rs` measures the
+          # regime lookup at the anchor row against the last row and on a
+          # two-row table against a three-row one, the option arithmetic at a
+          # near strike against a far one and at one lot against a million, and
+          # the round trip at both magnitudes — each against CEILING_PERMILLE.
+          # Its twelve row ids are `C-K-01` … `C-K-12`, NOT `K-01` … `K-12`:
+          # both families are real rows in docs/04-invariants.md, the `K-*`
+          # family is the crate's correctness rows, and layer 4's substring
+          # match would have accepted the wrong one. D-0045 renumbered these
+          # ids precisely so this row could be added and mean something.
+          #
+          # min_points are pinned at what each bench carries at the commit that
+          # added its row — api 4, costs 27, counted with layer 3's own awk.
           cover='
           core   crates/core/benches/ratio.rs   3  C-09 C-10
           pull   crates/pull/benches/ratio.rs   4  C-11 C-12
           store  crates/store/benches/ratio.rs  4  C-01 C-07 C-08
+          api    crates/api/benches/ratio.rs    4  C-14 C-15 C-16 C-17
+          costs  crates/costs/benches/ratio.rs  27 C-K-01 C-K-02 C-K-03 C-K-04 C-K-05 C-K-06 C-K-07 C-K-08 C-K-09 C-K-10 C-K-11 C-K-12
           '
 
           inv=docs/04-invariants.md

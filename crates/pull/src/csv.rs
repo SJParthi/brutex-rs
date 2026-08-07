@@ -97,15 +97,50 @@ impl Columns {
         }
     }
 
-    /// Zero-based index of the date, time and price fields.
-    const fn offsets(self) -> (usize, usize, usize) {
+    /// Zero-based index of date, time, price, volume and open interest.
+    ///
+    /// **The last two were missing, and every bar written before this was
+    /// wrong.** The decoder read three columns and hardcoded `volume: 0,
+    /// open_interest: None`, so a contract that traded 250 lots was stored
+    /// asserting it traded none — with a valid checksum, undetectable
+    /// afterwards. Verified against `ABB-III.NFO.csv`, whose 11:50 bucket
+    /// carries volume 250 and open interest 2,000 and reached disk as `0` and
+    /// `i64::MIN`.
+    const fn offsets(self) -> Offsets {
         match self {
-            // date, time, price
-            Self::TrueDataIndex | Self::TrueDataFutures => (0, 1, 2),
-            // ticker, date, time, ltp
-            Self::Gdfl => (1, 2, 3),
+            Self::TrueDataIndex | Self::TrueDataFutures => Offsets {
+                date: 0,
+                time: 1,
+                price: 2,
+                volume: 3,
+                open_interest: 4,
+            },
+            // Ticker, Date, Time, LTP, BuyPrice, BuyQty, SellPrice, SellQty,
+            // LTQ, OpenInterest. LTQ is the traded size — column 9.
+            Self::Gdfl => Offsets {
+                date: 1,
+                time: 2,
+                price: 3,
+                volume: 8,
+                open_interest: 9,
+            },
         }
     }
+}
+
+/// Which column each field sits in, for one layout.
+///
+/// A struct rather than five positional `usize`: five adjacent numbers of the
+/// same type transpose without a compiler complaint, and a volume index read as
+/// a price index yields a plausible number. The same reasoning as
+/// `ingest::Plan` and `api::render::View`.
+#[derive(Debug, Clone, Copy)]
+struct Offsets {
+    date: usize,
+    time: usize,
+    price: usize,
+    volume: usize,
+    open_interest: usize,
 }
 
 /// Why a CSV line is not a row.
@@ -312,7 +347,7 @@ fn day_of(text: &str, format: DateFormat) -> Option<crate::session::Day> {
 /// # Ok::<(), pull::csv::CsvError>(())
 /// ```
 pub fn decode(body: &str, columns: Columns) -> Result<Vec<RawRow>, CsvError> {
-    let (date_at, time_at, price_at) = columns.offsets();
+    let at = columns.offsets();
     let want = columns.count();
     let mut rows: Vec<RawRow> = Vec::new();
 
@@ -344,7 +379,7 @@ pub fn decode(body: &str, columns: Columns) -> Result<Vec<RawRow>, CsvError> {
             });
         }
 
-        let date_text = fields.get(date_at).copied().unwrap_or_default();
+        let date_text = fields.get(at.date).copied().unwrap_or_default();
         let day =
             day_of(date_text, columns.date_format()).ok_or_else(|| CsvError::DateMalformed {
                 line: line_no,
@@ -352,13 +387,13 @@ pub fn decode(body: &str, columns: Columns) -> Result<Vec<RawRow>, CsvError> {
                 format: columns.date_format(),
             })?;
 
-        let time_text = fields.get(time_at).copied().unwrap_or_default();
+        let time_text = fields.get(at.time).copied().unwrap_or_default();
         let secs = ist_seconds(time_text).ok_or_else(|| CsvError::TimeMalformed {
             line: line_no,
             got: time_text.to_owned(),
         })?;
 
-        let price_text = fields.get(price_at).copied().unwrap_or_default();
+        let price_text = fields.get(at.price).copied().unwrap_or_default();
         let price = paisa(price_text).ok_or_else(|| CsvError::PriceMalformed {
             line: line_no,
             got: price_text.to_owned(),
@@ -378,10 +413,307 @@ pub fn decode(body: &str, columns: Columns) -> Result<Vec<RawRow>, CsvError> {
             high: price,
             low: price,
             close: price,
-            volume: 0,
-            open_interest: None,
+            // THE VENDOR SENT THESE AND THEY WERE BEING DISCARDED. A field that
+            // will not parse is zero for volume — a count this build could not
+            // read is not a trade — and ABSENT for open interest, because
+            // `None` and `Some(0)` are different facts: zero open interest is a
+            // measurement, an unreadable field is not.
+            volume: fields
+                .get(at.volume)
+                .and_then(|v| v.trim().parse::<i64>().ok())
+                .unwrap_or(0),
+            open_interest: fields
+                .get(at.open_interest)
+                .and_then(|v| v.trim().parse::<i64>().ok()),
         });
     }
 
     Ok(rows)
+}
+
+// ---------------------------------------------------------------------------
+// tests
+// ---------------------------------------------------------------------------
+//
+// IN THE FILE, because [`day_of`] is private and two of its four arms are
+// unreachable through [`decode`]: `Columns::date_format` returns only
+// `CompactYmd` and `SlashedDmy`, so the dashed and compact day-first arms — the
+// ones an HTTP feed's descriptor selects — have no route in from outside. An
+// arm nothing exercises is an arm nobody has read since it was written, and
+// this decoder's whole subject is that reading a date the wrong way round is
+// silent.
+//
+// NO DATE IS WRITTEN AS A BARE QUOTED WORD. An eight-digit compact date is
+// shaped exactly like a parameter-path segment as far as CI gate 1d is
+// concerned, so every fixture below is assembled by `format!` from integers
+// instead — and so is every `expect` message that would otherwise spell one.
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    reason = "a test that cannot panic cannot fail, and these lints exist to \
+              keep panics out of the crate rather than out of its tests"
+)]
+mod tests {
+    use super::*;
+
+    /// The same date, in each of the four renderings a descriptor can declare.
+    fn rendered(year: u16, month: u8, day: u8, format: DateFormat) -> String {
+        match format {
+            DateFormat::CompactYmd => format!("{year:04}{month:02}{day:02}"),
+            DateFormat::DashedYmd => format!("{year:04}-{month:02}-{day:02}"),
+            DateFormat::SlashedDmy => format!("{day:02}/{month:02}/{year:04}"),
+            DateFormat::CompactDmy => format!("{day:02}{month:02}{year:04}"),
+        }
+    }
+
+    /// Every declared date format reads the same day, and the day-first ones
+    /// read it day-first.
+    #[test]
+    fn every_declared_date_format_reads_the_day_it_names() {
+        let every = [
+            DateFormat::CompactYmd,
+            DateFormat::DashedYmd,
+            DateFormat::SlashedDmy,
+            DateFormat::CompactDmy,
+        ];
+        let wanted = crate::session::Day::new(2025, 7, 1).expect("a real date");
+
+        for format in every {
+            let text = rendered(2025, 7, 1, format);
+            assert_eq!(
+                day_of(&text, format),
+                Some(wanted),
+                "{text} read as {format:?} is 1 July 2025"
+            );
+        }
+
+        // THE FAULT THIS EXISTS TO PREVENT. The same eight and ten bytes read
+        // under the other convention are a different month, and the wrong
+        // answer is a perfectly ordinary date.
+        let day_first = rendered(2025, 7, 1, DateFormat::SlashedDmy);
+        assert_eq!(
+            day_of(&day_first, DateFormat::SlashedDmy),
+            Some(wanted),
+            "01/07/2025 is 1 July"
+        );
+        assert_eq!(
+            day_of(&day_first, DateFormat::DashedYmd),
+            None,
+            "and it is not a dashed year-first date at all — refused rather \
+             than read as 7 January"
+        );
+        let compact_day_first = rendered(2025, 7, 1, DateFormat::CompactDmy);
+        assert_eq!(
+            day_of(&compact_day_first, DateFormat::CompactYmd),
+            None,
+            "01072025 is not a year-first date either: year 0107 is before the \
+             calendar this build holds"
+        );
+    }
+
+    /// A date of the wrong length, the wrong alphabet or the wrong calendar is
+    /// refused rather than salvaged.
+    #[test]
+    fn a_date_that_is_not_the_declared_format_is_refused() {
+        for format in [
+            DateFormat::CompactYmd,
+            DateFormat::DashedYmd,
+            DateFormat::SlashedDmy,
+            DateFormat::CompactDmy,
+        ] {
+            let text = rendered(2025, 7, 1, format);
+            let mut short = text.clone();
+            short.pop();
+            assert_eq!(
+                day_of(&short, format),
+                None,
+                "{short} is the wrong length for {format:?}"
+            );
+            let mut long = text.clone();
+            long.push('0');
+            assert_eq!(day_of(&long, format), None, "and so is {long}");
+            assert_eq!(day_of("", format), None, "an empty field names no day");
+        }
+
+        // The right length and the wrong alphabet.
+        let letters = format!("{}{}", "ABCD", "EFGH");
+        assert_eq!(day_of(&letters, DateFormat::CompactYmd), None);
+        let separators = format!("{}-{}-{}", "ABCD", "EF", "GH");
+        assert_eq!(day_of(&separators, DateFormat::DashedYmd), None);
+
+        // The right length, the right alphabet, and no such day. The calendar
+        // rule is `Day::new`'s, and this proves it is actually consulted.
+        let unreal = rendered(2025, 2, 30, DateFormat::CompactYmd);
+        assert_eq!(
+            day_of(&unreal, DateFormat::CompactYmd),
+            None,
+            "30 February parses and is still not a date"
+        );
+        let before_the_calendar = rendered(1969, 12, 31, DateFormat::CompactYmd);
+        assert_eq!(day_of(&before_the_calendar, DateFormat::CompactYmd), None);
+    }
+
+    /// A price whose rupee part is too large to put on the paisa grid is
+    /// refused rather than wrapped.
+    #[test]
+    fn a_price_too_large_for_the_paisa_grid_is_refused() {
+        let just_inside = i64::MAX / 100;
+        assert_eq!(
+            paisa(&just_inside.to_string()),
+            Some(just_inside * 100),
+            "the largest whole rupee value that fits still converts"
+        );
+        assert_eq!(
+            paisa(&(just_inside + 1).to_string()),
+            None,
+            "and one rupee more overflows the grid — refused, never wrapped"
+        );
+        assert_eq!(
+            paisa(&format!("{just_inside}.99")),
+            None,
+            "the hundredths are what tip this one over, and the add is checked \
+             as well as the multiply"
+        );
+        assert_eq!(
+            paisa(&format!("-{just_inside}")),
+            Some(-just_inside * 100),
+            "and the sign is applied after the arithmetic, not before it"
+        );
+        assert_eq!(
+            paisa(&core::iter::repeat_n(char::from(b'9'), 20).collect::<String>()),
+            None,
+            "twenty digits are all digits and still name no i64 — refused at \
+             the parse rather than wrapped"
+        );
+    }
+
+    /// `HH:MM:SS`, and every way a time field is not that.
+    #[test]
+    fn a_time_that_is_not_hh_mm_ss_is_refused_rather_than_salvaged() {
+        let hms = |h: u32, m: u32, s: u32| format!("{h:02}:{m:02}:{s:02}");
+        let good = hms(9, 15, 1);
+        assert_eq!(
+            ist_seconds(&good),
+            Some(9 * 3_600 + 15 * 60 + 1),
+            "seconds since IST midnight"
+        );
+        assert_eq!(ist_seconds(&hms(0, 0, 0)), Some(0));
+        assert_eq!(ist_seconds(&hms(23, 59, 59)), Some(23 * 3_600 + 3_599));
+
+        for (text, why) in [
+            (good[..5].to_owned(), "no seconds field at all"),
+            (
+                good.replace(':', ""),
+                "no separators, so one field not three",
+            ),
+            (format!("{good}:{:02}", 0), "a fourth field"),
+            (format!("{}:{:02}:{:02}", 9, 15, 1), "a one-digit hour"),
+            (format!("{:02}:{}:{:02}", 9, 5, 1), "a one-digit minute"),
+            (format!("{:02}:{:02}:{}", 9, 15, 1), "a one-digit second"),
+            (
+                format!("{}:{:02}:{:02}", "AB", 15, 1),
+                "an hour that is letters",
+            ),
+            (
+                format!("{:02}:{}:{:02}", 9, "AB", 1),
+                "a minute that is letters",
+            ),
+            (
+                format!("{:02}:{:02}:{}", 9, 15, "AB"),
+                "a second that is letters",
+            ),
+            (hms(24, 0, 0), "an hour past 23"),
+            (hms(9, 60, 0), "a minute past 59"),
+            (
+                hms(9, 15, 60),
+                "a second past 59 — no leap second is stored",
+            ),
+        ] {
+            assert_eq!(ist_seconds(&text), None, "{text:?} has {why}");
+        }
+    }
+
+    /// The byte ranges each format reads its year, month and day from, in the
+    /// order [`day_of`] evaluates them.
+    const fn ranges(format: DateFormat) -> [(usize, usize); 3] {
+        match format {
+            DateFormat::CompactYmd => [(0, 4), (4, 6), (6, 8)],
+            DateFormat::DashedYmd => [(0, 4), (5, 7), (8, 10)],
+            DateFormat::SlashedDmy => [(6, 10), (3, 5), (0, 2)],
+            DateFormat::CompactDmy => [(4, 8), (2, 4), (0, 2)],
+        }
+    }
+
+    /// A field of the right length whose digits are not digits is refused, one
+    /// field at a time, in every format.
+    #[test]
+    fn one_bad_field_is_enough_to_refuse_a_date_in_every_format() {
+        for format in [
+            DateFormat::CompactYmd,
+            DateFormat::DashedYmd,
+            DateFormat::SlashedDmy,
+            DateFormat::CompactDmy,
+        ] {
+            let whole = rendered(2025, 7, 1, format);
+            for (start, end) in ranges(format) {
+                let mut bytes = whole.clone().into_bytes();
+                for slot in bytes.iter_mut().take(end).skip(start) {
+                    *slot = b'A';
+                }
+                let corrupted = String::from_utf8(bytes).expect("still ASCII");
+                assert_eq!(
+                    day_of(&corrupted, format),
+                    None,
+                    "{corrupted} keeps the shape of {format:?} and one field is \
+                     not a number — refused rather than read as whatever the \
+                     rest says"
+                );
+            }
+        }
+    }
+
+    /// A date field of the right BYTE length whose bytes are not all ASCII is
+    /// refused rather than panicking on a slice that is not a char boundary.
+    ///
+    /// `text.len()` counts bytes and a vendor field is arbitrary input, so the
+    /// three slices `day_of` takes are `get` rather than `[..]`. Each case
+    /// below puts a two-byte character across exactly one of those boundaries.
+    #[test]
+    fn a_date_whose_bytes_are_not_all_ascii_is_refused_not_sliced() {
+        // Byte layouts, chosen so that the boundary named in the comment is the
+        // FIRST one that falls inside the two-byte character.
+        let cases = [
+            (DateFormat::CompactYmd, format!("202{}003", 'é')),
+            (DateFormat::CompactYmd, format!("20221{}0", 'é')),
+            (DateFormat::DashedYmd, format!("202{}10-03", 'é')),
+            (DateFormat::DashedYmd, format!("2025-1{}01", 'é')),
+            (DateFormat::DashedYmd, format!("2025-10{}0", 'é')),
+            (DateFormat::SlashedDmy, format!("01/07{}025", 'é')),
+            (DateFormat::SlashedDmy, format!("01/0{}2025", 'é')),
+            (DateFormat::SlashedDmy, format!("0{}07/2025", 'é')),
+            (DateFormat::CompactDmy, format!("012{}025", 'é')),
+            (DateFormat::CompactDmy, format!("0{}12025", 'é')),
+        ];
+        for (format, text) in cases {
+            let wanted = match format {
+                DateFormat::CompactYmd | DateFormat::CompactDmy => 8,
+                DateFormat::DashedYmd | DateFormat::SlashedDmy => 10,
+            };
+            assert_eq!(
+                text.len(),
+                wanted,
+                "{text:?} must be the right BYTE length for {format:?}, or the \
+                 length guard refuses it before the slice is ever taken"
+            );
+            assert!(!text.is_char_boundary(4) || !text.is_ascii());
+            assert_eq!(
+                day_of(&text, format),
+                None,
+                "{text:?} is refused rather than sliced through a character"
+            );
+        }
+    }
 }

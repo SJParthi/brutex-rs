@@ -1109,6 +1109,20 @@ fn pull_forms(view: &PullView<'_>) -> String {
         field("From (inclusive)", &date_input("from", today)),
         field("To (inclusive)", &date_input("to", today)),
     );
+    // THE LOCAL-ARCHIVE FIELD. Half the vendors are not APIs — TrueData and
+    // GDFL sell folders of CSVs — and that half needs no socket, no token and
+    // no rate governor, so it is the half that works today. Left blank, the
+    // request takes the HTTP path, which does not exist yet and refuses loudly
+    // rather than doing nothing.
+    let _ = write!(
+        out,
+        "{}",
+        field(
+            "Local vendor folder (optional)",
+            "<input type=\"text\" name=\"folder\" \
+             placeholder=\"/Users/you/Downloads/GDFL/GFDLNFO_TICK_01072025/Futures/-III\">",
+        )
+    );
     out.push_str("<button type=\"submit\">Start spot pull</button>");
     out.push_str("</form>");
     out.push_str(&pull_fine_print(today));
