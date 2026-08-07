@@ -179,6 +179,37 @@ pub fn fold(snapshots: &[Bar], bucket: Bucket) -> Result<Vec<Bar>, FoldError> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum FoldError {
+    /// A width narrower than the bars it is being built from.
+    ///
+    /// **This is an information limit, not an arithmetic one, and it was found
+    /// by measurement rather than by reading.** A folded one-minute bar is
+    /// stamped at the *start* of its minute, so the whole minute travels with
+    /// that single timestamp and *when inside the minute* things happened is
+    /// gone. Fold again at a width whose edges do not land on minute
+    /// boundaries and the entire minute is attributed to whichever bucket the
+    /// stamp falls in — dragging in data from after that bucket closed.
+    ///
+    /// Measured on the operator's archive, all 12,132 contracts:
+    ///
+    /// | Width | Bars compared | Wrong | Worst error |
+    /// |---|---|---|---|
+    /// | 90 s | 2,513,114 | **513,605 (20.4%)** | ₹1,147.90 |
+    /// | 100 s | 2,275,830 | **510,889 (22.4%)** | ₹1,147.90 |
+    ///
+    /// One concrete case: a 100-second bucket `[12:55:00, 12:56:40)` built from
+    /// minute bars swallowed a trade stamped **12:56:58** — eighteen seconds of
+    /// the future inside a closed bar, which is `CLAUDE.md` §3 rule 7 broken by
+    /// arithmetic rather than by an accessor.
+    ///
+    /// **Nothing is forbidden by this.** Any width at all is exact when folded
+    /// from the raw snapshots, which is what [`fold_from_snapshots`] is for.
+    /// This refusal names the one combination that loses information.
+    NarrowerThanSource {
+        /// The width asked for, in seconds.
+        want_secs: u32,
+        /// The width the input bars already carry, in seconds.
+        source_secs: u32,
+    },
     /// A snapshot's timestamp precedes the one before it.
     ///
     /// Refused rather than sorted. Rows sharing a second carry no tiebreaker,
@@ -196,17 +227,36 @@ pub enum FoldError {
 
 impl core::fmt::Display for FoldError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let Self::OutOfOrder {
-            at,
-            previous,
-            found,
-        } = *self;
-        write!(
-            f,
-            "snapshot {at} is stamped {found}, before {previous}. Refused \
-             rather than sorted: rows sharing a second have no tiebreaker, so a \
-             sort invents an order and changes which price became the open."
-        )
+        // A `match`, not a `let ... else`. The single-variant destructure that
+        // stood here became `unreachable!()` the moment a second variant
+        // existed, and the guard's own test is what fired it — a refusal that
+        // panicked instead of printing.
+        match *self {
+            Self::NarrowerThanSource {
+                want_secs,
+                source_secs,
+            } => write!(
+                f,
+                "a {want_secs}s bucket cannot be built from {source_secs}s \
+                 bars: {want_secs} is not a whole multiple of {source_secs}, so \
+                 a bucket edge falls INSIDE a source bar and that bar cannot be \
+                 split — the information to split it was discarded when it was \
+                 made. Measured cost of allowing it: 20.4% of bars wrong at \
+                 90s, worst error Rs 1,147.90. Fold from the raw snapshots \
+                 instead, where any width is exact."
+            ),
+            Self::OutOfOrder {
+                at,
+                previous,
+                found,
+            } => write!(
+                f,
+                "snapshot {at} is stamped {found}, before {previous}. Refused \
+                 rather than sorted: rows sharing a second have no tiebreaker, \
+                 so a sort invents an order and changes which price became the \
+                 open."
+            ),
+        }
     }
 }
 
@@ -347,3 +397,151 @@ impl Ladder {
 }
 
 const _: () = assert!(LADDER.len() == 6);
+
+/// Folds raw snapshots at **any** width. Always exact.
+///
+/// A snapshot carries its own instant, so no width can misattribute it. This
+/// is the entry point a sub-minute timeframe must use, and the reason nothing
+/// about the design is locked down: 1 second, 7 seconds, 90 seconds and one
+/// day all go through here and all are correct.
+///
+/// # Errors
+///
+/// [`FoldError::OutOfOrder`] if the snapshots are not in non-decreasing
+/// timestamp order.
+pub fn fold_from_snapshots(snapshots: &[Bar], bucket: Bucket) -> Result<Vec<Bar>, FoldError> {
+    fold(snapshots, bucket)
+}
+
+/// Folds bars that are already `source` wide into `bucket`-wide bars.
+///
+/// # Errors
+///
+/// [`FoldError::NarrowerThanSource`] when `bucket` is not a whole multiple of
+/// `source`. That is the combination which loses information: see the variant's
+/// own documentation for the measured cost of allowing it.
+///
+/// [`FoldError::OutOfOrder`] as for [`fold`].
+///
+/// # Examples
+///
+/// ```
+/// # use pull::fold::{fold_from_bars, Bucket, FoldError};
+/// let one_min = Bucket::MINUTE;
+///
+/// // Every whole-minute width is exact, so all of these are legal.
+/// for secs in [60u32, 120, 180, 300, 900, 3_600, 86_400] {
+///     let wider = Bucket::of_secs(secs).expect("non-zero");
+///     assert!(fold_from_bars(&[], wider, one_min).is_ok(), "{secs}s");
+/// }
+///
+/// // 90 seconds is one and a half minutes. Refused BY NAME, not silently
+/// // mis-attributed — this is the case measured at 20.4% wrong bars.
+/// let ninety = Bucket::of_secs(90).expect("non-zero");
+/// assert_eq!(
+///     fold_from_bars(&[], ninety, one_min),
+///     Err(FoldError::NarrowerThanSource { want_secs: 90, source_secs: 60 }),
+/// );
+/// ```
+pub fn fold_from_bars(bars: &[Bar], bucket: Bucket, source: Bucket) -> Result<Vec<Bar>, FoldError> {
+    // WIDER IS ALWAYS SAFE, NARROWER NEVER IS, AND "NOT A WHOLE MULTIPLE" IS
+    // NARROWER IN THE ONLY sense that matters: some bucket edge falls inside a
+    // source bar, and that bar cannot be split because the information to split
+    // it was discarded when it was made.
+    if !bucket.secs().is_multiple_of(source.secs()) {
+        return Err(FoldError::NarrowerThanSource {
+            want_secs: bucket.secs(),
+            source_secs: source.secs(),
+        });
+    }
+    fold(bars, bucket)
+}
+
+#[cfg(test)]
+mod guard {
+    use super::{Bucket, FoldError, fold_from_bars, fold_from_snapshots};
+
+    /// Every timeframe the operator named is a whole number of minutes, and
+    /// every one of them is exact from stored one-minute bars.
+    #[test]
+    fn every_whole_minute_width_is_allowed_from_minute_bars() {
+        for (label, secs) in [
+            ("1 minute", 60u32),
+            ("2 minute", 120),
+            ("3 minute", 180),
+            ("5 minute", 300),
+            ("15 minute", 900),
+            ("45 minute", 2_700),
+            ("1 hour", 3_600),
+            ("4 hour", 14_400),
+            ("1 day", 86_400),
+        ] {
+            let want = Bucket::of_secs(secs).expect("non-zero");
+            assert!(
+                fold_from_bars(&[], want, Bucket::MINUTE).is_ok(),
+                "{label} is {secs}s, a whole multiple of 60 — it must be allowed"
+            );
+        }
+    }
+
+    /// A width that is not a whole multiple is REFUSED, not mis-attributed.
+    ///
+    /// Measured on the operator's archive across all 12,132 contracts: a 90s
+    /// bucket built from minute bars got **20.4% of bars wrong**, worst error
+    /// Rs 1,147.90, and one case pulled a trade stamped 12:56:58 into a bucket
+    /// that ended 12:56:40 — eighteen seconds of the future inside a closed
+    /// bar. That is why this refuses rather than approximates.
+    #[test]
+    fn a_sub_minute_width_from_minute_bars_is_refused_by_name() {
+        for secs in [1u32, 7, 30, 90, 100, 3_607] {
+            let want = Bucket::of_secs(secs).expect("non-zero");
+            assert_eq!(
+                fold_from_bars(&[], want, Bucket::MINUTE),
+                Err(FoldError::NarrowerThanSource {
+                    want_secs: secs,
+                    source_secs: 60,
+                }),
+                "{secs}s is not a whole multiple of 60"
+            );
+        }
+
+        let text = fold_from_bars(&[], Bucket::of_secs(90).expect("nz"), Bucket::MINUTE)
+            .expect_err("90 is not a multiple of 60")
+            .to_string();
+        assert!(
+            text.contains("snapshots"),
+            "the refusal must say where the width IS available — nothing is \
+             forbidden, only this one lossy path. Got {text:?}"
+        );
+    }
+
+    /// From snapshots, EVERY width is exact. Nothing is locked down.
+    #[test]
+    fn any_width_at_all_is_allowed_from_snapshots() {
+        for secs in [1u32, 7, 30, 90, 100, 60, 300, 3_607, 86_400] {
+            let want = Bucket::of_secs(secs).expect("non-zero");
+            assert!(
+                fold_from_snapshots(&[], want).is_ok(),
+                "{secs}s from raw snapshots is exact — a snapshot carries its \
+                 own instant, so no width can misattribute it"
+            );
+        }
+    }
+
+    /// Folding minute bars into wider ones, from a five-minute source too.
+    #[test]
+    fn the_guard_is_about_the_source_not_about_minutes() {
+        let five = Bucket::of_secs(300).expect("nz");
+        // 15m and 1h are whole multiples of 5m — allowed.
+        assert!(fold_from_bars(&[], Bucket::of_secs(900).expect("nz"), five).is_ok());
+        assert!(fold_from_bars(&[], Bucket::of_secs(3_600).expect("nz"), five).is_ok());
+        // 1m is NARROWER than 5m — the information is gone.
+        assert!(fold_from_bars(&[], Bucket::MINUTE, five).is_err());
+        // 3m is not a multiple of 5m even though both are whole minutes.
+        assert!(
+            fold_from_bars(&[], Bucket::of_secs(180).expect("nz"), five).is_err(),
+            "3 minutes is not a whole multiple of 5 minutes — a bucket edge \
+             would fall inside a source bar"
+        );
+    }
+}
