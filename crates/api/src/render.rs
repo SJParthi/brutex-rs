@@ -2956,6 +2956,33 @@ mod tests {
             "{html}"
         );
         assert!(html.contains("class=\"key r3\""), "and a legend: {html}");
+
+        // ── THE HALF OF A-09 THIS TEST DID NOT PROVE ────────────────────────
+        //
+        // The invariant is two claims joined by an "and": every reason the
+        // filter counts is **named on the page by `DropReason::label`**, AND
+        // the bar width is integer arithmetic. Everything above proves the
+        // second. Nothing proved the first — the counts `>40<` and `>10<` say
+        // a number reached the page, not that the reason beside it did, and a
+        // renderer that dropped a row entirely would still satisfy them.
+        //
+        // It matters because a reason with a zero is the one most likely to be
+        // quietly omitted, and a filter reason absent from the page is a filter
+        // nobody can audit. All four are asserted, measured or not.
+        for reason in DROP_REASONS {
+            assert!(
+                html.contains(reason.label()),
+                "every drop reason is named on the page by its own label; \
+                 {:?} is missing: {html}",
+                reason.label()
+            );
+        }
+        assert_eq!(
+            DROP_REASONS.len(),
+            4,
+            "a fifth reason must be added to the panel, not silently counted"
+        );
+
         for forbidden in ["<script", "javascript:", "onclick", "onload", "onerror"] {
             assert!(!html.contains(forbidden), "{forbidden} must never appear");
         }
