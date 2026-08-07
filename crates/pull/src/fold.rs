@@ -121,14 +121,14 @@ pub fn fold(snapshots: &[Bar], bucket: Bucket) -> Result<Vec<Bar>, FoldError> {
     let mut previous: Option<i64> = None;
 
     for (i, snap) in snapshots.iter().enumerate() {
-        if let Some(prev) = previous {
-            if snap.ts_micros < prev {
-                return Err(FoldError::OutOfOrder {
-                    at: i,
-                    previous: prev,
-                    found: snap.ts_micros,
-                });
-            }
+        if let Some(prev) = previous
+            && snap.ts_micros < prev
+        {
+            return Err(FoldError::OutOfOrder {
+                at: i,
+                previous: prev,
+                found: snap.ts_micros,
+            });
         }
         previous = Some(snap.ts_micros);
 
