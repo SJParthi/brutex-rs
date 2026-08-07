@@ -17,7 +17,7 @@ description  = "Black-Scholes-Merton greeks and implied volatility for European 
 #     error: rustc 1.93.1 is not supported by the following package:
 #       greeks@0.1.0 requires rustc 1.97
 # The MSRV of a shared leaf crate is a property of the crate, not of the
-# workspace that happens to host it. D-0037.
+# workspace that happens to host it. D-0046.
 rust-version = "1.85"
 
 # ---------------------------------------------------------------------------
@@ -42,7 +42,7 @@ rust-version = "1.85"
 # green.
 #
 # Adding a line below requires an entry in docs/05-decisions.md naming what it
-# replaces, and gate 9b to be amended in the same commit. See D-0037.
+# replaces, and gate 9b to be amended in the same commit. See D-0046.
 # ---------------------------------------------------------------------------
 [dependencies]
 

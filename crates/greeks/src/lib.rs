@@ -36,7 +36,7 @@
 //!    defect. Every module here that does arithmetic carries a narrowly scoped
 //!    `#![allow(clippy::float_arithmetic)]` with that reason attached; the
 //!    workspace level is untouched, so the lint still fires everywhere else.
-//!    See `docs/05-decisions.md` D-0037.
+//!    See `docs/05-decisions.md` D-0046.
 //!
 //! # What is here
 //!

@@ -1339,23 +1339,39 @@ from enforcing over everything. See `docs/06-limits.md` §7c.
 
 ---
 
-## D-0037 · 2026-08-02 · Greeks are their own crate, in `f64`, and the crate never sees a paisa
+## D-0046 · 2026-08-02 · Greeks are their own crate, in `f64`, and the crate never sees a paisa
 
-**Numbering, corrected.** This entry is **D-0037**. It was first written as
-D-0036, on the reasoning that `main` ends at D-0034 and `feat/pull` had claimed
-D-0035 — and that reasoning read one branch's ledger and stopped. `feat/pull`
-had already claimed **both** 0035 and 0036: `origin/feat/pull` carries
-`## D-0035 · 2026-08-01 · crates/pull is three things and no vendor call…` and
-`## D-0036 · 2026-08-01 · The pull crate's bounds, its redactions and its
-fall-backs are made real…`, the second committed forty-nine minutes before this
-work was. Two different decisions under one identifier is exactly the collision
-the original paragraph set out to prevent, and it walked into it one number
-later. The lesson is in the mechanics, not the arithmetic: **the next free
-number is read off every unmerged branch's ledger, not off `main`'s.**
+**Numbering, corrected twice, and the second time is the interesting one.**
+This entry is **D-0046**.
+
+It was first written as **D-0036**, on the reasoning that `main` ends at D-0034
+and `feat/pull` had claimed D-0035 — and that reasoning read one branch's ledger
+and stopped. `feat/pull` had already claimed **both** 0035 and 0036, the second
+committed forty-nine minutes before this work was. So it moved to **D-0037**,
+and the paragraph written at the time closed with what looked like the lesson:
+*the next free number is read off every unmerged branch's ledger, not off
+`main`'s.*
+
+**That rule was followed and it still collided.** On 2026-08-07 `feat/pull`
+appended `## D-0037 · The rate governor is AIMD over integer permits…` and then
+ran on to D-0045 — five days after this entry took 0037, and without reading
+this branch. Reading the other branch *once, at the moment you write* is not a
+rule that holds: **both** branches must read, and the one that merges second is
+the one that must move, however long ago it picked. The number is not owned
+until it is on `main`.
+
+So the real lesson is narrower than the one written above, and it is a mechanism
+rather than an instruction: *an identifier chosen on an unmerged branch is
+provisional until merge.* Prose cannot enforce that. **A CI gate can** — one
+that walks every unmerged branch's ledger and fails on a duplicate `## D-\d{4}`
+heading. Until that gate exists this will happen a third time, and
+`docs/06-limits.md` §19 records it as an unclosed hole rather than a solved
+problem.
 
 `CLAUDE.md` §3 rule 8 makes identifiers append-only, so nothing already merged
-is renumbered. This entry had not merged; every `D-0036` reference inside
-`crates/greeks` and in `docs/00`, `01`, `04` and `06` moved with it.
+is renumbered — and nothing here had merged, either time. Every `D-0037`
+reference inside `crates/greeks` and in `docs/00`, `01`, `04` and `06` moved
+with it: 51 occurrences across 16 files, all mechanical.
 
 **Decision.** A new leaf crate, `crates/greeks`. Black-Scholes-Merton for
 European options: `d1`, `d2`, price, delta, gamma, vega, theta, rho, implied
@@ -1437,7 +1453,7 @@ one-minute bars in an NSE session, which is a realistic wrong choice.
 `greeks::vendor_anchor::the_rate_criterion_has_its_root_at_370_and_365_is_a_convention_near_it`
 now asserts the root's location, which is the discriminating quantity, and
 `…the_trading_day_divisor_is_excluded_and_the_calendar_one_is_not_selected`
-asserts what survives. D-0037.
+asserts what survives. D-0046.
 
 **The two gammas are NOT an independent prediction, and this entry withdraws
 the claim that they were.** Dhan publishes no spot, no strike and no maturity,

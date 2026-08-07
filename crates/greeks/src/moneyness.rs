@@ -20,11 +20,11 @@
 //! BANKNIFTY strike steps are **UNVERIFIED** in this repository — no source
 //! in `docs/00-charter.md` states them — so this crate takes the interval as
 //! an argument and refuses a strike that does not sit on the grid it was
-//! given. `docs/05-decisions.md` D-0037.
+//! given. `docs/05-decisions.md` D-0046.
 
 // A step count is a ratio, and a ratio is a statistical value under
 // `CLAUDE.md` §7. No paisa reaches this file: the strike arrives as an `f64`
-// and leaves as a signed count. See D-0037.
+// and leaves as a signed count. See D-0046.
 #![allow(clippy::float_arithmetic)]
 
 use std::fmt;

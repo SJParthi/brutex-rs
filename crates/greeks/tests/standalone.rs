@@ -20,7 +20,7 @@
 //! **CI gate 9b is the enforcement** — it reads the manifest and refuses a
 //! dependency, a dev-dependency, or any mention of a workspace type in this
 //! crate's sources. This file is the ergonomic check that sits beside it.
-//! `docs/05-decisions.md` D-0037.
+//! `docs/05-decisions.md` D-0046.
 //!
 //! No paisa appears anywhere in this file, which is the other half of that
 //! entry's argument: the crate is `f64` throughout *because it never sees
@@ -30,7 +30,7 @@
 // cannot panic cannot fail, and the lints that forbid panicking exist to keep
 // a panic out of the LIBRARY, not out of its tests. `float_arithmetic` and
 // `float_cmp` are here for the reason the whole crate exists -- see the crate
-// documentation and D-0037.
+// documentation and D-0046.
 #![allow(
     clippy::indexing_slicing,
     clippy::expect_used,

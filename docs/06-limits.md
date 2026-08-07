@@ -448,7 +448,7 @@ law.
 
 ## 18. `crates/greeks` — what is bounded, what is measured, and what is neither
 
-Added by D-0037.
+Added by D-0046.
 
 ### The solver is not O(1), and the crate says so in its own documentation
 
@@ -470,7 +470,7 @@ fixed count is sufficient rather than merely safe — and its cost does not
 depend on any input value, because it does not read the input to decide when
 to stop.
 
-**This said 72 until D-0037, and 72 was wrong by three.** The two evaluations
+**This said 72 until D-0046, and 72 was wrong by three.** The two evaluations
 that establish the bracket and the one at the answer were never counted, while
 the constant's own documentation called itself "the largest total number of
 model evaluations one solve can cost". A refused solve costs 75 as well. The
@@ -541,7 +541,7 @@ fourteen correct digits.
 
 The paragraph that used to sit here called the `ulp(price)/vega` estimate
 "optimistic by two orders of magnitude". **Both halves of that were wrong, and
-D-0037 replaces them.**
+D-0046 replaces them.**
 
 `ulp(price)` is not the granularity of a model price at all. The price is
 `forward·N(d1) − discounted_strike·N(d2)`: each product carries a unit in the
@@ -669,7 +669,7 @@ tail, which is no relative accuracy at all.
 ### The anchor is not an anchor, and this is the honest reading of it
 
 Three claims made in the first version of this section, and in the first draft
-of the ledger entry that is now D-0037, were withdrawn by D-0037 after
+of the ledger entry that is now D-0046, were withdrawn by D-0046 after
 measurement. All three overstated what one strike can carry.
 
 **1. "Four of the eight published numbers are inputs to the fit." It is six.**

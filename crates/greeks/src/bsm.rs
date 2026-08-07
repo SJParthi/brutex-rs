@@ -31,7 +31,7 @@
 //! behind it is UNVERIFIED. Getting the divisor wrong by the trading-day
 //! factor costs `365/252 = 1.448`, so a theta of `−15.15` a day becomes
 //! `−10.46`: a 44.8% error on a single strike, invisible unless it is tested.
-//! See `docs/05-decisions.md` D-0037 and `docs/06-limits.md` §18.
+//! See `docs/05-decisions.md` D-0046 and `docs/06-limits.md` §18.
 //!
 //! # What is exact here and what is not
 //!
@@ -52,7 +52,7 @@
 // vega is a sensitivity; `CLAUDE.md` §7 puts statistical values at full
 // precision and reserves `i64` paisa for prices. No paisa reaches this file
 // and no value here is ever snapped to a tick. See the crate documentation
-// and D-0037.
+// and D-0046.
 #![allow(clippy::float_arithmetic)]
 
 use crate::error::GreeksError;
@@ -382,7 +382,7 @@ impl Checked {
     /// Returned as the scale rather than as the error so the caller can divide
     /// before it multiplies by [`f64::EPSILON`]. Multiplying first underflows
     /// to exactly zero for a subnormal quantity, which reports the strongest
-    /// possible certainty at the moment there is none. See D-0037.
+    /// possible certainty at the moment there is none. See D-0046.
     pub(crate) fn price_scale(&self) -> f64 {
         self.forward + self.discounted_strike
     }
@@ -435,7 +435,7 @@ pub(crate) mod tests {
     /// exactly the gap that left: a strike a percent or two in the money, one
     /// to five days out, at a low volatility, where the price is a small
     /// residue of two terms near the spot. Every silently wrong implied
-    /// volatility D-0037 records was found there, and no point of the old grid
+    /// volatility D-0046 records was found there, and no point of the old grid
     /// stood inside it. A grid that misses the regime a test exists to police
     /// makes the test decorative.
     pub(crate) fn grid() -> Vec<(Contract, f64)> {
@@ -908,7 +908,7 @@ pub(crate) mod tests {
     fn the_price_scale_is_the_two_legs_and_it_dwarfs_the_price_they_leave() {
         // The quantity `GreeksError::Indeterminate` screens on. It has to be
         // the size of the terms the price is a DIFFERENCE of, not the size of
-        // the difference -- the whole defect D-0037 repairs is that those are
+        // the difference -- the whole defect D-0046 repairs is that those are
         // not the same number in the regime the guard exists for.
         let contract = Contract {
             spot: 25_851.19,

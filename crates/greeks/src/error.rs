@@ -126,7 +126,7 @@ pub enum GreeksError {
     /// the last place of the price itself on a one-day in-the-money NIFTY
     /// strike — and screening on the finer of the two is what let materially
     /// wrong answers through as `Ok`. See `crate::bsm::Checked::price_scale`
-    /// and D-0037.
+    /// and D-0046.
     ///
     /// Returning the number anyway is the failure `CLAUDE.md` §4 bans — a
     /// fallback that hides a failure. It is refused instead, with the numbers

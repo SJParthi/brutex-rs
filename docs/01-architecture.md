@@ -45,19 +45,19 @@ with the `tickvault` repository, which takes it by git URL, so it declares zero
 dependencies for the same reason `core` does — and unlike `core`, its public
 surface mentions no type from this workspace at all, only `f64` and plain enums
 it owns. **Both halves of that are enforced by CI gate 9b**, in the same shape
-as gate 9 for `core` and gate 7 for `web`; before D-0037 they were advertised in
+as gate 9 for `core` and gate 7 for `web`; before D-0046 they were advertised in
 six places and enforced in none. It is also the one place in this repository
 where a float is the correct type: `CLAUDE.md` §7 keeps statistical values at
 full precision and reserves `i64` paisa for prices, and this crate never sees a
 paisa. Its `rust-version` is written literally rather than inherited, because
 the MSRV of a shared leaf crate is a property of the crate and not of the
-workspace hosting it. See `docs/05-decisions.md` D-0037.
+workspace hosting it. See `docs/05-decisions.md` D-0046.
 
 **`CLAUDE.md` §5 does not list it.** That is a real discrepancy and §10 makes
 `CLAUDE.md` the winner, so this row is the document running ahead of session
 law rather than the other way round. `greeks` adds no arrow to §5's graph, so
 it violates nothing in it; bringing §5 into line is an operator decision, and
-it is **still open** — see D-0037, "One discrepancy an operator has to settle",
+it is **still open** — see D-0046, "One discrepancy an operator has to settle",
 which carries the one-line repair.
 
 ---

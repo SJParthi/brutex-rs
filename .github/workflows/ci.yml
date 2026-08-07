@@ -141,7 +141,7 @@ jobs:
           # a `pub use` adds zero code regions so the coverage gate cannot see
           # one either. Both were verified by breaking the property in a copy
           # of this workspace outside the repository -- clippy, the full test
-          # suite and 100% coverage all stayed green. See D-0037.
+          # suite and 100% coverage all stayed green. See D-0046.
           #
           # No untrusted input reaches this step: the inputs are a tracked
           # manifest path, `git ls-files` and static patterns. Nothing from the
@@ -152,7 +152,7 @@ jobs:
                  | grep -v '^$' || true)
           if [ -n "$deps" ]; then
             printf 'crates/greeks MUST DEPEND ON NOTHING. Found:\n%s\n' "$deps"
-            echo "It is shared with another repository by git URL. See D-0037."
+            echo "It is shared with another repository by git URL. See D-0046."
             exit 1
           fi
           # And no dev-dependency either: a dev-dependency is not forced on a

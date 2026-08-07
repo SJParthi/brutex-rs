@@ -28,7 +28,7 @@
 //! arithmetic ceiling. The test that was supposed to police it read the field
 //! the solver reports, so it could not see the gap by construction.
 //! `greeks::solver::the_reported_cost_is_every_model_evaluation` now counts at
-//! the single function every evaluation passes through. D-0037.
+//! the single function every evaluation passes through. D-0046.
 //!
 //! # Why the bracketed method is the floor and Newton is the optimisation
 //!
@@ -102,7 +102,7 @@
 //! relative volatility and 5 by more than `1e-2`, worst `5.5e-2`, every one of
 //! them reporting an `uncertainty` inside the `1e-3` bound. The numerator is
 //! now [`crate::bsm::Checked::price_scale`], which accepts 8,068 — 28 fewer —
-//! and leaves a worst accepted error of `2.2e-4`. D-0037.
+//! and leaves a worst accepted error of `2.2e-4`. D-0046.
 //!
 //! The criterion is still **necessary and not sufficient**, and saying
 //! otherwise would be the dishonesty rule 6 is about. It is a first-order
@@ -113,7 +113,7 @@
 
 // Every expression below is a float expression. An implied volatility is a
 // solved statistical parameter, not money; `CLAUDE.md` §7 keeps such values
-// at full precision. No paisa reaches this file. See D-0037.
+// at full precision. No paisa reaches this file. See D-0046.
 #![allow(clippy::float_arithmetic)]
 
 use std::f64::consts::TAU;
@@ -142,7 +142,7 @@ pub const BISECTION_STEPS: u32 = 64;
 ///
 /// They are part of the cost of a solve and they are counted. Leaving them out
 /// is how the ceiling below was understated by three for the whole life of
-/// this crate's first version — see D-0037.
+/// this crate's first version — see D-0046.
 pub const BRACKET_EVALUATIONS: u32 = 2;
 
 /// The one evaluation at the answer, which produces the vega the uncertainty
@@ -170,7 +170,7 @@ const NEWTON_STEP_TOLERANCE: f64 = 1.0e-12;
 /// Measured over an NSE envelope of 8,759 quotable points, the worst relative
 /// volatility error among the answers this bound accepts is `2.2e-4`, inside
 /// it. Under the old estimator the worst was `5.5e-2`, fifty-five times
-/// outside it, and reported as certain. D-0037.
+/// outside it, and reported as certain. D-0046.
 pub const MAX_RELATIVE_UNCERTAINTY: f64 = 1.0e-3;
 
 /// Which method produced the answer.
@@ -440,7 +440,7 @@ mod tests {
         // is precisely the regime the solver has to be trusted in -- repricing
         // at a wrong volatility reproduces the quote EXACTLY, so a price round
         // trip is satisfied by construction on the inputs where the answer is
-        // worst. At the point D-0037 records, the price round trip measured
+        // worst. At the point D-0046 records, the price round trip measured
         // `0e0` while the volatility was 5.14% wrong and reported as certain.
         //
         // Every point either round-trips in volatility or is refused for a
@@ -497,7 +497,7 @@ mod tests {
                     // days the price is a small residue of two terms near the
                     // spot, so the quote does not pin a volatility down and
                     // the answer is refused rather than returned -- which is
-                    // the repair D-0037 makes, and it is counted here so that
+                    // the repair D-0046 makes, and it is counted here so that
                     // a change which quietly stops refusing is visible.
                     Err(error) => {
                         refused += 1;
@@ -747,7 +747,7 @@ mod tests {
         // platform's libm, and against the pure-Rust libm that wasm32 links,
         // 140 of 1,344 solved volatilities differ by up to 4.22e-14 relative.
         // Invariant G-10 is narrowed to match and `docs/06-limits.md` section
-        // 18 carries the measurement. D-0037.
+        // 18 carries the measurement. D-0046.
         let contract = at_the_money();
         let quoted = contract.price(0.23, OptionKind::Call).expect("priced");
         let first = contract

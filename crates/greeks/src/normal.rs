@@ -38,7 +38,7 @@
 // Every expression below is a float expression. `CLAUDE.md` §7 makes a float
 // wrong for a PRICE; this module computes a probability, which is a
 // statistical value and has no representation on a tick grid. No paisa value
-// reaches this file. See the crate documentation and D-0037.
+// reaches this file. See the crate documentation and D-0046.
 #![allow(clippy::float_arithmetic)]
 
 /// `1 / sqrt(2 * pi)`.

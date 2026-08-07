@@ -33,7 +33,7 @@
 //!
 //! **The two gammas are the other two, and they are not an independent
 //! prediction either.** That claim was made by the first version of this file,
-//! and D-0037 withdraws it. With `q = 0` the fitted spot is
+//! and D-0046 withdraws it. With `q = 0` the fitted spot is
 //! `S = vega·100 / (n(d1)·sqrt(T))`, so the fitted gamma collapses to
 //!
 //! ```text
@@ -78,7 +78,7 @@
 //!    is not: it is the nearest ordinary calendar convention to a root the
 //!    criterion actually puts at 370.08, and the `0.9999`-point "rate
 //!    residual" this crate used to pin as a property of the sample is an
-//!    artifact of assuming 365. D-0037.
+//!    artifact of assuming 365. D-0046.
 //!
 //! # And the carry is assumed, not measured
 //!
@@ -108,7 +108,7 @@
 //! `docs/00-charter.md` states. See `docs/06-limits.md` §18.
 
 // The same exceptions every test module in this workspace takes, plus the two
-// this crate exists for. See the crate documentation and D-0037.
+// this crate exists for. See the crate documentation and D-0046.
 #![allow(
     clippy::indexing_slicing,
     clippy::expect_used,
@@ -368,14 +368,14 @@ fn the_delta_difference_is_reproduced_by_the_two_volatilities_and_says_nothing_a
     // carries it is `N(d1c) + N(-d1p)` with q = 0.
     //
     // -42.54% and not the -46% the first version of this crate printed in its
-    // prose: nothing computed that number, and this test now does. D-0037.
+    // prose: nothing computed that number, and this test now does. D-0046.
     //
     // WHAT THIS TEST IS NOT. It is not evidence that q = 0. `published_d1`
     // INVERTS the two deltas, so the second assertion below is
     // `N(N^-1(x)) + N(N^-1(y)) == x + y` and cannot fail for any deltas, any
     // volatilities or any carry. It is a consistency check on the inverse
     // distribution, and the first version of this file named it as if it were
-    // a measurement of the carry. It is not. D-0037, and
+    // a measurement of the carry. It is not. D-0046, and
     // `the_carry_is_consistent_with_zero_and_the_sample_cannot_pin_it` is what
     // actually probes q.
     let (d1_call, d1_put) = published_d1();
@@ -632,7 +632,7 @@ fn our_greeks_reproduce_the_captured_dhan_chain() {
             THETA_PUT_PER_DAY,
             1e-9,
         ),
-        // Not predictions. See the module documentation and D-0037.
+        // Not predictions. See the module documentation and D-0046.
         ("gamma call", ours_call.gamma, GAMMA_CALL, DISPLAY_HALF_ULP),
         ("gamma put", ours_put.gamma, GAMMA_PUT, DISPLAY_HALF_ULP),
     ];
