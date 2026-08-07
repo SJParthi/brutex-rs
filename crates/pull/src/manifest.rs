@@ -120,6 +120,14 @@
 //! image at one offset, with the byte offset through which the entry must
 //! already be durable. A writable memory mapping stays banned: it raises
 //! `SIGBUS` on a full disk and a signal cannot be caught.
+//!
+//! [`Manifest::image`] is the same statement at the scale of a whole file: it
+//! returns the complete bytes — header region then entries, every checksum
+//! computed — and [`Manifest::open_image`] reads them back. Those two are for
+//! the file that does not exist yet and for one being replaced whole; the
+//! incremental path is still `record`, which is 128 bytes however large the
+//! census is. **A writer must produce bytes this module's own reader accepts**,
+//! and the round trip that proves it goes through [`Manifest::load`] unchanged.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -309,8 +317,16 @@ pub fn reservation_for(n_valid: u64) -> usize {
 /// [`store::format::SLOT_STRIDE`] as a `usize`, for slicing a region.
 const SLOT_STRIDE_LEN: usize = 16_384;
 
+/// [`HEADER_LEN`] as a `usize`, for building and for splitting a whole file.
+///
+/// A literal in both widths for the same reason [`HEADER_LEN`] is one: the
+/// product needs a `usize`→`u64` conversion this workspace denies. The
+/// assertion below is what keeps the two honest.
+const HEADER_REGION_LEN: usize = 32_768;
+
 const _: () = assert!(MAX_ENTRIES == 2_097_152 && MAX_ENTRIES_LEN == 2_097_152);
 const _: () = assert!(SLOT_STRIDE == 16_384 && SLOT_STRIDE_LEN == 16_384);
+const _: () = assert!(HEADER_LEN == 32_768 && HEADER_REGION_LEN == 32_768);
 const _: () = assert!(HEADER_LEN == SLOT_COUNT * SLOT_STRIDE);
 const _: () = assert!(SLOT_COUNT <= MAX_SLOT_COUNT);
 const _: () = assert!(IMAGE_LEN == SLOT_LEN);
@@ -1293,9 +1309,29 @@ impl HeaderRead {
 /// removing the last arm would cost.
 ///
 /// [`Manifest::reserved`] is the reservation, and M-17 and M-19 assert it.
+///
+/// # Why the log is held as well as the index
+///
+/// The entry region on disk **is** a log: `n_valid` entries in the order they
+/// were committed, of which the index keeps only the newest per key. Holding
+/// the index alone was enough while nothing could write, and it stopped being
+/// enough the moment [`Manifest::image`] existed — a manifest that could not
+/// reproduce the entries it was loaded from would rewrite one month's history
+/// every time the file was replaced whole, silently, and `CLAUDE.md` §3 rule 8
+/// does not admit that. It is also what makes the image *deterministic*: an
+/// image emitted in `HashMap` iteration order would differ between two
+/// processes given identical inputs, which is rule 5.
+///
+/// It costs `size_of::<Entry>()` — **80 bytes** on this workspace's target,
+/// pinned by `pull::unit::the_log_is_the_entry_region_in_order` — per committed
+/// entry, reserved through [`reservation_for`] exactly as the index is, so the
+/// first `n_valid` appends after a load cannot reallocate it either. At the
+/// measured 248,000-entry scale that is about 40 MB beside the index's 144 MB;
+/// at [`MAX_ENTRIES`] it is 168 MB beside 574 MB.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
     header: ManifestHeader,
+    log: Vec<Entry>,
     index: HashMap<EntryKey, Entry>,
     degraded: Option<ManifestError>,
 }
@@ -1320,6 +1356,7 @@ impl Manifest {
     fn genesis(vendor: Vendor) -> Self {
         Self {
             header: ManifestHeader::genesis(vendor),
+            log: Vec::new(),
             index: HashMap::new(),
             degraded: None,
         }
@@ -1343,6 +1380,42 @@ impl Manifest {
             return Ok(Self::genesis(vendor));
         }
         Self::load(vendor, header_region, entries)
+    }
+
+    /// The manifest in one whole file's bytes, split at [`HEADER_LEN`].
+    ///
+    /// The inverse of [`Manifest::image`], and it exists rather than leaving
+    /// the split to a caller because **the split point is part of the format**.
+    /// A caller that computed it independently could be wrong about it in a way
+    /// no test of this module would ever see, and the failure would be a census
+    /// that reads its first entry out of the header region.
+    ///
+    /// # A first ingest is not a failure
+    ///
+    /// An empty slice is a file that does not exist yet, and
+    /// [`Manifest::open`] answers it with a genesis census. That is the whole
+    /// route to one: there is no `Manifest::empty`, and D-0036 is why —
+    /// starting a fresh census over a file that already holds one produces a
+    /// manifest that is verifiably wrong and still loads clean. Bytes that are
+    /// present but shorter than [`HEADER_LEN`] are a partly-written file, and
+    /// they are refused by name rather than quietly read as "nothing here yet".
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`Manifest::open`] refuses —
+    /// [`ManifestError::HeaderRegionTooShort`] for a file that is short,
+    /// [`ManifestError::CounterExceedsRegion`] for one truncated below the
+    /// count its header publishes.
+    pub fn open_image(vendor: Vendor, file: &[u8]) -> Result<Self, ManifestError> {
+        // `split_at_checked` rather than `split_at`: the panicking form would
+        // be reached by any file shorter than the header region, which is the
+        // ordinary shape of an interrupted write rather than a rare one. The
+        // `None` arm is that file, and it is handed on whole so `open` refuses
+        // it for its length.
+        let (header_region, entries) = file
+            .split_at_checked(HEADER_REGION_LEN)
+            .unwrap_or((file, &[]));
+        Self::open(vendor, header_region, entries)
     }
 
     /// Loads a manifest from its header region and its entry region.
@@ -1385,10 +1458,11 @@ impl Manifest {
 
         let header = read.newest();
         let published = match Self::walk(header, entries) {
-            Ok(index) => {
+            Ok(census) => {
                 return Ok(Self {
                     header,
-                    index,
+                    log: census.log,
+                    index: census.index,
                     degraded: read.stepped_over(),
                 });
             }
@@ -1404,9 +1478,10 @@ impl Manifest {
             return Err(published);
         };
         Self::walk(previous, entries)
-            .map(|index| Self {
+            .map(|census| Self {
                 header: previous,
-                index,
+                log: census.log,
+                index: census.index,
                 degraded: Some(published),
             })
             .map_err(|_| published)
@@ -1417,10 +1492,7 @@ impl Manifest {
     ///
     /// Split out of [`Manifest::load`] so that walking a second generation is
     /// the same code rather than a paraphrase of it.
-    fn walk(
-        header: ManifestHeader,
-        entries: &[u8],
-    ) -> Result<HashMap<EntryKey, Entry>, ManifestError> {
+    fn walk(header: ManifestHeader, entries: &[u8]) -> Result<Census, ManifestError> {
         // Reserved from the COUNTER, which `validate` has already proved is
         // within both `MAX_ENTRIES` and the region's capacity -- not from the
         // region's byte length, which is untrusted input. Sizing it from the
@@ -1435,13 +1507,20 @@ impl Manifest {
         // count of the form 7·2^k and turned the next append into an O(keys)
         // rebuild; the numbers that measurement produced are in
         // `APPEND_HEADROOM_FACTOR`'s note, and so is the derivation of the two.
+        //
+        // The log is reserved from the same number for the same reason: a push
+        // onto a `Vec` with no spare capacity copies the whole log, so a
+        // reservation of exactly `n_valid` would move the O(census) arm out of
+        // the map and into the log rather than removing it.
         let mut index: HashMap<EntryKey, Entry> =
             HashMap::with_capacity(reservation_for(header.n_valid));
+        let mut log: Vec<Entry> = Vec::with_capacity(reservation_for(header.n_valid));
         let mut n_keys = 0u64;
 
         for (ordinal, chunk) in (0u64..header.n_valid).zip(entries.chunks_exact(IMAGE_LEN)) {
             let entry =
                 Entry::decode(chunk).map_err(|fault| ManifestError::Entry { ordinal, fault })?;
+            log.push(entry);
             match index.insert(entry.key, entry) {
                 None => n_keys += 1,
                 Some(previous) => {
@@ -1481,7 +1560,7 @@ impl Manifest {
                 entries: total_rows,
             });
         }
-        Ok(index)
+        Ok(Census { log, index })
     }
 
     /// The header, counters and all.
@@ -1664,6 +1743,7 @@ impl Manifest {
         let offset = offset_within_bounds(ordinal);
         let commit = header.commit_within_bounds();
 
+        self.log.push(entry);
         self.index.insert(entry.key, entry);
         self.header = header;
         Ok(Append {
@@ -1672,6 +1752,90 @@ impl Manifest {
             bytes: entry.image(),
             commit,
         })
+    }
+
+    /// The complete file this census is: the header region, then every
+    /// committed entry in the order it was recorded.
+    ///
+    /// The inverse of [`Manifest::open_image`]. These are the bytes
+    /// [`ManifestHeader::read_region`] and [`Manifest::load`] already read —
+    /// **nothing in the reader was relaxed to accept them**, which is the point
+    /// of the round trip that proves it. Slot `generation % SLOT_COUNT` carries
+    /// the header and the other slot is left zero: zeroes decode as
+    /// [`ManifestError::NotAManifest`], which `read_region` does not count as a
+    /// fault, so a freshly imaged file loads with
+    /// [`Manifest::degraded_reason`] `None`.
+    ///
+    /// # It is O(entries), and it is not the counter this layer is about
+    ///
+    /// Every entry is re-imaged and re-checksummed, so one call is
+    /// `O(n_valid)`. That is the write path, where the bytes have to be
+    /// produced whatever their order; the census itself is still a field read.
+    /// The **incremental** writer remains [`Manifest::record`] — one 64-byte
+    /// entry and one 64-byte commit, however large the census — and this is for
+    /// the file that does not exist yet and for one being replaced whole.
+    ///
+    /// # Atomicity: the buffer is one unit, the install is the caller's
+    ///
+    /// **The image is atomic, its installation is not, and a half-installed
+    /// image is refused rather than believed.** This crate performs no I/O and
+    /// cannot rename anything, so that is the honest statement rather than a
+    /// guarantee it is in no position to make.
+    ///
+    /// One `Vec<u8>` reaches a writer whole or not at all, so there is no API
+    /// here that can emit half a census. Installing it must be write to a
+    /// temporary, flush, then rename onto the live path: a rename within one
+    /// filesystem is the only step atomic against a crash, and overwriting the
+    /// live file in place is not — it publishes a prefix.
+    ///
+    /// A prefix that does reach disk is **detected**, which is what makes the
+    /// gap survivable instead of silent. The header region is at the front, so
+    /// a truncated install publishes a counter over entries that are not there
+    /// and [`ManifestHeader::validate`] refuses it with
+    /// [`ManifestError::CounterExceedsRegion`]; a torn slot fails its own
+    /// CRC-32C and a torn entry fails its own.
+    ///
+    /// # What round-trips, exactly
+    ///
+    /// [`Manifest::open_image`] of this returns a value equal to `self` — every
+    /// counter, the generation, every entry in order — for a manifest whose
+    /// [`Manifest::degraded_reason`] is `None`. For one that loaded degraded
+    /// the image is the **repair**: the recovered generation is written whole
+    /// into a clean file, and what loads back differs in exactly that one
+    /// field, because the damage it named is gone.
+    ///
+    /// # Panics
+    ///
+    /// It does not. `n_valid` is at most [`MAX_ENTRIES`] on every path that can
+    /// produce a `Manifest` — [`ManifestHeader::validate`] on load,
+    /// [`ManifestHeader::advance`] on record — so the slot image is built by
+    /// the same infallible arithmetic [`Manifest::record`] uses, and there is
+    /// no failure arm here for a test to be unable to reach.
+    #[must_use]
+    pub fn image(&self) -> Vec<u8> {
+        let commit = self.header.commit_within_bounds();
+        // `log.len()` is at most `MAX_ENTRIES`, so this product is at most
+        // 134,217,728 and the sum cannot overflow a `usize` on any target that
+        // could hold the log in the first place.
+        let mut out = Vec::with_capacity(HEADER_REGION_LEN + self.log.len() * IMAGE_LEN);
+
+        // Two slots, written out longhand rather than indexed into, because
+        // this workspace denies slice indexing and the family is two: the
+        // assertion beside `MAX_SLOTS` is what makes a third one a compile
+        // error rather than a slot this loop silently skips.
+        if commit.slot == 0 {
+            out.extend_from_slice(&commit.bytes);
+        }
+        out.resize(SLOT_STRIDE_LEN, 0);
+        if commit.slot != 0 {
+            out.extend_from_slice(&commit.bytes);
+        }
+        out.resize(HEADER_REGION_LEN, 0);
+
+        for entry in &self.log {
+            out.extend_from_slice(&entry.image());
+        }
+        out
     }
 
     /// The byte offset of entry `ordinal`.
@@ -1704,6 +1868,19 @@ impl Manifest {
         }
         Ok(offset_within_bounds(ordinal))
     }
+}
+
+/// What one walk of the entry region produced.
+///
+/// Two structures over the same entries, and neither is derivable from the
+/// other: the log is what the region holds, in order, and the index is the
+/// newest entry per key. Returned together from one walk because building them
+/// in two passes would decode and checksum every entry twice.
+struct Census {
+    /// Every committed entry, in the order the region holds them.
+    log: Vec<Entry>,
+    /// The newest entry for each distinct key.
+    index: HashMap<EntryKey, Entry>,
 }
 
 /// `HEADER_LEN + ordinal · ENTRY_STRIDE`, for an ordinal already known to be

@@ -5548,3 +5548,433 @@ fn cells_are_ordered_instrument_major() {
     );
     assert!(cells[3..].iter().all(|c| c.instrument == "BBB"));
 }
+
+// ===========================================================================
+// The manifest writer — part 8
+//
+// `Manifest::image` produces a whole file and `Manifest::open_image` reads one
+// back. Every test below goes through the READER THAT ALREADY EXISTED:
+// `Manifest::load`, `ManifestHeader::read_region`, `Entry::decode` and both
+// CRC-32C checks are untouched by the change that added the writer. A writer
+// that needed the reader relaxed would be the wrong writer, so the round trip
+// is the proof and not the convenience.
+// ===========================================================================
+
+/// M-20 — a whole manifest survives its own image, through the reader
+/// unchanged.
+///
+/// Zero entries, one entry, several, and a key recorded twice: every counter,
+/// the generation, and every entry in order.
+#[test]
+fn a_whole_manifest_survives_its_own_image() {
+    // Zero entries — a first ingest for a vendor, which is the state a file
+    // that does not exist yet is in. `Manifest::open_image` of nothing is the
+    // only door to it; there is no `Manifest::empty`, and D-0036 is why.
+    let empty = Manifest::open_image(Vendor::Dhan, &[]).expect("no file is a genesis census");
+    assert_eq!(
+        empty,
+        fresh(Vendor::Dhan),
+        "the same census `open` hands out"
+    );
+    let image = empty.image();
+    assert_eq!(
+        image.len(),
+        HEADER_LEN_USIZE,
+        "an empty census is the header region and nothing after it"
+    );
+    let read = Manifest::open_image(Vendor::Dhan, &image).expect("an empty census reloads");
+    assert_eq!(read, empty);
+    assert_eq!((read.entries(), read.keys(), read.total_rows()), (0, 0, 0));
+    assert_eq!(read.degraded_reason(), None);
+    assert_eq!(read.header().generation, 0);
+
+    // One entry. Generation 1 lives in slot 1, so the image exercises the
+    // second slot as well as the first.
+    let one = entry("NIFTY", 2024, 6, 7_312, 1_000, 2_000);
+    let mut single = fresh(Vendor::Groww);
+    single.record(one).expect("one month");
+    let image = single.image();
+    assert_eq!(image.len(), HEADER_LEN_USIZE + IMAGE_LEN);
+    assert_eq!(
+        Manifest::open_image(Vendor::Groww, &image).expect("one month reloads"),
+        single
+    );
+
+    // Several, including a key recorded twice: four entries, three keys.
+    let months = [
+        entry("NIFTY", 2024, 6, 7_312, 1_000, 2_000),
+        entry("BANKNIFTY", 2024, 6, 7_310, 1_000, 2_000),
+        entry("NIFTY", 2024, 7, 7_500, 3_000, 4_000),
+        entry("NIFTY", 2024, 6, 7_400, 1_000, 2_500),
+    ];
+    let mut written = fresh(Vendor::Groww);
+    for month in &months {
+        written.record(*month).expect("a record");
+    }
+    let image = written.image();
+
+    let read = Manifest::open_image(Vendor::Groww, &image).expect("four months reload");
+    assert_eq!(
+        read, written,
+        "every counter, the generation and every entry"
+    );
+    assert_eq!(read.entries(), 4);
+    assert_eq!(read.keys(), 3);
+    assert_eq!(read.total_rows(), 7_400 + 7_310 + 7_500);
+    assert_eq!(read.header().generation, 4);
+    assert_eq!(read.header(), written.header());
+    assert_eq!(read.degraded_reason(), None, "a fresh image is not damaged");
+    assert_eq!(
+        read.entry(&months[0].key),
+        Some(months[3]),
+        "the newest wins"
+    );
+    assert_eq!(read.entry(&months[1].key), Some(months[1]));
+    assert_eq!(read.entry(&months[2].key), Some(months[2]));
+
+    // Idempotence — `CLAUDE.md` §3 rule 5, byte for byte. The image of a
+    // manifest that came from an image is the same bytes, which an emission in
+    // `HashMap` iteration order could not promise.
+    assert_eq!(read.image(), image);
+
+    // `open_image` is the split and nothing else: the same bytes handed to the
+    // reader that already existed give the same census.
+    assert_eq!(
+        Manifest::open(
+            Vendor::Groww,
+            &image[..HEADER_LEN_USIZE],
+            &image[HEADER_LEN_USIZE..]
+        )
+        .expect("the same bytes, split by hand"),
+        read
+    );
+}
+
+/// M-21 — the image puts every byte at the address the reader computes for it.
+///
+/// The round trip proves the file is *readable*; this proves it is readable for
+/// the right reason rather than because the writer and the reader share a
+/// mistake. The header slot is at `generation % SLOT_COUNT`, entry `i` is at
+/// `Manifest::offset_of(i)`, and the whole length is the `durable_through` the
+/// commit already published.
+#[test]
+fn the_image_puts_every_byte_where_the_reader_looks_for_it() {
+    let months = [
+        entry("NIFTY", 2024, 6, 7_312, 1_000, 2_000),
+        entry("BANKNIFTY", 2024, 6, 7_310, 1_000, 2_000),
+        entry("NIFTY", 2024, 7, 7_500, 3_000, 4_000),
+    ];
+    let mut manifest = fresh(Vendor::Groww);
+    for month in &months {
+        manifest.record(*month).expect("a record");
+    }
+    let image = manifest.image();
+    let commit = manifest.header().commit().expect("the published commit");
+
+    // Generation 3 belongs in slot 1, and the slot it does not belong in is
+    // left zero — which decodes as "not a manifest" and costs the reader a
+    // candidate rather than a fault.
+    assert_eq!(commit.slot, 1);
+    assert_eq!(commit.offset, SLOT_STRIDE_USIZE as u64);
+    assert_eq!(
+        &image[SLOT_STRIDE_USIZE..SLOT_STRIDE_USIZE + IMAGE_LEN],
+        &commit.bytes[..],
+        "the header slot is the commit the writer would have issued"
+    );
+    assert!(
+        image[..SLOT_STRIDE_USIZE].iter().all(|b| *b == 0),
+        "the other slot is zero, not a stale generation"
+    );
+    assert!(
+        image[SLOT_STRIDE_USIZE + IMAGE_LEN..HEADER_LEN_USIZE]
+            .iter()
+            .all(|b| *b == 0),
+        "and the rest of the slot's 16,384-byte spacing is zero"
+    );
+    assert_eq!(&image[..MAGIC.len()], &[0u8; 8], "slot 0 carries no magic");
+    assert_eq!(
+        &image[SLOT_STRIDE_USIZE..SLOT_STRIDE_USIZE + MAGIC.len()],
+        &MAGIC[..],
+        "and slot 1 carries the manifest magic, not a bar file's"
+    );
+
+    // Entry `i` is at `HEADER_LEN + i·64`, and holds exactly that entry's own
+    // image — checksum included, because the reader verifies it.
+    for (ordinal, month) in months.iter().enumerate() {
+        let at = HEADER_LEN_USIZE + ordinal * IMAGE_LEN;
+        assert_eq!(
+            at as u64,
+            Manifest::offset_of(ordinal as u64).expect("an ordinal in range"),
+            "entry {ordinal} sits where the arithmetic says"
+        );
+        assert_eq!(
+            &image[at..at + IMAGE_LEN],
+            &month.image()[..],
+            "entry {ordinal} is its own image, in the order it was recorded"
+        );
+        assert_eq!(Entry::decode(&image[at..at + IMAGE_LEN]), Ok(*month));
+    }
+
+    // The length is the offset the commit already told a writer to flush
+    // through. One number, not two that have to agree.
+    assert_eq!(image.len() as u64, commit.durable_through);
+    assert_eq!(image.len() as u64, HEADER_LEN + manifest.entries() * 64);
+    assert_eq!(image.len(), HEADER_LEN_USIZE + 3 * IMAGE_LEN);
+
+    // # The design ceiling is arithmetic here, not a census that was built
+    //
+    // A manifest at MAX_ENTRIES is a 134,250,496-byte image beside a ~285 MB
+    // index and a ~168 MB log, which is not a thing a unit test builds — the
+    // same reason `the_reservation_is_capped_at_the_design_ceiling` gives for
+    // its own ceiling. What IS checked is that the writer's length is the
+    // header's `durable_through`, asserted above at a census that exists, and
+    // that the same expression at the ceiling is exact and refuses one past it.
+    // `CLAUDE.md` §3 rule 6: this is a bound, and the part of it that is not
+    // measured is named rather than implied.
+    let genesis = ManifestHeader::genesis(Vendor::Groww);
+    let at_ceiling = ManifestHeader {
+        n_valid: MAX_ENTRIES,
+        n_keys: MAX_ENTRIES,
+        ..genesis
+    }
+    .commit()
+    .expect("exactly MAX_ENTRIES commits")
+    .durable_through;
+    assert_eq!(at_ceiling, HEADER_LEN + MAX_ENTRIES * 64);
+    assert_eq!(
+        at_ceiling, 134_250_496,
+        "134 MB, the figure MAX_ENTRIES names"
+    );
+    assert_eq!(
+        ManifestHeader {
+            n_valid: MAX_ENTRIES + 1,
+            ..genesis
+        }
+        .commit(),
+        Err(ManifestError::TooManyEntries {
+            n_valid: MAX_ENTRIES + 1,
+            limit: MAX_ENTRIES
+        }),
+        "one past the ceiling has no image, because it has no commit"
+    );
+}
+
+/// M-22 — a half-installed image is refused by name, never believed.
+///
+/// The image is one buffer and is therefore atomic as a value; installing it is
+/// the caller's `write, flush, rename`, and this crate performs no I/O and
+/// cannot do it. So the load-bearing claim is the other one: **every truncation
+/// of a whole image is refused, and no prefix is ever read as a smaller
+/// census.** The header region is at the front, so a prefix publishes a counter
+/// over entries that are not there.
+#[test]
+fn a_half_installed_image_is_refused_by_name() {
+    let months = [
+        entry("NIFTY", 2024, 6, 7_312, 1_000, 2_000),
+        entry("BANKNIFTY", 2024, 6, 7_310, 1_000, 2_000),
+        entry("NIFTY", 2024, 7, 7_500, 3_000, 4_000),
+    ];
+    let mut manifest = fresh(Vendor::Groww);
+    for month in &months {
+        manifest.record(*month).expect("a record");
+    }
+    let whole = manifest.image();
+    assert_eq!(whole.len(), HEADER_LEN_USIZE + 3 * IMAGE_LEN);
+
+    // Truncated in the MIDDLE of the last entry: the region holds two whole
+    // entries and the header counts three.
+    assert_eq!(
+        Manifest::open_image(Vendor::Groww, &whole[..whole.len() - 32]),
+        Err(ManifestError::CounterExceedsRegion {
+            n_valid: 3,
+            capacity: 2
+        })
+    );
+
+    // Truncated by a WHOLE entry, which is the shape that would otherwise look
+    // like a perfectly good two-entry file.
+    assert_eq!(
+        Manifest::open_image(Vendor::Groww, &whole[..whole.len() - IMAGE_LEN]),
+        Err(ManifestError::CounterExceedsRegion {
+            n_valid: 3,
+            capacity: 2
+        })
+    );
+
+    // Shorter than HEADER_LEN — the header region itself did not land.
+    assert_eq!(
+        Manifest::open_image(Vendor::Groww, &whole[..HEADER_LEN_USIZE - 1]),
+        Err(ManifestError::HeaderRegionTooShort { slots: 1, need: 2 })
+    );
+    assert_eq!(
+        Manifest::open_image(Vendor::Groww, &whole[..1]),
+        Err(ManifestError::HeaderRegionTooShort { slots: 0, need: 2 })
+    );
+
+    // Every prefix, exhaustively, so the three cases above are a description of
+    // the whole space rather than three points in it. Nothing between an empty
+    // file and the whole image loads.
+    assert!(
+        Manifest::open_image(Vendor::Groww, &whole[..0]).is_ok(),
+        "no file at all is a first ingest, and that is not damage"
+    );
+    for cut in 1..whole.len() {
+        match Manifest::open_image(Vendor::Groww, &whole[..cut]) {
+            Err(ManifestError::HeaderRegionTooShort { need: 2, .. }) => {
+                assert!(cut < HEADER_LEN_USIZE, "cut {cut} is a whole header");
+            }
+            Err(ManifestError::CounterExceedsRegion { n_valid: 3, .. }) => {
+                assert!(cut >= HEADER_LEN_USIZE, "cut {cut} has no header region");
+            }
+            other => panic!("prefix of {cut} bytes was not refused by name: {other:?}"),
+        }
+    }
+    assert!(
+        Manifest::open_image(Vendor::Groww, &whole).is_ok(),
+        "and the whole thing does load"
+    );
+
+    // A header slot that landed corrupt is the other half: its own CRC-32C
+    // catches it, and there is no older generation in a freshly imaged file to
+    // fall back to, so it refuses rather than reporting a stale census.
+    let mut corrupt = whole.clone();
+    let at = manifest.header().commit().expect("a commit").offset as usize;
+    // Byte 40 of a slot is the row total: inside the checksum's domain, and
+    // past the magic and the version, so the checksum is what refuses it.
+    corrupt[at + 40] ^= 0xFF;
+    match Manifest::open_image(Vendor::Groww, &corrupt) {
+        Err(ManifestError::SlotChecksum { stored, computed }) => {
+            assert_ne!(stored, computed, "the refusal names both numbers");
+        }
+        other => panic!("a corrupt header slot must be refused by name, got {other:?}"),
+    }
+}
+
+/// M-23 — the image carries the entry LOG, not the index over it.
+///
+/// The entry region on disk is a log: `n_valid` entries in the order they were
+/// committed, of which the index keeps the newest per key. A writer that
+/// emitted the index would compact one month's history away on every whole-file
+/// replacement — `CLAUDE.md` §3 rule 8 — and would emit it in `HashMap`
+/// iteration order, which is rule 5. The reader refuses that order outright,
+/// which is what makes both of those a test rather than a comment.
+#[test]
+fn the_log_is_the_entry_region_in_order() {
+    assert_eq!(
+        size_of::<Entry>(),
+        80,
+        "the per-entry cost of the log, as the Manifest doc states it"
+    );
+
+    let june = entry("NIFTY", 2024, 6, 7_312, 1_000, 2_000);
+    let june_again = entry("NIFTY", 2024, 6, 7_400, 1_000, 2_500);
+    let mut manifest = fresh(Vendor::Groww);
+    manifest.record(june).expect("june");
+    manifest.record(june_again).expect("june, again");
+    assert_eq!(
+        (manifest.entries(), manifest.keys(), manifest.total_rows()),
+        (2, 1, 7_400)
+    );
+
+    let image = manifest.image();
+    assert_eq!(
+        image.len(),
+        HEADER_LEN_USIZE + 2 * IMAGE_LEN,
+        "two entries on disk for one key — the older one is not compacted away"
+    );
+    assert_eq!(
+        &image[HEADER_LEN_USIZE..HEADER_LEN_USIZE + IMAGE_LEN],
+        &june.image()[..],
+        "the first entry recorded is the first entry written"
+    );
+    assert_eq!(
+        &image[HEADER_LEN_USIZE + IMAGE_LEN..],
+        &june_again.image()[..]
+    );
+
+    let read = Manifest::open_image(Vendor::Groww, &image).expect("it reloads");
+    assert_eq!(read, manifest);
+    assert_eq!(read.entries(), 2, "both entries came back");
+    assert_eq!(read.keys(), 1, "and they are still one key");
+    assert_eq!(read.entry(&june.key), Some(june_again));
+
+    // The order is load-bearing, and the reader is what enforces it: the same
+    // two entries the other way round are the row count going backwards.
+    let mut swapped = image.clone();
+    swapped[HEADER_LEN_USIZE..HEADER_LEN_USIZE + IMAGE_LEN].copy_from_slice(&june_again.image());
+    swapped[HEADER_LEN_USIZE + IMAGE_LEN..].copy_from_slice(&june.image());
+    assert_eq!(
+        Manifest::open_image(Vendor::Groww, &swapped),
+        Err(ManifestError::RowCountWentBackwards {
+            ordinal: 1,
+            previous: 7_400,
+            next: 7_312
+        }),
+        "a log emitted in any order but the recorded one is refused by the reader"
+    );
+
+    // And the same fact on the write side, so a caller cannot record it in the
+    // first place.
+    assert_eq!(
+        manifest.record(entry("NIFTY", 2024, 6, 7_311, 1_000, 2_500)),
+        Err(ManifestError::RowCountWentBackwards {
+            ordinal: 2,
+            previous: 7_400,
+            next: 7_311
+        })
+    );
+    assert_eq!(
+        manifest.image(),
+        image,
+        "a refused record left the census, and its bytes, untouched"
+    );
+}
+
+/// M-24 — a census that loaded degraded images as its repair, and that is the
+/// one documented inequality in the round trip.
+///
+/// `Manifest::image` writes the recovered generation whole into a clean file,
+/// so the value that loads back differs from the one that produced it in
+/// exactly one field: the damage it named is gone. Asserted rather than left as
+/// prose, because "equal except for" is the kind of claim that rots.
+#[test]
+fn a_degraded_census_images_as_its_repair() {
+    let one = entry("NIFTY", 2024, 6, 7_312, 1_000, 2_000);
+    let two = entry("BANKNIFTY", 2024, 6, 7_310, 1_000, 2_000);
+    let (header_region, data, _) = built(Vendor::Groww, &[one, two]);
+
+    // The commit for entry 1 landed; entry 1's own bytes never were written
+    // back. The generation below it describes the durable prefix.
+    let mut torn = data.clone();
+    torn[IMAGE_LEN..].fill(0);
+    let recovered = Manifest::load(Vendor::Groww, &header_region, &torn).expect("the fallback");
+    assert_eq!(recovered.entries(), 1);
+    assert!(
+        recovered.degraded_reason().is_some(),
+        "the recovery names what it stepped over"
+    );
+
+    let repaired =
+        Manifest::open_image(Vendor::Groww, &recovered.image()).expect("the repaired file reloads");
+    assert_eq!(
+        repaired.degraded_reason(),
+        None,
+        "the damage the recovery named is not in the file it wrote"
+    );
+    assert_eq!(
+        repaired.header(),
+        recovered.header(),
+        "and nothing else moved: same generation, same counters"
+    );
+    assert_eq!(repaired.entry(&one.key), Some(one));
+    assert_eq!(repaired.entry(&two.key), None, "the lost month stays lost");
+    assert_ne!(
+        repaired, recovered,
+        "the reason is a real difference, not a rounding of one"
+    );
+    assert_eq!(
+        repaired.image(),
+        recovered.image(),
+        "the bytes are identical; only the reason the value carries differs"
+    );
+}

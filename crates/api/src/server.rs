@@ -14,10 +14,10 @@
 //! sees decides the run on its own.
 
 use crate::catalog::{Catalog, PAGE_ROWS, Selection};
-use crate::{census, ingest, master, merge, render};
+use crate::{audit, census, ingest, master, merge, render};
 use brutex_core::instrument::InstrumentKey;
 use brutex_core::vendor::Vendor;
-use pull::session::Day;
+use pull::session::{Day, IstMoment};
 use std::fmt::Write as _;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -705,23 +705,53 @@ async fn health(
     (code, body)
 }
 
-/// Why no vendor call can be made in this build.
+/// What this build can and cannot do, named exactly.
 ///
-/// `CLAUDE.md` §4 permits degrading loudly and naming the reason, or refusing.
-/// This is the reason, written once and rendered wherever a counter would
-/// otherwise have to invent a number. **It names the modules that are absent**,
-/// so an operator can check the claim rather than take it.
+/// # This constant replaced one that was false in five separate ways
 ///
-/// When `pull::fetch` and `pull::rate` land, this constant is what stops being
-/// passed to [`render::PullView::halt`] — one place, not a search.
-pub const CAPTURE_UNAVAILABLE: &str = "crates/pull exposes no vendor fetch and \
-     no rate governor in this build: there is no pull::fetch and no pull::rate, \
-     and docs/04-invariants.md P-01 through P-04 still stand at '—'. Every \
-     capture counter therefore reads '—' and not '0' — nothing has been \
-     measured, and a zero would be a claim that it had. A request is still \
-     parsed, validated and echoed back with the exact dates that would go on \
-     the wire, and is then REFUSED with 503. No vendor is contacted and nothing \
-     is written.";
+/// It read:
+///
+/// ```text
+/// crates/pull exposes no vendor fetch and no rate governor in this build:
+/// there is no pull::fetch and no pull::rate, and docs/04-invariants.md P-01
+/// through P-04 still stand at '—' … A request is still parsed, validated and
+/// echoed back … and is then REFUSED with 503. No vendor is contacted and
+/// nothing is written.
+/// ```
+///
+/// By the time anyone read it: `crates/pull/src/fetch.rs` was 521 lines,
+/// `crates/pull/src/rate.rs` was 822, the four invariant rows had moved to
+/// `◐ ✓ ✗ ◐`, the local-archive path was writing bar files and a manifest, and
+/// a run that stored 62,978 bars still answered `NOT STARTED`. It was written
+/// before any of that landed and nothing moved it — the same defect class this
+/// repository keeps catching itself with: a comment asserting what the code
+/// contradicts. Gate 12 cannot see it, because a stale claim about a *module*
+/// is not a cost claim.
+///
+/// # What is true
+///
+/// `pull::fetch` exists and is the transport seam; `pull::rate::Governor`
+/// exists and D-0037 is its decision. What does not exist is an **HTTP
+/// implementation of [`pull::fetch::BarSource`]** — the only implementor in
+/// this build is `pull::fetch::FakeSource`, and `crates/pull/Cargo.toml`
+/// declares no HTTP client — so no socket can be opened from here. The
+/// local-archive half needs none of that and runs for real.
+///
+/// The claim is checkable rather than taken: every name in it is a path, and
+/// `api::server::tests::the_ingest_page_names_what_exists_and_what_does_not` is
+/// what stops it going stale silently a second time.
+pub const HTTP_UNAVAILABLE: &str = "THE LOCAL-ARCHIVE PATH RUNS AND THE HTTP \
+     PATH DOES NOT EXIST. crates/pull/src/fetch.rs and crates/pull/src/rate.rs \
+     are both present — pull::fetch::BarSource is the transport seam and \
+     pull::rate::Governor is the adaptive governor of D-0037 — but the only \
+     implementor of BarSource in this build is pull::fetch::FakeSource, and \
+     crates/pull/Cargo.toml declares no HTTP client, so no socket can be opened \
+     from this process. A spot pull that names a local vendor folder therefore \
+     RUNS: it reads the files, writes bar files and records the manifest, and \
+     the counters below are that run's. A spot pull with the folder left blank, \
+     and every expired-F&O request, is understood, echoed back with the exact \
+     dates that would go on the wire, and then REFUSED with 503 — no vendor is \
+     contacted and nothing is written.";
 
 /// Everything every request renders from, read once at startup.
 ///
@@ -749,6 +779,17 @@ pub struct Site {
     /// Where the manifests were read from, named on the page so an absence is
     /// actionable rather than mysterious.
     pub store_root: PathBuf,
+    /// When the manifests above were read, in epoch seconds.
+    ///
+    /// **A counter on this page is as old as this process.** The censuses are
+    /// read once into an `Arc<Site>` — D-0039, and re-reading them per request
+    /// is the O(entries) cost that split exists to remove — so a pull performed
+    /// by *this running server* is on disk and in the journal while these
+    /// counters still say what they said at startup. That is a real staleness
+    /// and it is now said out loud on `/store` rather than left for an operator
+    /// to discover: [`store_html`] compares this against the newest audit
+    /// record, which is one 256-byte read.
+    pub loaded_at: i64,
 }
 
 impl Site {
@@ -782,6 +823,7 @@ impl Site {
             indices,
             targets,
             store_root,
+            loaded_at: ingest::epoch_secs(std::time::SystemTime::now()),
         }
     }
 
@@ -793,6 +835,93 @@ impl Site {
             census::read_all(store_root),
             store_root.to_path_buf(),
         )
+    }
+
+    /// The journal every pull against this store root appends to.
+    ///
+    /// Derived from [`Site::store_root`] rather than stored beside it: two
+    /// fields that must agree about which store this is are two fields that can
+    /// disagree, and the journal belongs to the store, not to the process.
+    #[must_use]
+    pub fn journal(&self) -> audit::Journal {
+        audit::Journal::at(&self.store_root)
+    }
+}
+
+/// The newest record in a journal, or nothing.
+///
+/// One `metadata` call and one 256-byte read, whatever the file holds — the
+/// bound [`audit::Journal::page`] is built for, proven by
+/// `api::audit::the_tail_reads_only_the_records_it_shows`. Never fails: a
+/// journal that will not read is reported by [`audit::Journal::look`] and this
+/// simply has nothing to show.
+#[must_use]
+pub fn newest_record(journal: &audit::Journal, log: &audit::Log) -> Option<audit::Record> {
+    journal
+        .page(log.records(), 0, 1)
+        .ok()?
+        .into_iter()
+        .next()
+        .and_then(|entry| entry.decoded.ok())
+}
+
+/// The journal, as the page footer states it.
+#[must_use]
+fn journal_note<'a>(
+    path: &'a str,
+    log: &'a audit::Log,
+    trouble: &'a str,
+) -> render::JournalNote<'a> {
+    match *log {
+        audit::Log::Absent => render::JournalNote {
+            path,
+            records: 0,
+            bytes: 0,
+            present: false,
+            trouble: None,
+        },
+        audit::Log::Unreadable { .. } => render::JournalNote {
+            path,
+            records: 0,
+            bytes: 0,
+            present: true,
+            trouble: Some(trouble),
+        },
+        audit::Log::Held {
+            records,
+            bytes,
+            torn,
+        } => render::JournalNote {
+            path,
+            records,
+            bytes,
+            present: true,
+            trouble: torn.map(|_ignored| trouble),
+        },
+    }
+}
+
+/// What is wrong with the journal file itself, in one sentence.
+///
+/// Built separately from [`journal_note`] because it has to outlive the borrow
+/// the view takes of it, and because a sentence an operator reads is not a
+/// field an enum carries.
+#[must_use]
+fn journal_trouble(log: &audit::Log) -> String {
+    match *log {
+        audit::Log::Absent => String::new(),
+        audit::Log::Unreadable { ref reason } => format!(
+            "UNREADABLE — {reason}. No run can be recorded until that is fixed, \
+             and a pull that cannot be recorded says so on its own answer page."
+        ),
+        audit::Log::Held { torn, records, .. } => torn.map_or_else(String::new, |spare| {
+            format!(
+                "TORN WRITE — {spare} byte(s) past the last whole record. A \
+                 process was killed inside an append. The {records} whole \
+                 record(s) before it are unaffected and still read; nothing \
+                 here repairs the tail."
+            )
+        }),
     }
 }
 
@@ -840,6 +969,44 @@ async fn pull_get(
     (code, axum::response::Html(body))
 }
 
+/// `YYYY-MM-DD HH:MM:SS` in IST, from epoch seconds.
+///
+/// A clock value no calendar can name is said rather than swallowed: a record
+/// whose timestamp is unusable is still a record of a run that happened, and
+/// blanking the row would lose it.
+#[must_use]
+pub fn ist_stamp(secs: i64) -> String {
+    IstMoment::from_epoch_secs(secs).map_or_else(
+        |why| format!("epoch second {secs} — {why}"),
+        |at| {
+            format!(
+                "{} {:02}:{:02}:{:02} IST",
+                at.day(),
+                at.minute_of_day() / 60,
+                at.minute_of_day() % 60,
+                at.second_of_minute()
+            )
+        },
+    )
+}
+
+/// A recorded window, or a dash when the record carries none.
+///
+/// Both ends zero means "this record is about a request that never got as far
+/// as a window" — a refused form, for instance. It is a dash and not
+/// `1970-01-01..=1970-01-01`, because a date nobody asked for is worse than no
+/// date at all.
+#[must_use]
+pub fn window_text(from: u32, to: u32) -> String {
+    if from == 0 && to == 0 {
+        return "—".to_owned();
+    }
+    match (Day::from_days(from), Day::from_days(to)) {
+        (Ok(a), Ok(b)) => format!("{a}..={b}"),
+        _ => format!("day {from}..=day {to} — outside the calendar this build can name"),
+    }
+}
+
 /// The ingest page, from a site already loaded.
 #[must_use]
 pub fn pull_html(site: &Site, today: Day) -> String {
@@ -848,13 +1015,54 @@ pub fn pull_html(site: &Site, today: Day) -> String {
         .enumerate()
         .map(|(i, t)| (t, site.targets.get(i).copied().unwrap_or(0)))
         .collect();
+    let journal = site.journal();
+    let log = journal.look();
+    let trouble = journal_trouble(&log);
+    let path = journal.path.display().to_string();
+    // NOT A FABRICATED PROGRESS BAR, AND NO LONGER A FABRICATED ABSENCE
+    // EITHER. There is nothing running — a pull is one synchronous POST — but
+    // runs HAVE happened, and the last one's counters are on disk. The panel
+    // reads them. When there is no record it still says dashes, and the
+    // sentence beside them names the file that is empty rather than a module
+    // that is not.
+    let last = newest_record(&journal, &log);
+    let stamp = last.as_ref().map(|r| ist_stamp(r.at_unix_secs));
+    let window = last.as_ref().and_then(|r| {
+        match (Day::from_days(r.from_days), Day::from_days(r.to_days)) {
+            (Ok(a), Ok(b)) => pull::session::Window::new(a, b).ok(),
+            _ => None,
+        }
+    });
+    let capture = match (last.as_ref(), stamp.as_ref(), window) {
+        (Some(record), Some(when), Some(window)) => Some(render::Capture {
+            what: &record.source,
+            when,
+            outcome: record.outcome.label(),
+            loud: record.outcome.is_loud(),
+            window,
+            fetched: record.rows_read,
+            stored: record.bars_stored,
+            folded: record.rows_folded,
+            drops: record.drops,
+            took_micros: record.elapsed_micros,
+        }),
+        _ => None,
+    };
+    let no_capture = if last.is_some() {
+        "The last record carries no usable window, so its counters are not shown \
+         beside one — see /audit for the record itself."
+    } else {
+        "No pull has been recorded against this store root yet, so every counter \
+         below is an em dash and not a zero: nothing has been measured, and a \
+         zero would be a claim that it had."
+    };
     render::pull_page(&render::PullView {
         today,
         targets: &targets,
-        // NOT A FABRICATED PROGRESS BAR. There is nothing running, so there is
-        // nothing to report, and the page says so where the numbers would be.
-        capture: None,
-        halt: Some(CAPTURE_UNAVAILABLE),
+        capture,
+        no_capture,
+        journal: journal_note(&path, &log, &trouble),
+        halt: Some(HTTP_UNAVAILABLE),
         notes: &site.read.notes,
     })
 }
@@ -870,7 +1078,9 @@ pub fn refusal_html(scope: &str, why: &ingest::Refusal) -> String {
         scope,
         verdict: "REFUSED",
         reason: &why.to_string(),
+        good: false,
         facts: &facts,
+        footnote: "Nothing here was written to the store.",
     })
 }
 
@@ -880,8 +1090,41 @@ fn accepted_html(scope: &str, mut facts: Vec<(&'static str, String)>) -> String 
     render::receipt_page(&render::Receipt {
         scope,
         verdict: "NOT STARTED",
-        reason: CAPTURE_UNAVAILABLE,
+        reason: HTTP_UNAVAILABLE,
+        good: false,
         facts: &facts,
+        footnote: "Nothing here was written to the store.",
+    })
+}
+
+/// The page a run that actually stored bars answers with.
+///
+/// **A separate receipt, because the shared one was lying.** Every successful
+/// local ingest — 194 members, 62,978 bars, a manifest rewritten — came back
+/// under the verdict `NOT STARTED`, with [`HTTP_UNAVAILABLE`]'s predecessor as
+/// its reason, a red `badge bad`, and the closing line *"Nothing here was
+/// written to the store."* Four claims on one page, all four false, because
+/// there was one `accepted_html` and it stamped every answer alike.
+fn stored_html(
+    scope: &str,
+    verdict: &str,
+    reason: &str,
+    facts: &[(&'static str, String)],
+) -> String {
+    let good = verdict == audit::Outcome::Stored.label();
+    render::receipt_page(&render::Receipt {
+        scope,
+        verdict,
+        reason,
+        good,
+        facts,
+        footnote: if good {
+            "The bars named above ARE on the store root named above, and the \
+             manifest counts them."
+        } else {
+            "Whatever landed before the failure is on disk and is described \
+             above; nothing beyond it is claimed."
+        },
     })
 }
 
@@ -924,12 +1167,31 @@ fn window_facts(window: pull::session::Window) -> Vec<(&'static str, String)> {
 /// attribute is a courtesy, a parser is a rule"* — and spot had only the
 /// courtesy. An attribute is absent from a `curl`, from a replayed POST, and
 /// from any client that is not the browser the form was rendered for.
-fn spot_answer(body: &str, today: Day, site: &Site) -> (axum::http::StatusCode, String) {
+fn spot_answer(
+    body: &str,
+    today: Day,
+    now: std::time::SystemTime,
+    site: &Site,
+) -> (axum::http::StatusCode, String) {
+    let journal = site.journal();
     match ingest::parse_spot(body, today) {
-        Err(why) => (
-            axum::http::StatusCode::BAD_REQUEST,
-            refusal_html("Spot pull", &why),
-        ),
+        Err(why) => {
+            let record = audit::Record::refused(
+                audit::Scope::Spot,
+                audit::Outcome::Refused,
+                now,
+                &param(body, "target"),
+                &why.to_string(),
+            );
+            // A REFUSAL IS RECORDED TOO. "What was asked" includes the requests
+            // that were not honoured — an operator debugging a form that never
+            // starts anything needs the refusals more than the successes.
+            let _ignored = journal.append(&record);
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                refusal_html("Spot pull", &why),
+            )
+        }
         Ok(asked) => {
             let slot = ingest::SpotTarget::ALL
                 .into_iter()
@@ -954,54 +1216,163 @@ fn spot_answer(body: &str, today: Day, site: &Site) -> (axum::http::StatusCode, 
             // loud 503 as before rather than a silent nothing.
             let folder = param(body, "folder");
             if folder.is_empty() {
+                let record = audit::Record::refused(
+                    audit::Scope::Spot,
+                    audit::Outcome::NotStarted,
+                    now,
+                    asked.target.label(),
+                    "no local folder was given and there is no HTTP transport in this build",
+                )
+                .with_window(asked.window);
+                facts.push(recorded_fact(&journal, &record));
                 return (
                     axum::http::StatusCode::SERVICE_UNAVAILABLE,
                     accepted_html("Spot pull", facts),
                 );
             }
-            match run_local(&folder, asked.window) {
-                Ok(done) => {
-                    facts.push(("Source", format!("local folder · {folder}")));
-                    facts.push(("Members read", done.members.to_string()));
-                    facts.push(("Rows read", done.rows_read.to_string()));
-                    facts.push(("Bars stored", done.bars_stored.to_string()));
-                    facts.push(("Bars dropped", done.census.total().to_string()));
-                    facts.push(("Members failed", done.failures.len().to_string()));
-                    // EVERY ROW ACCOUNTED FOR, or say so. A row that vanished
-                    // without landing in one of the three is indistinguishable
-                    // from a row the vendor never sent.
-                    facts.push((
-                        "Balances",
-                        if done.balances() {
-                            "yes — rows in equals bars out plus drops".to_owned()
-                        } else {
-                            format!(
-                                "NO — {} rows read, {} stored, {} dropped, {} members failed",
-                                done.rows_read,
-                                done.bars_stored,
-                                done.census.total(),
-                                done.failures.len()
-                            )
-                        },
-                    ));
-                    for f in done.failures.iter().take(5) {
-                        facts.push(("Failed", format!("{} — {}", f.instrument, f.why)));
-                    }
-                    (
-                        axum::http::StatusCode::OK,
-                        accepted_html("Spot pull", facts),
-                    )
-                }
-                Err(why) => {
-                    facts.push(("Source", format!("local folder · {folder}")));
-                    facts.push(("Refused", why));
-                    (
-                        axum::http::StatusCode::BAD_REQUEST,
-                        accepted_html("Spot pull", facts),
-                    )
-                }
-            }
+            facts.push(("Source", format!("local folder · {folder}")));
+            facts.push(("Store root", site.store_root.display().to_string()));
+            local_answer(&folder, asked.window, now, site, &journal, facts)
         }
+    }
+}
+
+/// One local-archive run, from the folder to the receipt.
+///
+/// Split out of [`spot_answer`] to stay under clippy's line ceiling; the split
+/// is a lint, not a design.
+fn local_answer(
+    folder: &str,
+    window: pull::session::Window,
+    now: std::time::SystemTime,
+    site: &Site,
+    journal: &audit::Journal,
+    mut facts: Vec<(&'static str, String)>,
+) -> (axum::http::StatusCode, String) {
+    // MEASURED, NOT ESTIMATED. `Instant` and not the wall clock: the wall
+    // clock can step backwards under NTP and a negative duration is not a
+    // thing an operator should ever be shown.
+    let started = std::time::Instant::now();
+    let outcome = run_local(folder, window, &site.store_root);
+    let took = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+
+    match outcome {
+        Ok(done) => {
+            facts.push(("Members read", done.members.to_string()));
+            facts.push(("Rows read", done.rows_read.to_string()));
+            facts.push(("Bars stored", done.bars_stored.to_string()));
+            facts.push(("Rows folded into an open bar", done.rows_folded.to_string()));
+            facts.push(("Slices the census counted", done.counted.to_string()));
+            facts.push(("Rows dropped", done.census.total().to_string()));
+            facts.push(("Members failed", done.failures.len().to_string()));
+            facts.push(("Took", render_elapsed(took)));
+            // EVERY ROW ACCOUNTED FOR, or say so. A row that vanished without
+            // landing in one of the four is indistinguishable from a row the
+            // vendor never sent.
+            facts.push((
+                "Balances",
+                if done.balances() {
+                    format!(
+                        "yes — {} read = {} stored + {} folded + {} dropped",
+                        done.rows_read,
+                        done.bars_stored,
+                        done.rows_folded,
+                        done.census.total()
+                    )
+                } else {
+                    format!(
+                        "NO — {} rows read, {} stored, {} folded, {} dropped, {} members failed",
+                        done.rows_read,
+                        done.bars_stored,
+                        done.rows_folded,
+                        done.census.total(),
+                        done.failures.len()
+                    )
+                },
+            ));
+            for f in done.failures.iter().take(5) {
+                facts.push(("Failed", format!("{} — {}", f.instrument, f.why)));
+            }
+            let record =
+                audit::Record::of_run(audit::Scope::Spot, now, took, folder, window, &done);
+            let verdict = record.outcome.label();
+            facts.push(recorded_fact(journal, &record));
+            let reason = if done.balances() {
+                "The run finished and every row is accounted for. Bars are on \
+                 disk, the manifest counts them, and this run is on the record \
+                 at /audit."
+            } else {
+                "THE RUN FINISHED AND THE BOOKS DO NOT BALANCE. Rows in does not \
+                 equal bars out plus rows folded plus rows dropped, or a member \
+                 failed. Nothing has been hidden — the figures below are what \
+                 happened."
+            };
+            (
+                axum::http::StatusCode::OK,
+                stored_html("Spot pull", verdict, reason, &facts),
+            )
+        }
+        Err(why) => {
+            facts.push(("Refused", why.clone()));
+            facts.push(("Took", render_elapsed(took)));
+            let record = audit::Record::refused(
+                audit::Scope::Spot,
+                audit::Outcome::Failed,
+                now,
+                folder,
+                &why,
+            )
+            .with_window(window);
+            facts.push(recorded_fact(journal, &record));
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                stored_html(
+                    "Spot pull",
+                    "FAILED",
+                    "The folder was reached and the run did not complete. Nothing \
+                     partial is claimed: the reason is below and the attempt is on \
+                     the record at /audit.",
+                    &facts,
+                ),
+            )
+        }
+    }
+}
+
+/// A duration an operator reads, from microseconds.
+///
+/// The receipt's copy of [`render::elapsed`]'s job. It is here rather than
+/// exported from `render` because a receipt row is a fact, not markup, and the
+/// two formats being identical is a coincidence this does not depend on.
+fn render_elapsed(micros: u64) -> String {
+    if micros < 1_000_000 {
+        format!("{}.{:03} ms", micros / 1_000, micros % 1_000)
+    } else {
+        format!(
+            "{}.{:03} s",
+            micros / 1_000_000,
+            (micros % 1_000_000) / 1_000
+        )
+    }
+}
+
+/// Appends one record and says on the receipt whether it landed.
+///
+/// **The failure is not swallowed.** A run that wrote 9.8 MB of bars and could
+/// not write its 256-byte record is a run nobody can find afterwards, so the
+/// answer page says which of the two happened. `CLAUDE.md` §4 — a fallback that
+/// hides a failure is banned; this one names it in the same table as the
+/// figures it belongs to.
+fn recorded_fact(journal: &audit::Journal, record: &audit::Record) -> (&'static str, String) {
+    match journal.append(record) {
+        Ok(()) => (
+            "Recorded",
+            format!("yes — appended to {}", journal.path.display()),
+        ),
+        Err(why) => (
+            "Recorded",
+            format!("NO — this run is NOT in the journal. {why}"),
+        ),
     }
 }
 
@@ -1011,10 +1382,29 @@ fn spot_answer(body: &str, today: Day, site: &Site) -> (axum::http::StatusCode, 
 /// `pull::vendor` rather than being decided here — the column layout, the
 /// timestamp encoding and the price scale are descriptor fields, so adding a
 /// feed is a row in that table and not an edit in this function.
+///
+/// # Two defects this signature and its body carry the fix for
+///
+/// **The segment was the string `"FUT"`.** `brutex_core::instrument::Segment`
+/// parses `INDEX`, `CASH` and `FNO` and nothing else, so every member of every
+/// GDFL folder was refused by the census key — 194 named failures and not one
+/// bar written, on a page that used to write the bars and count none of them.
+/// The two path segments are now spelled by [`Exchange::as_str`] and
+/// [`Segment::as_str`] rather than by a literal, so the next typo does not
+/// compile.
+///
+/// **The store root was read from the environment a second time.** It called a
+/// private `default_store_dir` that consulted `HOME` directly, while the pages
+/// read [`store_dir`], which honours `BRUTEX_STORE`. With that variable set,
+/// bars went to one tree and `/store` reported another — a page truthfully
+/// describing a store nobody had written to. The root now arrives as an
+/// argument, from the one [`Site`] every page renders from.
 fn run_local(
     folder: &str,
     window: pull::session::Window,
+    store_root: &Path,
 ) -> Result<pull::ingest::Ingested, String> {
+    use brutex_core::instrument::{Exchange, Segment};
     let request = pull::fetch::BarRequest {
         window,
         cadence: pull::session::Cadence::Minute,
@@ -1026,20 +1416,11 @@ fn run_local(
         scale: pull::vendor::PriceScale::Paisa,
         timeframe: store::path::Timeframe::MINUTE_1,
         vendor: brutex_core::vendor::Vendor::Dhan,
-        exchange: "NSE",
-        segment: "FUT",
+        exchange: Exchange::Nse.as_str(),
+        segment: Segment::Fno.as_str(),
     };
-    pull::ingest::from_dir(std::path::Path::new(folder), &default_store_dir(), plan)
+    pull::ingest::from_dir(std::path::Path::new(folder), store_root, plan)
         .map_err(|why| why.to_string())
-}
-
-/// Where bars are written when nothing says otherwise.
-fn default_store_dir() -> std::path::PathBuf {
-    std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_default()
-        .join(".brutex")
-        .join("store")
 }
 
 /// Starting a spot pull. **POST only.**
@@ -1047,8 +1428,13 @@ async fn pull_spot(
     axum::extract::State(site): axum::extract::State<Loaded>,
     body: String,
 ) -> (axum::http::StatusCode, axum::response::Html<String>) {
-    let (code, page) = dated(ingest::today_ist(), "Spot pull", |today| {
-        spot_answer(&body, today, &site)
+    // ONE READING OF THE CLOCK, USED TWICE. The day the gate checks against and
+    // the second stamped into the record come from the same `SystemTime`, so a
+    // request that straddles midnight cannot be gated against one day and
+    // recorded on another.
+    let now = std::time::SystemTime::now();
+    let (code, page) = dated(ingest::ist_day(now), "Spot pull", |today| {
+        spot_answer(&body, today, now, &site)
     });
     (code, axum::response::Html(page))
 }
@@ -1058,12 +1444,27 @@ async fn pull_spot(
 ///
 /// Split from the handler so the expiry gate is driven by a value rather than
 /// by the machine's clock — `CLAUDE.md` §3 rule 5.
-fn fno_answer(body: &str, today: Day) -> (axum::http::StatusCode, String) {
+fn fno_answer(
+    body: &str,
+    today: Day,
+    now: std::time::SystemTime,
+    journal: &audit::Journal,
+) -> (axum::http::StatusCode, String) {
     match ingest::parse_fno(body, today) {
-        Err(why) => (
-            axum::http::StatusCode::BAD_REQUEST,
-            refusal_html("Expired F&O pull", &why),
-        ),
+        Err(why) => {
+            let record = audit::Record::refused(
+                audit::Scope::Fno,
+                audit::Outcome::Refused,
+                now,
+                &param(body, "underlying"),
+                &why.to_string(),
+            );
+            let _ignored = journal.append(&record);
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                refusal_html("Expired F&O pull", &why),
+            )
+        }
         Ok(asked) => {
             let mut facts = vec![
                 ("Underlying", asked.underlying.as_str().to_owned()),
@@ -1074,6 +1475,15 @@ fn fno_answer(body: &str, today: Day) -> (axum::http::StatusCode, String) {
                 ),
             ];
             facts.extend(window_facts(asked.window));
+            let record = audit::Record::refused(
+                audit::Scope::Fno,
+                audit::Outcome::NotStarted,
+                now,
+                asked.underlying.as_str(),
+                "expired F&O has no local-archive path and no HTTP transport in this build",
+            )
+            .with_window(asked.window);
+            facts.push(recorded_fact(journal, &record));
             (
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
                 accepted_html("Expired F&O pull", facts),
@@ -1083,11 +1493,152 @@ fn fno_answer(body: &str, today: Day) -> (axum::http::StatusCode, String) {
 }
 
 /// Starting an expired-series pull. **POST only.**
-async fn pull_fno(body: String) -> (axum::http::StatusCode, axum::response::Html<String>) {
-    let (code, page) = dated(ingest::today_ist(), "Expired F&O pull", |today| {
-        fno_answer(&body, today)
+async fn pull_fno(
+    axum::extract::State(site): axum::extract::State<Loaded>,
+    body: String,
+) -> (axum::http::StatusCode, axum::response::Html<String>) {
+    let now = std::time::SystemTime::now();
+    let journal = site.journal();
+    let (code, page) = dated(ingest::ist_day(now), "Expired F&O pull", |today| {
+        fno_answer(&body, today, now, &journal)
     });
     (code, axum::response::Html(page))
+}
+
+/// The audit page.
+async fn audit_get(
+    axum::extract::State(site): axum::extract::State<Loaded>,
+    uri: axum::http::Uri,
+) -> (axum::http::StatusCode, axum::response::Html<String>) {
+    let (code, body) = dated(ingest::today_ist(), "Audit", |today| {
+        (
+            axum::http::StatusCode::OK,
+            audit_html(&site, today, page_number(uri.query().unwrap_or(""))),
+        )
+    });
+    (code, axum::response::Html(body))
+}
+
+/// The audit page, from a site already loaded.
+///
+/// Bounded twice over: the record count is one `metadata` call, so the pager is
+/// arithmetic, and only this page's records are read off disk. Neither cost
+/// grows with the journal —
+/// `api::audit::the_tail_reads_only_the_records_it_shows` is what holds the
+/// read to its page.
+#[must_use]
+pub fn audit_html(site: &Site, today: Day, page: usize) -> String {
+    let journal = site.journal();
+    let log = journal.look();
+    let trouble = journal_trouble(&log);
+    let path = journal.path.display().to_string();
+    let total = log.records();
+    let per_page = u64::try_from(PAGE_ROWS).unwrap_or(1).max(1);
+    let last_page = usize::try_from(total.saturating_sub(1) / per_page).unwrap_or(0);
+    let page = page.min(last_page);
+    let skip = u64::try_from(page).unwrap_or(0).saturating_mul(per_page);
+    let mut notes = vec![format!(
+        "audit journal: {path} — {total} record(s), one 256-byte record per pull, \
+         appended and fsync-ed before the answer is rendered"
+    )];
+    if !trouble.is_empty() {
+        notes.push(format!("UNAVAILABLE — {trouble}"));
+    }
+    let rows = audit_rows(&journal, total, skip, per_page, &mut notes);
+    render::audit_page(&render::AuditView {
+        today,
+        journal: journal_note(&path, &log, &trouble),
+        rows: &rows,
+        page,
+        last_page,
+        notes: &notes,
+    })
+}
+
+/// One page of the journal, as rows, with any refusal appended to `notes`.
+///
+/// Split from [`audit_html`] so the refusal arm is drivable. Left inline, it
+/// was reachable only from a journal that changed size between the `metadata`
+/// call and the read — a race a test cannot stage — and an untestable arm on a
+/// render path is an arm nobody has checked. Taking the journal and the count
+/// as arguments makes both outcomes a property of the file, which a test owns.
+///
+/// A read that fails empties the table and says why. It does **not** fall back
+/// to a shorter read or to zero records: `CLAUDE.md` §4 — degrade loudly and
+/// name the reason.
+fn audit_rows(
+    journal: &audit::Journal,
+    total: u64,
+    skip: u64,
+    take: u64,
+    notes: &mut Vec<String>,
+) -> Vec<render::AuditRow> {
+    match journal.page(total, skip, take) {
+        Ok(entries) => entries.into_iter().map(audit_row).collect(),
+        Err(why) => {
+            notes.push(format!("UNREADABLE — {why}"));
+            Vec::new()
+        }
+    }
+}
+
+/// One journal entry, as the page shows it.
+///
+/// A record that will not decode becomes a row saying so rather than a gap: one
+/// damaged record must not blank the rows around it, which is exactly what a
+/// `filter_map` here would have done.
+fn audit_row(entry: audit::Entry) -> render::AuditRow {
+    match entry.decoded {
+        Err(fault) => render::AuditRow {
+            ordinal: entry.ordinal,
+            fault: Some(fault.to_string()),
+            when: String::new(),
+            scope: String::new(),
+            outcome: String::new(),
+            loud: true,
+            source: String::new(),
+            window: String::new(),
+            members: 0,
+            rows_read: 0,
+            bars_stored: 0,
+            rows_folded: 0,
+            counted: 0,
+            drops: audit::Drops::default(),
+            failures: 0,
+            took_micros: 0,
+            note: String::new(),
+        },
+        Ok(record) => render::AuditRow {
+            ordinal: entry.ordinal,
+            fault: None,
+            when: ist_stamp(record.at_unix_secs),
+            scope: record.scope.label().to_owned(),
+            outcome: record.outcome.label().to_owned(),
+            loud: record.outcome.is_loud(),
+            source: if record.source_was_cut() {
+                format!(
+                    "{}… (cut from {} bytes)",
+                    record.source, record.source_bytes
+                )
+            } else {
+                record.source.clone()
+            },
+            window: window_text(record.from_days, record.to_days),
+            members: record.members,
+            rows_read: record.rows_read,
+            bars_stored: record.bars_stored,
+            rows_folded: record.rows_folded,
+            counted: record.counted,
+            drops: record.drops,
+            failures: record.failures,
+            took_micros: record.elapsed_micros,
+            note: if record.note_was_cut() {
+                format!("{}… (cut from {} bytes)", record.note, record.note_bytes)
+            } else {
+                record.note.clone()
+            },
+        },
+    }
 }
 
 /// The store page.
@@ -1129,6 +1680,36 @@ pub fn store_html(site: &Site, today: Day, page: usize) -> String {
          header, and every grid cell is one hash probe",
         site.store_root.display()
     )];
+    // A COUNTER ON THIS PAGE IS AS OLD AS THIS PROCESS, and until now nothing
+    // said so. The censuses are read once into an `Arc<Site>` (D-0039), so a
+    // pull run by this very server lands on disk and in the journal while these
+    // cards still say what they said at startup. The audit journal is what
+    // makes the staleness detectable in constant time: one 256-byte read of the
+    // newest record, compared against the second the site was loaded.
+    let journal = site.journal();
+    let log = journal.look();
+    if let Some(record) = newest_record(&journal, &log)
+        && record.at_unix_secs >= site.loaded_at
+    {
+        // TWO NOTES, EACH UNDER `render::clamp`'s 160-byte ceiling. One long
+        // note would be cut mid-sentence by the renderer, and a truncated
+        // warning is a warning nobody finishes reading.
+        notes.push(format!(
+            "UNCHECKED — a pull ran at {}; these manifests were read at {}. \
+             Restart to refresh, or see /audit.",
+            ist_stamp(record.at_unix_secs),
+            ist_stamp(site.loaded_at)
+        ));
+        notes.push(
+            "The counters below are this process's startup read; re-reading them \
+             per request is the cost D-0039 removed."
+                .to_owned(),
+        );
+    }
+    let trouble = journal_trouble(&log);
+    if !trouble.is_empty() {
+        notes.push(format!("UNAVAILABLE — audit journal {trouble}"));
+    }
     notes.extend(site.censuses.iter().map(census::VendorCensus::note));
     // The master notes ride along, because an `UNAVAILABLE` master is why the
     // grid may be down to the two swept series.
@@ -1169,6 +1750,7 @@ pub fn router(site: Loaded) -> axum::Router {
         .route("/pull", axum::routing::get(pull_get))
         .route("/pull/spot", axum::routing::post(pull_spot))
         .route("/pull/fno", axum::routing::post(pull_fno))
+        .route("/audit", axum::routing::get(audit_get))
         .route("/store", axum::routing::get(store_get))
         .route("/health", axum::routing::get(health))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_FORM_BYTES))
@@ -1354,6 +1936,16 @@ mod tests {
     /// A site over the given masters and an empty store.
     fn site(name: &str, dir: &Path) -> Site {
         Site::load(dir, &store_root(name))
+    }
+
+    /// A fixed moment, so a recorded run is the same record on every run.
+    ///
+    /// 04:30 UTC on the day every gate below is driven with, which is 10:00
+    /// IST — so a record's stamp and a page's `today` cannot disagree, and no
+    /// assertion here is a property of when the suite happened to run.
+    fn moment() -> std::time::SystemTime {
+        let secs = u64::from(day(2026, 8, 7).days_from_epoch()) * 86_400 + 4 * 3_600 + 30 * 60;
+        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs)
     }
 
     const GROWW_HEAD: &str = "exchange,segment,underlying_symbol,trading_symbol,\
@@ -2040,6 +2632,10 @@ mod tests {
             "Store is a real link now: {root}"
         );
         assert!(
+            root.contains("<a class=\"lnk\" href=\"/audit\">Audit</a>"),
+            "and Audit is a real link too: {root}"
+        );
+        assert!(
             root.contains("<span class=\"lnk off\" title=\"not built yet\">Runs</span>"),
             "and Runs is still shown, disabled, because there is no sweep: {root}"
         );
@@ -2071,6 +2667,19 @@ mod tests {
              and must never be a 500: {store_page}"
         );
         assert!(store_page.contains("UNAVAILABLE"), "{store_page}");
+
+        // AND /audit ANSWERS OVER AN EMPTY JOURNAL, for the same reason: no
+        // pull has been run against this store root, and a page that 500s on a
+        // fresh install is a page that is broken exactly when it is first
+        // opened.
+        let audit_page = get(addr, "/audit?page=3").await;
+        let status = audit_page.lines().next().unwrap_or_default();
+        assert!(status.contains("200 OK"), "{audit_page}");
+        assert!(audit_page.contains("nothing recorded yet"), "{audit_page}");
+        assert!(
+            audit_page.contains("It is a file on disk, not memory"),
+            "and it says where the history lives: {audit_page}"
+        );
 
         // A GET ON A POST ROUTE STARTS NOTHING. A crawler follows links and a
         // browser refetches on back; either would otherwise begin an ingest.
@@ -2235,7 +2844,7 @@ mod tests {
                 "and the correction is stated, not performed in silence: {over}"
             );
             assert!(
-                over.contains("no vendor was contacted") || over.contains("No vendor is contacted"),
+                over.contains("no vendor was contacted") || over.contains("no vendor is contacted"),
                 "and it says nothing ran: {over}"
             );
 
@@ -2408,11 +3017,28 @@ mod tests {
         assert!(html.contains("Swept indices"), "{html}");
         assert!(html.contains("NIFTY Total Market equities"), "{html}");
 
-        // NOT A FABRICATED PROGRESS BAR. Nothing is running, so every counter
-        // is a dash and the reason is named at the top of the page.
-        assert!(html.contains("CAPTURE UNAVAILABLE"), "{html}");
-        assert!(html.contains("pull::fetch"), "the missing module is named");
-        assert!(html.contains("pull::rate"), "and so is the governor");
+        // NOT A FABRICATED PROGRESS BAR, AND NOT A FABRICATED ABSENCE EITHER.
+        //
+        // CHANGED, AND WHY. This block used to assert the page said
+        // "CAPTURE UNAVAILABLE" and named `pull::fetch` and `pull::rate` as the
+        // MISSING modules. Both files exist — 521 and 822 lines — and the
+        // local-archive path writes bars through them, so the old assertions
+        // pinned a sentence that had become false. What is actually absent is
+        // an HTTP implementor of `BarSource`, and that is what is asserted now:
+        // the claim is checkable, so the test can hold it to being true.
+        assert!(html.contains("ARCHIVE ONLY"), "{html}");
+        assert!(
+            html.contains("THE LOCAL-ARCHIVE PATH RUNS AND THE HTTP PATH DOES NOT EXIST"),
+            "{html}"
+        );
+        assert!(
+            !html.contains("there is no pull::fetch"),
+            "the stale claim must not come back: {html}"
+        );
+        assert!(
+            html.contains("FakeSource"),
+            "and the ONE implementor that does exist is named: {html}"
+        );
         assert!(
             !html.contains("<div class=\"cv\">0</div>"),
             "a zero would claim a measurement nobody took: {html}"
@@ -2872,9 +3498,13 @@ mod tests {
         // `fno_answer` is the half of the handler the expiry rule lives in, and
         // it takes the day rather than reading one, so both outcomes are pinned
         // rather than being properties of when the suite ran.
+        let root = store_root("fnogate");
+        let journal = audit::Journal::at(&root);
         let (code, page) = fno_answer(
             "underlying=NIFTY&series=fut&expiry=2026-07-30&from=2026-07-01&to=2026-07-30",
             day(2026, 8, 7),
+            moment(),
+            &journal,
         );
         assert_eq!(code, axum::http::StatusCode::SERVICE_UNAVAILABLE);
         assert!(page.contains("NOT STARTED"), "{page}");
@@ -2882,13 +3512,44 @@ mod tests {
             page.contains("expired, checked against 2026-08-07"),
             "{page}"
         );
+        assert!(
+            page.contains("<th>Recorded</th><td>yes"),
+            "an accepted request that cannot run is still on the record: {page}"
+        );
 
         let (code, page) = fno_answer(
             "underlying=NIFTY&series=fut&expiry=2026-08-07&from=2026-08-01&to=2026-08-07",
             day(2026, 8, 7),
+            moment(),
+            &journal,
         );
         assert_eq!(code, axum::http::StatusCode::BAD_REQUEST);
         assert!(page.contains("LIVE CONTRACT IS NEVER STORED"), "{page}");
+
+        // BOTH went into the journal — the refusal as well as the acceptance.
+        // An operator debugging a form that never starts anything needs the
+        // refusals more than the successes, and a log that keeps only the
+        // successes is the one that cannot answer them.
+        let log = journal.look();
+        assert_eq!(
+            log.records(),
+            2,
+            "one record per request, refusals included"
+        );
+        let rows = journal.page(2, 0, 2).expect("a page");
+        let newest = rows[0].decoded.clone().expect("decodes");
+        assert_eq!(newest.outcome, audit::Outcome::Refused);
+        assert_eq!(newest.scope, audit::Scope::Fno);
+        assert!(newest.note.contains("has not expired"), "{}", newest.note);
+        // AND THE CUT IS VISIBLE. The refusal is 107 bytes and the field holds
+        // 68, so what the record keeps is a prefix — and it says so, rather
+        // than presenting a half sentence as the whole reason.
+        assert!(newest.note_was_cut(), "{}", newest.note);
+        assert!(newest.note_bytes > 68, "the original length is kept");
+        let older = rows[1].decoded.clone().expect("decodes");
+        assert_eq!(older.outcome, audit::Outcome::NotStarted);
+        assert_eq!(older.source, "NIFTY");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -3046,6 +3707,7 @@ mod tests {
         let (code, html) = spot_answer(
             &spot_form(&absent, "2022-01-08", "2022-01-08"),
             day(2026, 8, 7),
+            moment(),
             &site,
         );
         assert_eq!(
@@ -3085,6 +3747,7 @@ mod tests {
         let (code, html) = spot_answer(
             &spot_form(&folder, "2022-01-08", "2022-01-08"),
             day(2026, 8, 7),
+            moment(),
             &site,
         );
         assert_eq!(code, axum::http::StatusCode::OK, "{html}");
@@ -3098,16 +3761,20 @@ mod tests {
             "and neither was stored: {html}"
         );
         assert!(
-            html.contains("<th>Bars dropped</th><td>2</td>"),
+            html.contains("<th>Rows dropped</th><td>2</td>"),
             "each one counted by the reason it was declined for: {html}"
         );
         assert!(
             html.contains("<th>Members failed</th><td>0</td>"),
             "a declined row is not a failure: {html}"
         );
+        // RENAMED HONESTLY, and the arithmetic is now spelled out rather than
+        // described. The old sentence said "rows in equals bars out plus drops"
+        // and omitted the folded rows entirely, which is the term that made a
+        // real 354,675-row run read as not balancing.
         assert!(
-            html.contains("rows in equals bars out plus drops"),
-            "the run balances and the receipt says which arithmetic: {html}"
+            html.contains("<th>Balances</th><td>yes — 2 read = 0 stored + 0 folded + 2 dropped"),
+            "the run balances and the receipt shows every term: {html}"
         );
         let _ = std::fs::remove_dir_all(&folder);
     }
@@ -3133,6 +3800,7 @@ mod tests {
         let (code, html) = spot_answer(
             &spot_form(&folder, "2022-01-08", "2022-01-08"),
             day(2026, 8, 7),
+            moment(),
             &site,
         );
         assert_eq!(
@@ -3164,6 +3832,7 @@ mod tests {
         let (code, html) = spot_answer(
             "target=swept&from=2022-01-08&to=2022-01-08",
             day(2026, 8, 7),
+            moment(),
             &site,
         );
         assert_eq!(
@@ -3177,25 +3846,633 @@ mod tests {
         );
     }
 
-    /// Bars land under the home directory unless something says otherwise.
+    /// Bars land in the store root the PAGE reports, and nowhere else.
+    ///
+    /// **This test replaced `the_default_store_directory_is_named_under_the_
+    /// home_directory`, and the function it exercised is gone.** That function
+    /// read `HOME` directly and joined `.brutex/store`, while every page reads
+    /// [`store_dir`], which honours `BRUTEX_STORE`. With that variable set the
+    /// two disagreed: bars went to one tree and `/store` truthfully described
+    /// another, which is the "plausible wrong answer" shape this repository
+    /// hunts. The old test asserted the old function's shape faithfully — it
+    /// was the *design* that was wrong, so the assertion is now about the
+    /// property that matters instead: one root, taken from the site.
     #[test]
-    fn the_default_store_directory_is_named_under_the_home_directory() {
-        let root = default_store_dir();
-        // Rendered BEFORE the assertions rather than inside their messages: a
-        // message argument is evaluated only when the assertion fails, so a
-        // `root.display()` on its own line is a line the passing run never
-        // executes — and the coverage gate is right to say so.
-        let shown = root.display().to_string();
-        assert!(root.ends_with("store"), "the leaf is the store: {shown}");
+    fn a_run_writes_under_the_same_store_root_the_page_reports() {
+        let dir = agreeing("localroot");
+        let site = site("localroot", &dir);
+        let folder = vendor_folder(
+            "localroot",
+            &format!(
+                "{GDFL_MEMBER_HEAD}\
+                 NIFTY,08/01/2022,10:00:00,100.00,0,0,0,0,0,7\n\
+                 NIFTY,08/01/2022,10:00:30,100.50,0,0,0,0,0,7\n"
+            ),
+        );
+        let (code, html) = spot_answer(
+            &spot_form(&folder, "2022-01-08", "2022-01-08"),
+            day(2026, 8, 7),
+            moment(),
+            &site,
+        );
+        assert_eq!(code, axum::http::StatusCode::OK, "{html}");
+        let root = site.store_root.display().to_string();
         assert!(
-            root.parent().is_some_and(|p| p.ends_with(".brutex")),
-            "under this build's own dot directory, not loose in home: {shown}"
+            html.contains(&format!("<th>Store root</th><td>{root}</td>")),
+            "the receipt names the root it wrote under: {html}"
+        );
+        assert!(
+            site.store_root.join("bars").exists(),
+            "and the bars are THERE, under the site's root and not under one \
+             read from the environment a second time"
+        );
+        // The journal is under the same root, for the same reason.
+        assert!(site.journal().path.starts_with(&site.store_root));
+        assert_eq!(site.journal().look().records(), 1);
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// One local run, on the record, and the pull page reads it back.
+    ///
+    /// The whole loop in one test: a run happens, a record lands on disk, and
+    /// the page renders that record's counters rather than an em dash.
+    #[test]
+    fn a_run_is_recorded_and_the_pull_page_reads_the_record_back() {
+        let dir = agreeing("localaudit");
+        let site = site("localaudit", &dir);
+        // Before anything: no journal, dashes, and a sentence naming the empty
+        // file rather than an absent module.
+        let before = pull_html(&site, day(2026, 8, 7));
+        assert!(before.contains("No file yet"), "{before}");
+        assert_eq!(before.matches("class=\"meter none\"").count(), 6);
+        assert!(
+            before.contains("No pull has been recorded against this store root yet"),
+            "{before}"
+        );
+
+        let folder = vendor_folder(
+            "localaudit",
+            &format!(
+                "{GDFL_MEMBER_HEAD}\
+                 NIFTY,08/01/2022,10:00:00,100.00,0,0,0,0,5,7\n\
+                 NIFTY,08/01/2022,10:00:30,100.50,0,0,0,0,3,7\n\
+                 NIFTY,08/01/2022,10:01:00,101.00,0,0,0,0,2,7\n"
+            ),
+        );
+        let (code, receipt) = spot_answer(
+            &spot_form(&folder, "2022-01-08", "2022-01-08"),
+            day(2026, 8, 7),
+            moment(),
+            &site,
+        );
+        assert_eq!(code, axum::http::StatusCode::OK, "{receipt}");
+        assert!(
+            receipt.contains("<th>Recorded</th><td>yes — appended to"),
+            "the receipt says whether the record landed: {receipt}"
+        );
+        // A RUN THAT STORED BARS IS NOT "NOT STARTED". That verdict on this
+        // page was the third stale claim on this route.
+        assert!(!receipt.contains("NOT STARTED"), "{receipt}");
+        assert!(receipt.contains("STORED"), "{receipt}");
+        assert!(
+            receipt.contains("<th>Rows folded into an open bar</th>"),
+            "{receipt}"
+        );
+        assert!(
+            receipt.contains("<th>Slices the census counted</th>"),
+            "{receipt}"
+        );
+
+        // 3 rows in, 2 bars out (10:00 and 10:01), 1 folded, 0 dropped.
+        assert!(html_fact(&receipt, "Rows read", "3"), "{receipt}");
+        assert!(html_fact(&receipt, "Bars stored", "2"), "{receipt}");
+        assert!(
+            html_fact(&receipt, "Rows folded into an open bar", "1"),
+            "{receipt}"
+        );
+
+        // And the pull page now reads that record back off disk.
+        let after = pull_html(&site, day(2026, 8, 7));
+        assert_eq!(
+            after.matches("class=\"meter none\"").count(),
+            0,
+            "every counter is measured now: {after}"
+        );
+        assert!(after.contains("STORED"), "{after}");
+        assert!(after.contains("2022-01-08..=2022-01-08"), "{after}");
+        assert!(after.contains("1 record(s)"), "{after}");
+        assert!(
+            after.contains("It is a file on disk, not memory"),
+            "and it says which: {after}"
+        );
+
+        // As does /audit, with the same numbers and no JavaScript.
+        let page = audit_html(&site, day(2026, 8, 7), 0);
+        assert!(page.contains("2026-08-07 10:00:00 IST"), "{page}");
+        assert!(page.contains("STORED"), "{page}");
+        assert!(
+            page.contains(">3</td>") && page.contains(">2</td>"),
+            "{page}"
+        );
+        for forbidden in ["<script", "javascript:", "onclick", "onload", "onerror"] {
+            assert!(!page.contains(forbidden), "{forbidden} must never appear");
+        }
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// Whether a `<th>label</th><td>value</td>` pair is on a receipt.
+    fn html_fact(html: &str, label: &str, value: &str) -> bool {
+        html.contains(&format!("<th>{label}</th><td>{value}</td>"))
+    }
+
+    /// The banner names what exists and what does not, and both halves are
+    /// checkable against the tree.
+    ///
+    /// **This test exists because the sentence it guards was false for
+    /// months.** The old constant said `pull::fetch` and `pull::rate` did not
+    /// exist while both files were on disk and the local-archive path was
+    /// writing bars through them, and nothing in CI could see it: gate 12 only
+    /// reads *cost* claims, and "there is no module X" is not one. A claim
+    /// about a file is checkable by looking at the file, so this looks.
+    #[test]
+    fn the_ingest_page_names_what_exists_and_what_does_not() {
+        // THE CLAIM: fetch.rs and rate.rs are present, FakeSource is the only
+        // implementor of BarSource, and crates/pull declares no HTTP client.
+        // Every one of those is a fact about a tracked file, so it is read
+        // rather than asserted from memory.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crates/")
+            .join("pull");
+        for file in ["src/fetch.rs", "src/rate.rs"] {
+            assert!(
+                root.join(file).is_file(),
+                "the banner claims crates/pull/{file} is present — it must be"
+            );
+        }
+        let fetch = std::fs::read_to_string(root.join("src/fetch.rs")).expect("fetch.rs");
+        assert!(
+            fetch.contains("pub trait BarSource"),
+            "the seam the banner names must be there"
+        );
+        let implementors = [
+            "src/fetch.rs",
+            "src/ingest.rs",
+            "src/vendor.rs",
+            "src/work.rs",
+        ]
+        .into_iter()
+        .filter_map(|f| std::fs::read_to_string(root.join(f)).ok())
+        .map(|text| text.matches("impl BarSource for").count())
+        .sum::<usize>();
+        assert_eq!(
+            implementors, 1,
+            "the banner says FakeSource is the ONLY implementor; a second one \
+             makes that sentence false and this test is where it is caught"
+        );
+        let manifest = std::fs::read_to_string(root.join("Cargo.toml")).expect("Cargo.toml");
+        assert!(
+            !manifest.contains("reqwest"),
+            "the banner says crates/pull declares no HTTP client"
+        );
+
+        // AND THE PAGE SAYS EXACTLY THAT, with none of the old sentence left.
+        let dir = agreeing("banner");
+        let site = site("banner", &dir);
+        let html = pull_html(&site, day(2026, 8, 7));
+        assert!(html.contains("crates/pull/src/fetch.rs"), "{html}");
+        assert!(html.contains("crates/pull/src/rate.rs"), "{html}");
+        assert!(html.contains("pull::fetch::FakeSource"), "{html}");
+        assert!(html.contains("declares no HTTP client"), "{html}");
+        for stale in [
+            "no vendor fetch and",
+            "there is no pull::fetch",
+            "no pull::rate",
+            "P-01 through P-04 still stand",
+            "CAPTURE UNAVAILABLE",
+        ] {
+            assert!(
+                !html.contains(stale),
+                "the old, false sentence must not survive anywhere: {stale}"
+            );
+        }
+        // The four invariant rows the old text claimed still read "—" do not.
+        let inv = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("repo root")
+            .join("docs/04-invariants.md");
+        let text = std::fs::read_to_string(&inv).expect("the invariants document");
+        for row in ["| P-01 |", "| P-02 |", "| P-03 |", "| P-04 |"] {
+            let line = text
+                .lines()
+                .find(|l| l.starts_with(row))
+                .unwrap_or_else(|| panic!("{row} must exist"));
+            assert!(
+                !line.trim_end().ends_with("— |"),
+                "{row} no longer stands at an em dash, which is exactly what the \
+                 old banner claimed it did"
+            );
+        }
+    }
+
+    /// A journal that cannot be read at all is loud on every page that reads
+    /// it, and a run whose record could not be written says so on its receipt.
+    ///
+    /// The fixture is a FILE where the `audit/` directory has to be: the
+    /// metadata call on the journal path then fails with `NotADirectory`, which
+    /// is neither "absent" nor "held" and is exactly the third state the reader
+    /// keeps separate.
+    #[test]
+    fn a_journal_that_cannot_be_read_is_loud_and_a_lost_record_is_named() {
+        let dir = agreeing("journalbroken");
+        let site = site("journalbroken", &dir);
+        std::fs::write(site.store_root.join("audit"), b"not a directory").expect("writes");
+
+        assert!(
+            matches!(site.journal().look(), audit::Log::Unreadable { .. }),
+            "a file where the directory has to be is unreadable, not absent"
+        );
+
+        // /pull says so, /audit says so, /store says so. Three pages, one fact.
+        let pull = pull_html(&site, day(2026, 8, 7));
+        assert!(pull.contains("UNREADABLE —"), "{pull}");
+        assert!(pull.contains("No run can be recorded"), "{pull}");
+        let page = audit_html(&site, day(2026, 8, 7), 0);
+        assert!(page.contains("UNREADABLE —"), "{page}");
+        assert!(page.contains("ATTENTION"), "the badge is loud: {page}");
+        let store = store_html(&site, day(2026, 8, 7), 0);
+        assert!(store.contains("UNAVAILABLE — audit journal"), "{store}");
+
+        // AND THE RECEIPT NAMES THE LOST RECORD. A run whose 256 bytes could
+        // not be written is a run nobody can find afterwards, so the page that
+        // answers it is where that has to be said.
+        let folder = vendor_folder(
+            "journalbroken",
+            &format!(
+                "{GDFL_MEMBER_HEAD}\
+                 NIFTY,08/01/2022,10:00:00,100.00,0,0,0,0,4,7\n"
+            ),
+        );
+        let (code, html) = spot_answer(
+            &spot_form(&folder, "2022-01-08", "2022-01-08"),
+            day(2026, 8, 7),
+            moment(),
+            &site,
         );
         assert_eq!(
-            root,
-            default_store_dir(),
-            "and it is a pure function of the environment — two calls in one \
-             process cannot disagree about where the bars went"
+            code,
+            axum::http::StatusCode::OK,
+            "the BARS still landed: {html}"
+        );
+        assert!(
+            html.contains("<th>Recorded</th><td>NO — this run is NOT in the journal."),
+            "the lost record is named, not swallowed: {html}"
+        );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// A torn journal is named on the pages that read it, and the whole records
+    /// before the tear still render.
+    #[test]
+    fn a_torn_journal_is_named_and_the_records_before_it_still_render() {
+        let dir = agreeing("journaltorn");
+        let site = site("journaltorn", &dir);
+        let journal = site.journal();
+        journal
+            .append(&audit::Record::refused(
+                audit::Scope::Spot,
+                audit::Outcome::Stored,
+                moment(),
+                "swept",
+                "whole",
+            ))
+            .expect("appends");
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&journal.path)
+                .expect("opens");
+            f.write_all(&[0u8; 100]).expect("writes");
+        }
+        let page = audit_html(&site, day(2026, 8, 7), 0);
+        assert!(page.contains("TORN WRITE — 100 byte(s)"), "{page}");
+        assert!(page.contains("nothing here repairs the tail"), "{page}");
+        assert!(
+            page.contains("swept"),
+            "the whole record still renders: {page}"
+        );
+        let pull = pull_html(&site, day(2026, 8, 7));
+        assert!(pull.contains("TORN WRITE"), "{pull}");
+    }
+
+    /// The three renderings that only a value out of range can reach.
+    #[test]
+    fn a_clock_or_a_window_outside_the_calendar_is_said_rather_than_guessed() {
+        // A timestamp no IST calendar can name. `ist_stamp` refuses it by name
+        // instead of blanking the row: a record whose stamp is unusable is
+        // still a record of a run that happened.
+        let said = ist_stamp(i64::MAX);
+        assert!(
+            said.starts_with("epoch second 9223372036854775807 — "),
+            "{said}"
+        );
+        let epoch = ist_stamp(0);
+        assert!(epoch.contains("1970-01-01 05:30:00 IST"), "{epoch}");
+
+        // A window whose day counts are past 9999-12-31.
+        assert_eq!(window_text(0, 0), "—", "no window is a dash, not 1970");
+        assert!(window_text(u32::MAX, u32::MAX).contains("outside the calendar"));
+        assert_eq!(window_text(0, 1), "1970-01-01..=1970-01-02");
+
+        // And a duration crossing the second boundary in both directions.
+        assert_eq!(render_elapsed(0), "0.000 ms");
+        assert_eq!(render_elapsed(999_999), "999.999 ms");
+        assert_eq!(render_elapsed(4_512_903), "4.512 s");
+    }
+
+    /// A record whose window and note are both past what a record can hold
+    /// renders as a cut value that says it was cut.
+    #[test]
+    fn a_record_with_an_impossible_window_and_a_cut_note_still_renders() {
+        let dir = agreeing("auditcut");
+        let site = site("auditcut", &dir);
+        let mut record = audit::Record::refused(
+            audit::Scope::Spot,
+            audit::Outcome::Refused,
+            moment(),
+            "swept",
+            "a reason far longer than the sixty-eight bytes one record keeps for it, \
+             so the page has to say that what it shows is a prefix",
+        );
+        record.from_days = u32::MAX;
+        record.to_days = u32::MAX;
+        site.journal().append(&record).expect("appends");
+
+        let page = audit_html(&site, day(2026, 8, 7), 0);
+        assert!(page.contains("(cut from 125 bytes)"), "{page}");
+        assert!(page.contains("a reason far longer"), "{page}");
+        // The window is unrenderable and the row still renders.
+        assert!(page.contains("REFUSED"), "{page}");
+        // And /pull shows dashes rather than a fabricated window, with a
+        // sentence naming why.
+        let pull = pull_html(&site, day(2026, 8, 7));
+        assert!(
+            pull.contains("The last record carries no usable window"),
+            "{pull}"
+        );
+        assert_eq!(pull.matches("class=\"meter none\"").count(), 6, "{pull}");
+    }
+
+    /// A source longer than the record's field is cut on the page and says so.
+    #[test]
+    fn a_source_longer_than_the_field_is_shown_as_cut_on_the_audit_page() {
+        let dir = agreeing("auditcutsrc");
+        let site = site("auditcutsrc", &dir);
+        let long = format!("/very/long/vendor/folder/path/{}", "segment/".repeat(12));
+        assert!(long.len() > 64);
+        site.journal()
+            .append(&audit::Record::refused(
+                audit::Scope::Spot,
+                audit::Outcome::Failed,
+                moment(),
+                &long,
+                "short",
+            ))
+            .expect("appends");
+        let page = audit_html(&site, day(2026, 8, 7), 0);
+        assert!(
+            page.contains(&format!("(cut from {} bytes)", long.len())),
+            "{page}"
+        );
+        assert!(page.contains("FAILED"), "{page}");
+    }
+
+    /// A journal that will not read empties the table and says why, rather
+    /// than reporting no runs.
+    ///
+    /// The disagreement staged here is the real one: the `metadata` call said
+    /// there were four records and the read found nothing there — a journal
+    /// deleted between the two. "Nothing has been recorded" and "I could not
+    /// read what was recorded" are different facts and this is where they stay
+    /// different.
+    #[test]
+    fn a_journal_that_will_not_read_empties_the_table_and_names_the_refusal() {
+        let root = store_root("auditunread");
+        let journal = audit::Journal::at(&root);
+        let mut notes = Vec::new();
+        let rows = audit_rows(&journal, 4, 0, 200, &mut notes);
+        assert!(
+            rows.is_empty(),
+            "no row is invented over an unreadable file"
+        );
+        assert_eq!(notes.len(), 1, "and exactly one reason is given: {notes:?}");
+        // AND THE SAME DISAGREEMENT SHOWS NO "LAST RUN". A counter that says
+        // four and a file that holds none must not produce a capture panel
+        // over figures nobody read.
+        assert_eq!(
+            newest_record(
+                &journal,
+                &audit::Log::Held {
+                    records: 4,
+                    bytes: 1024,
+                    torn: None
+                }
+            ),
+            None,
+            "a record that cannot be read is not a record"
+        );
+        let why = notes.first().map(String::as_str).unwrap_or_default();
+        assert!(why.starts_with("UNREADABLE — "), "{why}");
+        assert!(why.contains("pull.journal"), "and names the file: {why}");
+
+        // The other half: a file that IS there yields rows and no note.
+        journal
+            .append(&audit::Record::refused(
+                audit::Scope::Spot,
+                audit::Outcome::Stored,
+                moment(),
+                "swept",
+                "",
+            ))
+            .expect("appends");
+        let mut clean = Vec::new();
+        let rows = audit_rows(&journal, 1, 0, 200, &mut clean);
+        assert_eq!(rows.len(), 1);
+        assert!(clean.is_empty(), "a clean read adds no note: {clean:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The audit page with nothing in it says so, and never 500s.
+    #[test]
+    fn an_empty_audit_page_says_nothing_was_recorded_rather_than_showing_zeroes() {
+        let dir = agreeing("auditempty");
+        let site = site("auditempty", &dir);
+        let page = audit_html(&site, day(2026, 8, 7), 0);
+        assert!(page.starts_with("<!doctype html>"));
+        assert!(page.contains("nothing recorded yet"), "{page}");
+        assert!(page.contains("No file yet"), "{page}");
+        assert!(!page.contains("<tbody>"), "no table at all: {page}");
+        // A page past the end clamps rather than erroring.
+        let far = audit_html(&site, day(2026, 8, 7), 9_999);
+        assert_eq!(far, page, "?page=9999 clamps to the only page there is");
+    }
+
+    /// A damaged record is a refused ROW, never a blank page.
+    #[test]
+    fn a_damaged_record_is_shown_as_refused_and_the_rest_of_the_page_renders() {
+        let dir = agreeing("auditdamaged");
+        let site = site("auditdamaged", &dir);
+        let journal = site.journal();
+        for i in 0..3u32 {
+            journal
+                .append(&audit::Record::refused(
+                    audit::Scope::Spot,
+                    audit::Outcome::Stored,
+                    moment(),
+                    &format!("run-{i}"),
+                    "nothing to report",
+                ))
+                .expect("appends");
+        }
+        let mut bytes = std::fs::read(&journal.path).expect("reads");
+        bytes[300] ^= 0xff;
+        std::fs::write(&journal.path, &bytes).expect("writes");
+
+        let page = audit_html(&site, day(2026, 8, 7), 0);
+        assert!(page.contains("RECORD REFUSED"), "{page}");
+        assert!(page.contains("record checksum"), "and both numbers: {page}");
+        assert!(page.contains("run-2"), "the newest still renders: {page}");
+        assert!(page.contains("run-0"), "and so does the oldest: {page}");
+        assert!(page.contains("ATTENTION"), "the badge is loud: {page}");
+    }
+
+    /// A held month renders as a filled swatch on the real page, driven by a
+    /// real manifest file rather than by a hand-built row.
+    ///
+    /// The render-level proof is `api::render::a_swatch_is_a_shape_before_it_is
+    /// _a_shade`; this is the plumbing behind it — manifest bytes on disk, read
+    /// by `census::read_vendor`, probed by `census::coverage_page`, drawn by
+    /// `render::store_page`. A visualisation proved only against a fixture is a
+    /// visualisation nobody has seen over data.
+    #[test]
+    fn a_held_month_is_a_filled_swatch_on_the_page_over_a_real_manifest() {
+        use pull::manifest::{Entry, EntryKey, Manifest, manifest_path};
+        let dir = agreeing("swatchreal");
+        let root = store_root("swatchreal");
+
+        let mut manifest = Manifest::open(Vendor::Dhan, &[], &[]).expect("a genesis manifest");
+        let symbol = brutex_core::symbol::Symbol::new("NIFTY").expect("a symbol");
+        let month = store::path::YearMonth::new(2026, 8).expect("a month");
+        manifest
+            .record(Entry {
+                key: EntryKey {
+                    exchange: brutex_core::instrument::Exchange::Nse,
+                    segment: brutex_core::instrument::Segment::Index,
+                    symbol,
+                    timeframe: store::path::Timeframe::MINUTE_1,
+                    month,
+                },
+                rows: 8_250,
+                first_ts_micros: 1_751_350_800_000_000,
+                last_ts_micros: 1_751_363_940_000_000,
+            })
+            .expect("records");
+        let path = manifest_path(&root, Vendor::Dhan);
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
+        std::fs::write(&path, manifest.image()).expect("writes");
+
+        let site = Site::load(&dir, &root);
+        let html = store_html(&site, day(2026, 8, 7), 0);
+
+        // The counter card reads the file, not a guess.
+        assert!(
+            html.contains("<div class=\"cv\">1</div>"),
+            "one month: {html}"
+        );
+        assert!(
+            html.contains("8250 row(s) across 1 committed entr(ies)"),
+            "{html}"
+        );
+
+        // AND THE CELL IS A FILLED SQUARE. Exactly one, because exactly one
+        // instrument-month on this page is held — the top shade, since it is
+        // also the fullest month shown.
+        assert_eq!(
+            html.matches("class=\"sw q4\"").count(),
+            1,
+            "the held cell is solid and at the top shade: {html}"
+        );
+        assert!(html.contains("held, 8250 row(s)"), "{html}");
+        assert!(
+            html.matches("class=\"sw void\"").count() > 1,
+            "and every month that is not held is hollow and crossed: {html}"
+        );
+        assert_eq!(
+            html.matches("<tr class=\"swept\">").count(),
+            1,
+            "one row is tinted held: {html}"
+        );
+        // One index instrument in the fixture universe × 36 months back.
+        assert!(
+            html.contains("36 instrument-month(s) in the grid"),
+            "{html}"
+        );
+        assert!(
+            html.contains("<b>1 of 36</b> shown row(s) are held"),
+            "{html}"
+        );
+        assert!(html.contains("quartiles of 8250"), "{html}");
+        assert!(html.contains("class=\"strip\""), "{html}");
+        assert!(
+            html.contains("<rect class=\"on\""),
+            "and the glance strip has a tick for it: {html}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The store page says out loud that its counters predate a pull this
+    /// process has since performed.
+    #[test]
+    fn the_store_page_says_when_its_counters_are_older_than_the_last_pull() {
+        let dir = agreeing("storestale");
+        let site = site("storestale", &dir);
+        let fresh = store_html(&site, day(2026, 8, 7), 0);
+        assert!(
+            !fresh.contains("these manifests were read at"),
+            "nothing has happened yet: {fresh}"
+        );
+
+        // A record stamped after the site loaded is exactly the case the note
+        // exists for: the bars and the manifest moved, and these cards did not.
+        let later = std::time::SystemTime::now() + std::time::Duration::from_mins(1);
+        site.journal()
+            .append(&audit::Record::refused(
+                audit::Scope::Spot,
+                audit::Outcome::Stored,
+                later,
+                "swept",
+                "",
+            ))
+            .expect("appends");
+        let stale = store_html(&site, day(2026, 8, 7), 0);
+        assert!(
+            stale.contains("UNCHECKED — a pull ran at"),
+            "the staleness is named, not left to be discovered: {stale}"
+        );
+        // IT SURVIVES THE RENDERER'S CLAMP WHOLE. `render::clamp` cuts a note
+        // past 160 bytes at its last comma and appends "… and N more", so a
+        // warning that is too long is a warning whose second half nobody reads.
+        // Asserting the closing tag right after the last word is what proves
+        // this one was not cut — a `contains("Restart")` would pass on a
+        // truncated note too.
+        assert!(
+            stale.contains("Restart to refresh, or see /audit.</li>"),
+            "the whole note reaches the page, uncut: {stale}"
+        );
+        assert!(
+            stale.contains("class=\"loud\""),
+            "UNCHECKED is one of the words that makes a note loud: {stale}"
         );
     }
 }

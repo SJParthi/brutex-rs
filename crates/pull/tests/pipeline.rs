@@ -906,6 +906,12 @@ fn a_run_balances_only_when_every_row_is_accounted_for() {
         members: 1,
         rows_read: 5,
         bars_stored: 3,
+        // Nothing folded here, so this literal keeps saying exactly what it
+        // said before the fold got a counter. The fold's own arm of the
+        // balance is proved by
+        // `a_folded_row_is_counted_as_consumed_and_the_books_balance` below.
+        rows_folded: 0,
+        counted: 1,
         census,
         failures: Vec::new(),
     };

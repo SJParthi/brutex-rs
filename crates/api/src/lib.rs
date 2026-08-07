@@ -6,6 +6,7 @@
 //!
 //! | Module | Owns |
 //! |---|---|
+//! | [`audit`] | what every pull did, on disk, one fixed-stride record each |
 //! | [`master`] | reading one vendor's instrument master off disk |
 //! | [`merge`] | one map from every vendor, and the ISIN cross-check on it |
 //! | [`ingest`] | what the operator asked a pull to do, and every named refusal |
@@ -27,6 +28,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod audit;
 pub mod catalog;
 pub mod census;
 pub mod ingest;

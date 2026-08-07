@@ -29,6 +29,7 @@
 //! shows what a person can read; the other 90,000 instruments cost nothing
 //! because they are never touched.
 
+use crate::audit::{DROP_REASONS, Drops};
 use crate::census::{Coverage, VendorCensus};
 use crate::ingest::{Series, SpotTarget};
 use brutex_core::instrument::{InstrumentKey, Kind};
@@ -36,8 +37,7 @@ use brutex_core::isin::Isin;
 use brutex_core::universe::Universe;
 use brutex_core::vendor::{Vendor, VendorSet};
 use pull::session::{
-    BARS_PER_REGULAR_SESSION, Day, DropCensus, DropReason, SESSION_CLOSE_MINUTE,
-    SESSION_OPEN_MINUTE, Window,
+    BARS_PER_REGULAR_SESSION, Day, SESSION_CLOSE_MINUTE, SESSION_OPEN_MINUTE, Window,
 };
 use std::fmt::Write as _;
 
@@ -233,6 +233,36 @@ font-variant-numeric:tabular-nums}\
 .meter.none .cv{color:var(--dim)}\
 .hscroll{overflow-x:auto;max-width:1180px;margin:0 auto;padding:0 20px}\
 td.miss{color:var(--dim)}\
+svg.sw{vertical-align:-2px;margin-right:7px;flex:none}\
+.sw.q1{color:color-mix(in srgb,var(--ok) 30%,var(--line))}\
+.sw.q2{color:color-mix(in srgb,var(--ok) 54%,var(--line))}\
+.sw.q3{color:color-mix(in srgb,var(--ok) 77%,var(--line))}\
+.sw.q4{color:var(--ok)}\
+.sw.void{color:var(--dim);opacity:.5}\
+tr.void td{color:var(--dim)}\
+tr.void td.num{font-weight:400}\
+tr.swept td.num{font-weight:750;font-variant-numeric:tabular-nums}\
+svg.strip{display:block;width:100%;height:16px;border-radius:5px;background:var(--line)}\
+svg.strip rect.on{fill:var(--ok)}\
+svg.strip rect.gap{fill:transparent}\
+svg.share{display:block;width:100%;height:11px;border-radius:99px;background:var(--line)}\
+svg.share rect.r0{fill:var(--acc)}\
+svg.share rect.r1{fill:var(--acc2)}\
+svg.share rect.r2{fill:var(--warn)}\
+svg.share rect.r3{fill:var(--bad)}\
+svg.share rect.none{fill:var(--line)}\
+.legend{display:flex;gap:15px;flex-wrap:wrap;align-items:center;color:var(--dim);\
+font-size:11.5px;margin:12px 0 0}\
+.legend span{display:inline-flex;align-items:center}\
+.key{display:inline-block;width:11px;height:11px;border-radius:3px;margin-right:6px}\
+.key.r0{background:var(--acc)}.key.r1{background:var(--acc2)}\
+.key.r2{background:var(--warn)}.key.r3{background:var(--bad)}\
+td.when{font-variant-numeric:tabular-nums;color:var(--dim);font-size:12.5px}\
+td.verdict{font-weight:820;font-size:11px;letter-spacing:.7px}\
+td.verdict.loud{color:var(--bad)}\
+td.verdict.calm{color:var(--ok)}\
+td.wide{white-space:normal;max-width:22rem;font-size:12.5px;color:var(--dim)}\
+tr.fault td{background:color-mix(in srgb,var(--bad) 10%,transparent);color:var(--bad)}\
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}";
 
 /// Words that make a note a failure rather than a tally.
@@ -649,6 +679,7 @@ fn nav(current: &str) -> String {
         ("/", "Dashboard", true),
         ("/instruments", "Instruments", true),
         ("/pull", "Ingest", true),
+        ("/audit", "Audit", true),
         ("/store", "Store", true),
         ("/runs", "Runs", false),
     ] {
@@ -1008,6 +1039,153 @@ fn hhmm(minute_of_day: u32) -> String {
     format!("{:02}:{:02}", minute_of_day / 60, minute_of_day % 60)
 }
 
+/// How many parts in `whole` the value `n` is, on a five-step scale.
+///
+/// Integer arithmetic, because `clippy::float_arithmetic` is denied
+/// workspace-wide (CLAUDE.md §7) and a swatch has no business being the first
+/// exception. `0` means nothing at all; `1..=4` are the quartiles of `whole`,
+/// and anything above zero is at least `1` so a single held bar is still
+/// visibly held rather than rounding away to the empty shade.
+fn quartile(n: u64, whole: u64) -> u8 {
+    if n == 0 {
+        return 0;
+    }
+    let whole = whole.max(1);
+    let step = n.saturating_mul(4) / whole;
+    u8::try_from(step.clamp(1, 4)).unwrap_or(4)
+}
+
+/// A cell's swatch: solid when the month is held, hollow and crossed when it is
+/// not.
+///
+/// **This is the thing that makes a grid readable without reading it.** Colour
+/// alone would fail a monochrome print and a colour-blind reader, so the two
+/// states differ in *shape* as well: filled square against an outlined square
+/// with a stroke through it. `role="img"` and the label carry the same fact to
+/// a screen reader, and the number stays in the cell beside it.
+fn swatch(n: Option<u64>, peak: u64) -> String {
+    match n {
+        None | Some(0) => "<svg class=\"sw void\" viewBox=\"0 0 12 12\" width=\"12\" \
+             height=\"12\" role=\"img\" aria-label=\"not held\">\
+             <rect x=\"1.5\" y=\"1.5\" width=\"9\" height=\"9\" rx=\"2.5\" fill=\"none\" \
+             stroke=\"currentColor\" stroke-width=\"1.2\"/>\
+             <line x1=\"3\" y1=\"9\" x2=\"9\" y2=\"3\" stroke=\"currentColor\" \
+             stroke-width=\"1.2\"/></svg>"
+            .to_owned(),
+        Some(rows) => format!(
+            "<svg class=\"sw q{}\" viewBox=\"0 0 12 12\" width=\"12\" height=\"12\" \
+             role=\"img\" aria-label=\"held, {rows} row(s)\">\
+             <rect x=\"1\" y=\"1\" width=\"10\" height=\"10\" rx=\"2.5\" \
+             fill=\"currentColor\"/></svg>",
+            quartile(rows, peak)
+        ),
+    }
+}
+
+/// A strip of ticks, one per row shown, filled where the row is held.
+///
+/// The whole page's coverage in one glance, and bounded by construction: it
+/// draws one rect per row already on the page, so it costs what the table
+/// beside it costs. `api::render::the_coverage_strip_draws_one_tick_per_row_and_no_more`
+/// is what holds it to one tick per row and no more.
+fn coverage_strip(held: &[bool]) -> String {
+    let n = held.len();
+    if n == 0 {
+        return String::new();
+    }
+    let mut out = String::with_capacity(64 + n * 48);
+    let _ = write!(
+        out,
+        "<svg class=\"strip\" viewBox=\"0 0 {n} 10\" preserveAspectRatio=\"none\" \
+         role=\"img\" aria-label=\"{} of {n} row(s) on this page are held\">",
+        held.iter().filter(|h| **h).count()
+    );
+    for (i, on) in held.iter().enumerate() {
+        if *on {
+            let _ = write!(
+                out,
+                "<rect class=\"on\" x=\"{i}\" y=\"0\" width=\"1\" height=\"10\"/>"
+            );
+        }
+    }
+    out.push_str("</svg>");
+    out
+}
+
+/// One stacked bar: each drop reason's share of the total, in integer percent.
+///
+/// Percentages are computed against the total and the last segment takes
+/// whatever rounding left over, so the four always add to the width and the bar
+/// never shows a gap that is really a division remainder.
+fn share_bar(drops: Drops) -> String {
+    let total = drops.total();
+    if total == 0 {
+        return "<svg class=\"share\" viewBox=\"0 0 100 10\" preserveAspectRatio=\"none\" \
+                role=\"img\" aria-label=\"nothing was dropped\">\
+                <rect class=\"none\" x=\"0\" y=\"0\" width=\"100\" height=\"10\"/></svg>"
+            .to_owned();
+    }
+    let mut out = String::with_capacity(512);
+    out.push_str(
+        "<svg class=\"share\" viewBox=\"0 0 100 10\" preserveAspectRatio=\"none\" role=\"img\" \
+         aria-label=\"each drop reason's share\">",
+    );
+    let mut at = 0u64;
+    for (i, reason) in DROP_REASONS.into_iter().enumerate() {
+        let last = i + 1 == DROP_REASONS.len();
+        let width = if last {
+            100u64.saturating_sub(at)
+        } else {
+            drops.of(reason).saturating_mul(100) / total
+        };
+        if width > 0 {
+            let _ = write!(
+                out,
+                "<rect class=\"r{i}\" x=\"{at}\" y=\"0\" width=\"{width}\" height=\"10\"><title>{}</title></rect>",
+                escape(&format!("{}: {}", reason.label(), drops.of(reason)))
+            );
+        }
+        at = at.saturating_add(width);
+    }
+    out.push_str("</svg>");
+    out
+}
+
+/// The key under a stacked bar, so a colour means something.
+fn share_legend() -> String {
+    let mut out = String::with_capacity(384);
+    out.push_str("<div class=\"legend\">");
+    for (i, reason) in DROP_REASONS.into_iter().enumerate() {
+        let _ = write!(
+            out,
+            "<span><i class=\"key r{i}\"></i>{}</span>",
+            escape(reason.label())
+        );
+    }
+    out.push_str("</div>");
+    out
+}
+
+/// A duration an operator reads, from microseconds, with no float anywhere.
+///
+/// Milliseconds to three places under a second, then seconds to three places.
+/// The remainder is printed as a zero-padded fraction rather than divided into
+/// one, because `clippy::float_arithmetic` is denied and a wall-clock reading
+/// is not the place to make the first exception.
+fn elapsed(micros: u64) -> String {
+    if micros == 0 {
+        return "—".to_owned();
+    }
+    if micros < 1_000_000 {
+        return format!("{}.{:03} ms", micros / 1_000, micros % 1_000);
+    }
+    format!(
+        "{}.{:03} s",
+        micros / 1_000_000,
+        (micros % 1_000_000) / 1_000
+    )
+}
+
 /// The day before `day`, or `day` itself at the start of the epoch.
 ///
 /// The expiry input's `max`: an operator cannot even offer a contract that has
@@ -1036,23 +1214,60 @@ fn date_input(name: &str, max: Day) -> String {
     )
 }
 
-/// A live capture, as the page shows it.
+/// One run, as the page shows it.
 ///
-/// Held rather than invented: the census is
-/// [`pull::session::DropCensus`] itself, so every reason the page names is a
-/// reason the filter actually counts, and adding a fifth there adds it here.
+/// **It is a run that HAPPENED, not one in flight.** A pull here is synchronous
+/// — the POST does the work and answers with the result — so there is no such
+/// thing as a capture to watch, and a panel that implied otherwise would be a
+/// progress bar over a process that does not exist. Every figure below is read
+/// back out of [`crate::audit`], which is a file, so it survives the restart
+/// that empties a process.
+///
+/// Held rather than invented: [`Drops`] carries the same four counts
+/// [`pull::session::DropCensus`] recorded, so every reason the page names is a
+/// reason the filter actually counts.
 #[derive(Debug, Clone, Copy)]
 pub struct Capture<'a> {
-    /// What is being fetched, in one line.
+    /// What was asked for, in one line.
     pub what: &'a str,
+    /// When it ran, in IST, already rendered.
+    pub when: &'a str,
+    /// How it ended: one word from [`crate::audit::Outcome`].
+    pub outcome: &'a str,
+    /// Whether that word is one an operator must not miss.
+    pub loud: bool,
     /// The operator's inclusive window.
     pub window: Window,
-    /// Bars the vendor returned.
+    /// Rows the source held, before any filtering.
     pub fetched: u64,
     /// Bars that landed in the store.
     pub stored: u64,
+    /// Rows merged into a bar that was already open.
+    ///
+    /// Neither stored nor dropped, and the reason the books balance. It was
+    /// missing from this panel while `pull::ingest::Ingested` already carried
+    /// it, so an operator could see 354,675 read and 62,978 stored and had no
+    /// way to find the other 291,527.
+    pub folded: u64,
     /// What was dropped, and why.
-    pub census: DropCensus,
+    pub drops: Drops,
+    /// How long it took, in microseconds.
+    pub took_micros: u64,
+}
+
+/// Where the journal is and what it holds, in one line for a page footer.
+#[derive(Debug, Clone, Copy)]
+pub struct JournalNote<'a> {
+    /// The file every record is appended to.
+    pub path: &'a str,
+    /// How many whole records it holds.
+    pub records: u64,
+    /// How large it is, so the growth is a number rather than a worry.
+    pub bytes: u64,
+    /// Whether the file is there at all.
+    pub present: bool,
+    /// What is wrong with the file itself, when something is.
+    pub trouble: Option<&'a str>,
 }
 
 /// Everything one rendering of the ingest page needs.
@@ -1063,13 +1278,19 @@ pub struct PullView<'a> {
     /// How many instruments each spot target covers, in [`SpotTarget::ALL`]
     /// order. Counted from the loaded universe, never guessed.
     pub targets: &'a [(SpotTarget, usize)],
-    /// The capture in flight. `None` renders every counter as `—`.
+    /// The last run on the record. `None` renders every counter as `—`.
     pub capture: Option<Capture<'a>>,
-    /// Why nothing can be captured, when nothing can be.
+    /// Why there is no run to show, when there is none.
     ///
-    /// `Some` puts a loud block at the top of the page and is the reason every
-    /// counter below reads `—`. `CLAUDE.md` §4: degrade loudly and name the
-    /// reason — never a progress bar over a process that does not exist.
+    /// Rendered under the panel so a dash always has a sentence beside it.
+    pub no_capture: &'a str,
+    /// Where the record of every run lives.
+    pub journal: JournalNote<'a>,
+    /// What this build cannot do, named.
+    ///
+    /// `Some` puts a loud block at the top of the page. `CLAUDE.md` §4: degrade
+    /// loudly and name the reason — and name it *accurately*, which is the
+    /// whole reason this constant was rewritten.
     pub halt: Option<&'a str>,
     /// Everything an operator has to be told.
     pub notes: &'a [String],
@@ -1196,33 +1417,18 @@ fn pull_fine_print(today: Day) -> String {
     )
 }
 
-/// The capture panel: what landed, and what was dropped, by reason.
-fn capture_panel(capture: Option<Capture<'_>>) -> String {
-    // EVERY REASON THE FILTER COUNTS, NAMED. `DropReason` is `#[non_exhaustive]`
-    // so there is no `ALL` to iterate; the four are listed here and each one's
-    // label comes from `DropReason::label`, so a renamed reason renames itself
-    // on the page rather than drifting from it.
-    const DROPS: [DropReason; 4] = [
-        DropReason::BeforeWindow,
-        DropReason::AfterWindow,
-        DropReason::BeforeSessionOpen,
-        DropReason::AtOrAfterSessionClose,
-    ];
-    let census = capture.map(|c| c.census);
-    let mut out = String::with_capacity(2048);
-    out.push_str(
-        "<section class=\"wrap\"><div class=\"panel\">\
-         <h2><span class=\"dot\"></span>Capture</h2>\
-         <p class=\"lead\">What the vendor returned, what landed, and what was \
-         discarded — with the reason kept all the way to the answer.</p>",
-    );
-
+/// The six meters over the last recorded run.
+///
+/// Split out of [`capture_panel`] to stay under clippy's line ceiling; the
+/// split is a lint, not a design.
+fn capture_meters(capture: Option<Capture<'_>>) -> String {
+    let mut out = String::with_capacity(1536);
     out.push_str("<div class=\"meters\">");
     for (label, value, note) in [
         (
-            "In flight",
+            "Asked for",
             capture.map_or_else(|| "—".to_owned(), |c| escape(c.what)),
-            "instrument and window",
+            "target or folder",
         ),
         (
             "Window",
@@ -1230,9 +1436,9 @@ fn capture_panel(capture: Option<Capture<'_>>) -> String {
             "inclusive, both ends",
         ),
         (
-            "Bars fetched",
+            "Rows read",
             count_cell(capture.map(|c| c.fetched)),
-            "returned by the vendor",
+            "as the source sent them",
         ),
         (
             "Bars stored",
@@ -1240,8 +1446,13 @@ fn capture_panel(capture: Option<Capture<'_>>) -> String {
             "written to the bar file",
         ),
         (
-            "Bars dropped",
-            count_cell(census.map(|c| u64::from(c.total()))),
+            "Rows folded",
+            count_cell(capture.map(|c| c.folded)),
+            "merged into an open bar",
+        ),
+        (
+            "Rows dropped",
+            count_cell(capture.map(|c| c.drops.total())),
             "by the reasons below",
         ),
     ] {
@@ -1255,22 +1466,51 @@ fn capture_panel(capture: Option<Capture<'_>>) -> String {
         );
     }
     out.push_str("</div>");
+    out
+}
+
+/// The panel over the last recorded run: what landed, and what was dropped, by
+/// reason.
+///
+/// It reads the journal, not a variable: the figures are the ones
+/// [`crate::audit::Record`] holds, so they are the same figures after a restart
+/// as before one.
+fn capture_panel(capture: Option<Capture<'_>>, absent: &str) -> String {
+    let drops = capture.map(|c| c.drops);
+    let mut out = String::with_capacity(3072);
+    let _ = write!(
+        out,
+        "<section class=\"wrap\"><div class=\"panel\">\
+         <h2><span class=\"dot\"></span>Last recorded run</h2>\
+         <p class=\"lead\">Not a live capture — a pull here is one POST that does \
+         the work and answers with the result, so there is nothing to watch. \
+         These are the counters of the most recent run, read back out of the \
+         journal on disk.{}</p>",
+        capture.map_or_else(
+            || format!(" <b>{}</b>", escape(absent)),
+            |c| format!(
+                " Ran {} · <b>{}</b> · took {}.",
+                escape(c.when),
+                escape(c.outcome),
+                escape(&elapsed(c.took_micros))
+            )
+        )
+    );
+    out.push_str(&capture_meters(capture));
 
     // The bar widths are INTEGER percentages of the largest drop on the panel.
     // `clippy::float_arithmetic` is denied workspace-wide (CLAUDE.md §7) and a
     // progress bar has no business being the first exception.
-    let peak = census.map_or(1, |c| {
-        DROPS.iter().map(|&r| c.of(r)).max().unwrap_or(0).max(1)
-    });
+    let peak = drops.map_or(1, Drops::peak);
     out.push_str(
-        "<table><thead><tr><th>Dropped because</th><th>Bars</th><th>Share</th></tr></thead><tbody>",
+        "<table><thead><tr><th>Dropped because</th><th>Rows</th><th>Share</th></tr></thead><tbody>",
     );
-    for reason in DROPS {
-        let n = census.map(|c| c.of(reason));
+    for reason in DROP_REASONS {
+        let n = drops.map(|d| d.of(reason));
         let bar = n.map_or_else(String::new, |v| {
             format!(
                 "<div class=\"cbar\"><span style=\"width:{}%\"></span></div>",
-                (u64::from(v).saturating_mul(100) / u64::from(peak)).max(3)
+                (v.saturating_mul(100) / peak).max(3)
             )
         });
         // ONE `class` attribute, not two. This was `class="num"{cls}` with
@@ -1282,14 +1522,59 @@ fn capture_panel(capture: Option<Capture<'_>>) -> String {
             out,
             "<tr><td>{}</td><td class=\"num{cls}\">{}</td><td>{bar}</td></tr>",
             escape(reason.label()),
-            count_cell(n.map(u64::from)),
+            count_cell(n),
         );
     }
-    out.push_str("</tbody></table></div></section>");
+    out.push_str("</tbody></table>");
+    if let Some(c) = capture {
+        let _ = write!(
+            out,
+            "<p class=\"fine\">Every reason's share of the {} row(s) dropped:</p>{}{}",
+            c.drops.total(),
+            share_bar(c.drops),
+            share_legend()
+        );
+    }
+    out.push_str("</div></section>");
     out
 }
 
-/// The ingest page: two forms, and an honest account of what is running.
+/// Where the record of every run lives, said on the page rather than assumed.
+///
+/// **The point of the sentence is the word "disk".** An operator has to know
+/// whether the history they are reading survives a restart, and the only way to
+/// know is to be told which it is and where.
+fn journal_note(note: JournalNote<'_>) -> String {
+    let mut out = String::with_capacity(768);
+    out.push_str("<section class=\"wrap\"><div class=\"panel\">");
+    let _ = write!(
+        out,
+        "<h2><span class=\"dot\"></span>Where the record is kept</h2>\
+         <p class=\"lead\">Every pull — accepted, refused or failed — appends one \
+         256-byte record to <code>{}</code>. <b>It is a file on disk, not memory: \
+         restarting this process loses nothing.</b> {}</p>",
+        escape(note.path),
+        if note.present {
+            format!(
+                "{} record(s), {} byte(s) so far. <a href=\"/audit\">Read them</a>.",
+                note.records, note.bytes
+            )
+        } else {
+            "No file yet — nothing has been pulled through this store root.".to_owned()
+        }
+    );
+    if let Some(trouble) = note.trouble {
+        let _ = write!(
+            out,
+            "<div class=\"halt\"><b>the journal itself</b>{}</div>",
+            escape(trouble)
+        );
+    }
+    out.push_str("</div></section>");
+    out
+}
+
+/// The ingest page: two forms, and an honest account of what this build can do.
 #[must_use]
 pub fn pull_page(view: &PullView<'_>) -> String {
     let mut body = open("brutex · ingest", "/pull");
@@ -1303,14 +1588,15 @@ pub fn pull_page(view: &PullView<'_>) -> String {
         if view.halt.is_none() {
             "ready"
         } else {
-            "CAPTURE UNAVAILABLE"
+            "ARCHIVE ONLY"
         },
     ));
     if let Some(reason) = view.halt {
-        body.push_str(&halt_block("nothing can be captured yet", reason));
+        body.push_str(&halt_block("what this build can and cannot do", reason));
     }
     body.push_str(&pull_forms(view));
-    body.push_str(&capture_panel(view.capture));
+    body.push_str(&capture_panel(view.capture, view.no_capture));
+    body.push_str(&journal_note(view.journal));
     body.push_str(&notes_block(view.notes));
     body.push_str(FOOT);
     body
@@ -1325,11 +1611,27 @@ pub struct Receipt<'a> {
     pub verdict: &'a str,
     /// The loud line: the refusal, or why an accepted request did not run.
     pub reason: &'a str,
+    /// Whether the verdict is one to be pleased about.
+    ///
+    /// **This was hardcoded `false`, and a run that stored 62,978 bars came
+    /// back under a red `badge bad`.** That was harmless when the only thing
+    /// this page could ever say was `REFUSED` or `NOT STARTED`; it stopped
+    /// being harmless the moment a run could succeed. A field, because the
+    /// caller is the only thing that knows.
+    pub good: bool,
     /// The request as the server understood it, field by field.
     ///
     /// Rendered even for a refusal, because "what you asked for" and "what I
     /// read" differing is itself the diagnosis.
     pub facts: &'a [(&'a str, String)],
+    /// The last line: what this answer means for the store.
+    ///
+    /// **A field, because the line under it used to be the constant sentence
+    /// "Nothing here was written to the store."** That was true of every
+    /// receipt this page could produce when it was written, and it went on
+    /// being printed under a run that wrote 194 bar files and 9.8 MB. Only the
+    /// caller knows which happened, so only the caller writes it.
+    pub footnote: &'a str,
 }
 
 /// The page one POST answers with.
@@ -1345,10 +1647,16 @@ pub fn receipt_page(receipt: &Receipt<'_>) -> String {
         "Asked, read,<br>answered.",
         "Every field below is what the server understood, not what was typed. \
          Where the two differ, that is the diagnosis.",
-        false,
+        receipt.good,
         receipt.verdict,
     ));
-    body.push_str(&halt_block(receipt.scope, receipt.reason));
+    let _ = write!(
+        body,
+        "<section class=\"wrap\"><div class=\"halt{}\"><b>{}</b>{}</div></section>",
+        if receipt.good { " good" } else { "" },
+        escape(receipt.scope),
+        escape(receipt.reason)
+    );
     body.push_str("<section class=\"wrap\"><div class=\"panel\"><table class=\"kv\"><tbody>");
     for &(label, ref value) in receipt.facts {
         let _ = write!(
@@ -1359,9 +1667,11 @@ pub fn receipt_page(receipt: &Receipt<'_>) -> String {
         );
     }
     body.push_str("</tbody></table>");
-    body.push_str(
-        "<p class=\"fine\">Nothing here was written to the store. \
-         <a href=\"/pull\">Back to the forms</a>.</p>",
+    let _ = write!(
+        body,
+        "<p class=\"fine\">{} <a href=\"/pull\">Back to the forms</a> · \
+         <a href=\"/audit\">the record of every run</a>.</p>",
+        escape(receipt.footnote)
     );
     body.push_str("</div></section>");
     body.push_str(FOOT);
@@ -1414,9 +1724,64 @@ fn census_cards(censuses: &[VendorCensus]) -> String {
     out
 }
 
+/// The largest row count anywhere on this page, or one.
+///
+/// The swatch shades are quartiles of **the page**, not of an invented ideal.
+/// Nobody knows how many one-minute bars a month "should" hold without a
+/// trading calendar, and `crates/pull/src/session.rs` says the calendar filter
+/// does not exist yet (`docs/04-invariants.md` P-03). Shading against a made-up
+/// denominator would be exactly the invention `CLAUDE.md` §3 rule 1 forbids, so
+/// the scale is stated on the page as what it is: relative to the fullest month
+/// shown.
+fn page_peak(rows: &[Coverage]) -> u64 {
+    let mut peak = 1u64;
+    for row in rows {
+        for &(_, n) in &row.rows {
+            if let Some(v) = n
+                && v > peak
+            {
+                peak = v;
+            }
+        }
+    }
+    peak
+}
+
 /// The coverage grid: one row per instrument-month, one hash probe per cell.
+///
+/// Every cell carries a **swatch as well as a number**, so held and not-held
+/// differ in shape before they differ in digits, and the row is tinted by which
+/// it is. That is the whole change: a grid of numbers is a grid nobody scans.
 fn coverage_table(view: &StoreView<'_>) -> String {
-    let mut out = String::with_capacity(512 + view.rows.len() * 192);
+    let peak = page_peak(view.rows);
+    let mut out = String::with_capacity(768 + view.rows.len() * 320);
+    let held: Vec<bool> = view.rows.iter().map(Coverage::is_held).collect();
+    let filled = held.iter().filter(|h| **h).count();
+    let _ = write!(
+        out,
+        "<section class=\"wrap\"><div class=\"panel\">\
+         <h2><span class=\"dot\"></span>Coverage at a glance</h2>\
+         <p class=\"lead\">One tick per row on this page, filled where some \
+         vendor holds that instrument-month. <b>{filled} of {}</b> shown row(s) \
+         are held. {}</p>{}</div></section>",
+        held.len(),
+        if filled == 0 {
+            // NO SCALE IS STATED WHEN THERE IS NOTHING TO SCALE. `peak` falls
+            // back to 1 so the division is safe, and printing "quartiles of 1"
+            // over an empty page would be a number that means nothing dressed
+            // as one that does.
+            "Every cell on this page is empty, so there is no shading scale to \
+             state — an empty page is a real answer, not a missing one."
+                .to_owned()
+        } else {
+            format!(
+                "The swatches in the table are quartiles of {peak} — the fullest \
+                 month on this page — and not of an ideal month, because no \
+                 trading calendar exists in this build to say what a full month is."
+            )
+        },
+        coverage_strip(&held)
+    );
     out.push_str("<div class=\"hscroll\"><table><thead><tr>");
     out.push_str("<th>Instrument</th><th>Month</th><th>Timeframe</th>");
     for vendor in Vendor::ALL {
@@ -1424,7 +1789,7 @@ fn coverage_table(view: &StoreView<'_>) -> String {
     }
     out.push_str("</tr></thead><tbody>");
     for row in view.rows {
-        let cls = if row.is_held() { "swept" } else { "" };
+        let cls = if row.is_held() { "swept" } else { "void" };
         let _ = write!(
             out,
             "<tr class=\"{cls}\"><td>{}</td><td>{}</td><td>1m</td>",
@@ -1433,7 +1798,12 @@ fn coverage_table(view: &StoreView<'_>) -> String {
         );
         for &(_, n) in &row.rows {
             let miss = if n.is_none() { " miss" } else { "" };
-            let _ = write!(out, "<td class=\"num{miss}\">{}</td>", count_cell(n));
+            let _ = write!(
+                out,
+                "<td class=\"num{miss}\">{}{}</td>",
+                swatch(n, peak),
+                count_cell(n)
+            );
         }
         out.push_str("</tr>");
     }
@@ -1472,33 +1842,230 @@ pub fn store_page(view: &StoreView<'_>) -> String {
         view.today.month(),
     );
     body.push_str(&coverage_table(view));
+    body.push_str(&pager("/store", view.page, view.last_page));
+    body.push_str(&notes_block(view.notes));
+    body.push_str(FOOT);
+    body
+}
 
-    // PAGING. The grid is instruments × months and both factors are bounded, so
-    // the last page is arithmetic and the rows past this one were never built.
-    if view.last_page > 0 {
-        body.push_str("<nav class=\"pager\">");
-        if view.page > 0 {
-            let _ = write!(
-                body,
-                "<a href=\"/store?page={}\">&larr; previous</a>",
-                view.page - 1
-            );
-        }
-        let _ = write!(
-            body,
-            "<span>page {} of {}</span>",
-            view.page + 1,
-            view.last_page + 1
-        );
-        if view.page < view.last_page {
-            let _ = write!(
-                body,
-                "<a href=\"/store?page={}\">next &rarr;</a>",
-                view.page + 1
-            );
-        }
-        body.push_str("</nav>");
+/// The previous/next control, shared by every paged surface.
+///
+/// One function rather than one per page, for the reason
+/// [`crate::catalog::PAGE_ROWS`] is one constant: two copies drift, and a pager
+/// that disagrees with its table about where a page ends is a page an operator
+/// cannot trust.
+fn pager(base: &str, page: usize, last_page: usize) -> String {
+    if last_page == 0 {
+        return String::new();
     }
+    let mut out = String::with_capacity(256);
+    out.push_str("<nav class=\"pager\">");
+    if page > 0 {
+        let _ = write!(
+            out,
+            "<a href=\"{base}?page={}\">&larr; previous</a>",
+            page.saturating_sub(1)
+        );
+    }
+    let _ = write!(
+        out,
+        "<span>page {} of {}</span>",
+        page.saturating_add(1),
+        last_page.saturating_add(1)
+    );
+    if page < last_page {
+        let _ = write!(
+            out,
+            "<a href=\"{base}?page={}\">next &rarr;</a>",
+            page.saturating_add(1)
+        );
+    }
+    out.push_str("</nav>");
+    out
+}
+
+/// One row of the audit page: one pull, as it was written down.
+///
+/// The strings are owned rather than borrowed because every one of them is
+/// built for this render — a formatted timestamp, a window, a truncated note —
+/// and a caller holding six borrowed buffers per row so the renderer can avoid
+/// one allocation is a worse trade than the allocation. The count is bounded by
+/// [`crate::catalog::PAGE_ROWS`], so it is O(rows shown).
+#[derive(Debug, Clone)]
+pub struct AuditRow {
+    /// Its position in the journal, counted from the first record ever written.
+    pub ordinal: u64,
+    /// Why the record could not be believed, when it could not be.
+    ///
+    /// `Some` means every figure below is absent rather than zero, and the row
+    /// renders as a refusal in place. One damaged record never blanks the page.
+    pub fault: Option<String>,
+    /// When it ran, in IST.
+    pub when: String,
+    /// Which form it came from.
+    pub scope: String,
+    /// How it ended, in one word.
+    pub outcome: String,
+    /// Whether that word is one an operator must not miss.
+    pub loud: bool,
+    /// What was asked for.
+    pub source: String,
+    /// The window, inclusive at both ends.
+    pub window: String,
+    /// Members the folder held.
+    pub members: u64,
+    /// Rows read out of the source.
+    pub rows_read: u64,
+    /// Bars written to the store.
+    pub bars_stored: u64,
+    /// Rows merged into a bar that was already open.
+    pub rows_folded: u64,
+    /// Slices the census holds after the run.
+    pub counted: u64,
+    /// Rows dropped, by reason.
+    pub drops: Drops,
+    /// Members that failed.
+    pub failures: u64,
+    /// How long it took, in microseconds.
+    pub took_micros: u64,
+    /// Why it ended the way it did.
+    pub note: String,
+}
+
+/// Everything one rendering of the audit page needs.
+#[derive(Debug, Clone, Copy)]
+pub struct AuditView<'a> {
+    /// Today in IST, for the page header.
+    pub today: Day,
+    /// Where the journal is and what it holds.
+    pub journal: JournalNote<'a>,
+    /// The records this page shows, newest first.
+    pub rows: &'a [AuditRow],
+    /// Which page this is, zero-based.
+    pub page: usize,
+    /// The highest page number that has rows.
+    pub last_page: usize,
+    /// Everything an operator has to be told.
+    pub notes: &'a [String],
+}
+
+/// One record's row in the audit table.
+fn audit_row(row: &AuditRow) -> String {
+    if let Some(ref fault) = row.fault {
+        return format!(
+            "<tr class=\"fault\"><td class=\"num\">#{}</td>\
+             <td class=\"wide\" colspan=\"10\">RECORD REFUSED — {}</td></tr>",
+            row.ordinal,
+            escape(fault)
+        );
+    }
+    let verdict = if row.loud { "loud" } else { "calm" };
+    let mut out = String::with_capacity(768);
+    let _ = write!(
+        out,
+        "<tr><td class=\"num\">#{}</td><td class=\"when\">{}</td>\
+         <td>{}</td><td class=\"verdict {verdict}\">{}</td><td>{}</td>\
+         <td class=\"when\">{}</td>\
+         <td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td>\
+         <td class=\"num\">{}</td><td class=\"num\">{}</td>",
+        row.ordinal,
+        escape(&row.when),
+        escape(&row.scope),
+        escape(&row.outcome),
+        escape(&row.source),
+        escape(&elapsed(row.took_micros)),
+        row.members,
+        row.rows_read,
+        row.bars_stored,
+        row.rows_folded,
+        row.counted,
+    );
+    out.push_str("</tr>");
+    let _ = write!(
+        out,
+        "<tr class=\"{}\"><td></td><td class=\"wide\" colspan=\"4\">{}</td>\
+         <td class=\"wide\" colspan=\"6\">{} row(s) dropped · {} member(s) failed{}</td></tr>",
+        if row.loud { "fault" } else { "void" },
+        escape(&row.note),
+        row.drops.total(),
+        row.failures,
+        if row.drops.total() == 0 {
+            String::new()
+        } else {
+            format!("<br>{}", share_bar(row.drops))
+        }
+    );
+    out
+}
+
+/// The audit page: every pull this store root has seen, newest first.
+///
+/// Bounded by construction. The journal's record count is `len / 256`, one
+/// `metadata` call, so the pager is arithmetic; and only the records on this
+/// page are ever read off disk —
+/// `api::audit::the_tail_reads_only_the_records_it_shows` is the proof of the
+/// read and `api::render::the_audit_page_draws_only_the_rows_it_was_given` is
+/// the proof of the render.
+#[must_use]
+pub fn audit_page(view: &AuditView<'_>) -> String {
+    let loud =
+        view.journal.trouble.is_some() || view.rows.iter().any(|r| r.loud || r.fault.is_some());
+    let mut body = open("brutex · audit", "/audit");
+    body.push_str(&hero(
+        "EVERY PULL · ON DISK · SURVIVES A RESTART",
+        "What was asked,<br>and what it did.",
+        "One 256-byte record per pull, appended and fsync-ed before the answer \
+         is rendered. Nothing here is in memory, so a restart loses none of it — \
+         which is the point, because a log is wanted exactly when a process has \
+         just stopped.",
+        !loud,
+        if loud { "ATTENTION" } else { "ok" },
+    ));
+    if let Some(trouble) = view.journal.trouble {
+        body.push_str(&halt_block("the journal itself", trouble));
+    }
+    body.push_str(&journal_note(view.journal));
+    let _ = write!(
+        body,
+        "<p class=\"sub\">{} record(s) held · showing {} · today is {}</p>",
+        view.journal.records,
+        view.rows.len(),
+        view.today,
+    );
+    if view.rows.is_empty() {
+        body.push_str(&halt_block(
+            "nothing recorded yet",
+            "No pull has been run against this store root. The table below is \
+             empty because there is nothing in it — not because a figure is \
+             missing. Start one from the ingest page.",
+        ));
+    } else {
+        body.push_str("<div class=\"hscroll\"><table><thead><tr>");
+        for head in [
+            "#",
+            "When (IST)",
+            "Form",
+            "Outcome",
+            "Asked for",
+            "Took",
+            "Members",
+            "Rows read",
+            "Bars stored",
+            "Rows folded",
+            "Counted",
+        ] {
+            let _ = write!(body, "<th>{}</th>", escape(head));
+        }
+        body.push_str("</tr></thead><tbody>");
+        for row in view.rows {
+            body.push_str(&audit_row(row));
+        }
+        body.push_str("</tbody></table></div>");
+        body.push_str("<section class=\"wrap\">");
+        body.push_str(&share_legend());
+        body.push_str("</section>");
+    }
+    body.push_str(&pager("/audit", view.page, view.last_page));
     body.push_str(&notes_block(view.notes));
     body.push_str(FOOT);
     body
@@ -1516,6 +2083,10 @@ mod tests {
     use brutex_core::instrument::{Exchange, Expiry, OptionSide, Segment};
     use brutex_core::price::Paisa;
     use brutex_core::symbol::Symbol;
+    // The counter type itself is only reachable from a test now: `Capture`
+    // holds `Drops`, which is the same four counts as a value, because a
+    // record read back off disk cannot rebuild a counter without counting.
+    use pull::session::{DropCensus, DropReason};
 
     fn nifty() -> InstrumentKey {
         InstrumentKey::index(Exchange::Nse, "NIFTY").expect("valid")
@@ -1920,7 +2491,16 @@ mod tests {
         Day::new(y, m, day).expect("a real date")
     }
 
-    /// An ingest view with nothing running — what the server renders today.
+    /// A journal note for the pages that carry one.
+    const JOURNAL: JournalNote<'static> = JournalNote {
+        path: "/tmp/store/audit/pull.journal",
+        records: 3,
+        bytes: 768,
+        present: true,
+        trouble: None,
+    };
+
+    /// An ingest view — the last recorded run, or the absence of one.
     fn pull_view<'a>(halt: Option<&'a str>, capture: Option<Capture<'a>>) -> PullView<'a> {
         const TARGETS: [(SpotTarget, usize); 3] = [
             (SpotTarget::Swept, 2),
@@ -1931,6 +2511,8 @@ mod tests {
             today: d(2026, 8, 7),
             targets: &TARGETS,
             capture,
+            no_capture: "No pull has been recorded against this store root yet.",
+            journal: JOURNAL,
             halt,
             notes: &[],
         }
@@ -1988,13 +2570,19 @@ mod tests {
         // A DASH IS NOT A ZERO. `0 dropped` is a measurement; `—` is the
         // absence of one, and rendering the second as the first is exactly the
         // silent degradation CLAUDE.md section 4 forbids.
-        let html = pull_page(&pull_view(Some("pull::fetch does not exist"), None));
+        //
+        // CHANGED, AND NAMED: the badge used to read CAPTURE UNAVAILABLE and
+        // the meters used to be five. Both were wrong once the local-archive
+        // path started running — capture is not unavailable, the HTTP transport
+        // is — and the sixth meter is `Rows folded`, which is the number that
+        // makes the books balance and had nowhere to be shown.
+        let html = pull_page(&pull_view(Some("there is no HTTP transport"), None));
         assert!(
             html.contains("class=\"halt\""),
             "the reason is loud: {html}"
         );
-        assert!(html.contains("pull::fetch does not exist"));
-        assert!(html.contains("CAPTURE UNAVAILABLE"), "and badged: {html}");
+        assert!(html.contains("there is no HTTP transport"));
+        assert!(html.contains("ARCHIVE ONLY"), "and badged: {html}");
         assert!(!html.contains("badge good"));
         assert!(!html.contains("<div class=\"cv\">0</div>"), "{html}");
         assert!(html.contains("<div class=\"cv\">—</div>"));
@@ -2004,33 +2592,33 @@ mod tests {
         // applied to the wrong half would leave a dash looking like a figure.
         assert_eq!(
             html.matches("class=\"meter none\"").count(),
-            5,
-            "all five meters carry no measurement: {html}"
+            6,
+            "all six meters carry no measurement: {html}"
         );
         assert_eq!(html.matches("class=\"meter\"").count(), 0, "{html}");
         assert!(
             !html.contains("<span style=\"width:"),
             "no bar is drawn over a number nobody has: {html}"
         );
+        // And the dash has a sentence beside it naming the empty FILE, not an
+        // absent module.
+        assert!(
+            html.contains("No pull has been recorded against this store root yet"),
+            "{html}"
+        );
         // Every reason the filter counts is still NAMED, so the shape of what
         // will be measured is visible even while nothing is measured.
-        for reason in [
-            DropReason::BeforeWindow,
-            DropReason::AfterWindow,
-            DropReason::BeforeSessionOpen,
-            DropReason::AtOrAfterSessionClose,
-        ] {
+        for reason in DROP_REASONS {
             let label = reason.label();
             assert!(html.contains(label), "{label} must be named: {html}");
         }
     }
 
     #[test]
-    fn a_running_capture_reports_real_counts_with_integer_bars() {
-        // The other half of the same renderer, driven by a real DropCensus.
-        // Written now because the panel's whole purpose is to carry these
-        // numbers, and a renderer proved only in its empty state is a renderer
-        // nobody has checked.
+    fn a_recorded_run_reports_real_counts_with_integer_bars() {
+        // The other half of the same renderer, driven by the four counts a real
+        // DropCensus recorded. A renderer proved only in its empty state is a
+        // renderer nobody has checked.
         let mut census = DropCensus::new();
         for _ in 0..40 {
             census.count(DropReason::BeforeSessionOpen);
@@ -2041,24 +2629,34 @@ mod tests {
         let window = Window::new(d(2022, 1, 8), d(2022, 2, 8)).expect("forwards");
         let capture = Capture {
             what: "NSE-NIFTY · 1m",
+            when: "2022-02-08 15:31:02 IST",
+            outcome: "STORED",
+            loud: false,
             window,
             fetched: 12_040,
             stored: 11_990,
-            census,
+            folded: 0,
+            drops: Drops::of_census(census),
+            took_micros: 4_512_903,
         };
         let html = pull_page(&pull_view(None, Some(capture)));
 
-        assert!(html.contains("badge good"), "something is running: {html}");
+        assert!(html.contains("badge good"), "nothing is halted: {html}");
         assert!(!html.contains("class=\"halt\""), "{html}");
         // The mirror of the empty case: every meter now carries a measurement,
         // so none of them is greyed.
         assert_eq!(html.matches("class=\"meter none\"").count(), 0, "{html}");
-        assert_eq!(html.matches("class=\"meter\"").count(), 5, "{html}");
+        assert_eq!(html.matches("class=\"meter\"").count(), 6, "{html}");
         assert!(html.contains("NSE-NIFTY · 1m"));
         assert!(html.contains("2022-01-08..=2022-02-08"), "{html}");
         assert!(html.contains("12040") && html.contains("11990"));
         assert!(html.contains(">50<"), "the drop total: {html}");
         assert!(html.contains(">40<") && html.contains(">10<"));
+        assert!(
+            html.contains("2022-02-08 15:31:02 IST"),
+            "when it ran: {html}"
+        );
+        assert!(html.contains("4.512 s"), "how long it took: {html}");
         // INTEGER bar widths, never a float: 40/40 is 100%, 10/40 is 25%, and
         // a reason with nothing dropped still draws the 3% floor so that a zero
         // reads as "none" rather than as "not rendered".
@@ -2066,6 +2664,302 @@ mod tests {
         assert!(html.contains("width:25%"), "{html}");
         assert!(html.contains("width:3%"), "{html}");
         assert!(!html.contains("width:0%"), "{html}");
+        // THE SHARE BAR: four segments summing to exactly the full width, with
+        // the last taking the rounding remainder so there is never a gap that
+        // is really a division leftover.
+        assert!(html.contains("class=\"share\""), "{html}");
+        assert!(
+            html.contains("class=\"r0\"") || html.contains("class=\"r1\""),
+            "{html}"
+        );
+        assert!(html.contains("class=\"key r3\""), "and a legend: {html}");
+        for forbidden in ["<script", "javascript:", "onclick", "onload", "onerror"] {
+            assert!(!html.contains(forbidden), "{forbidden} must never appear");
+        }
+    }
+
+    #[test]
+    fn the_page_says_the_journal_is_a_file_on_disk_and_where() {
+        // THE OPERATOR'S QUESTION IS "does this survive a restart". A page that
+        // shows a history without saying where it lives cannot answer it, and a
+        // history that lives in memory is missing exactly when it is wanted.
+        let html = pull_page(&pull_view(Some("x"), None));
+        assert!(
+            html.contains("It is a file on disk, not memory"),
+            "the page must say which: {html}"
+        );
+        assert!(html.contains("/tmp/store/audit/pull.journal"), "{html}");
+        assert!(html.contains("3 record(s), 768 byte(s)"), "{html}");
+        assert!(
+            html.contains("href=\"/audit\""),
+            "and a way to read it: {html}"
+        );
+
+        // An absent file says so rather than showing zeroes as if measured.
+        let mut view = pull_view(Some("x"), None);
+        view.journal = JournalNote {
+            path: "/tmp/store/audit/pull.journal",
+            records: 0,
+            bytes: 0,
+            present: false,
+            trouble: None,
+        };
+        let html = pull_page(&view);
+        assert!(html.contains("No file yet"), "{html}");
+        assert!(!html.contains("0 record(s), 0 byte(s)"), "{html}");
+
+        // A torn tail is loud on the page that reads it.
+        view.journal = JournalNote {
+            path: "/tmp/store/audit/pull.journal",
+            records: 4,
+            bytes: 1124,
+            present: true,
+            trouble: Some("TORN WRITE — 100 byte(s) past the last whole record"),
+        };
+        let html = pull_page(&view);
+        assert!(html.contains("TORN WRITE"), "{html}");
+    }
+
+    #[test]
+    fn a_duration_is_integer_arithmetic_in_both_directions() {
+        assert_eq!(elapsed(0), "—", "zero is not a measurement");
+        assert_eq!(elapsed(1), "0.001 ms");
+        assert_eq!(elapsed(999_999), "999.999 ms");
+        assert_eq!(elapsed(1_000_000), "1.000 s");
+        assert_eq!(elapsed(4_512_903), "4.512 s");
+        assert_eq!(elapsed(u64::MAX), "18446744073709.551 s");
+    }
+
+    #[test]
+    fn a_swatch_is_a_shape_before_it_is_a_shade() {
+        // COLOUR ALONE IS NOT A DISTINCTION. A monochrome print and a
+        // colour-blind reader both need the two states to differ in FORM, so
+        // held is a filled square and not-held is an outlined square with a
+        // stroke through it.
+        let empty = swatch(None, 100);
+        let zero = swatch(Some(0), 100);
+        let full = swatch(Some(100), 100);
+        assert!(empty.contains("class=\"sw void\""), "{empty}");
+        assert!(empty.contains("<line"), "the cross is the shape: {empty}");
+        assert!(empty.contains("fill=\"none\""), "{empty}");
+        assert!(empty.contains("aria-label=\"not held\""), "{empty}");
+        assert_eq!(zero, empty, "zero rows held is not held");
+        assert!(full.contains("class=\"sw q4\""), "{full}");
+        assert!(full.contains("fill=\"currentColor\""), "{full}");
+        assert!(
+            !full.contains("<line"),
+            "a filled swatch has no cross: {full}"
+        );
+        assert!(full.contains("held, 100 row(s)"), "{full}");
+
+        // Quartiles are integer arithmetic and one held bar never rounds away.
+        assert_eq!(quartile(0, 100), 0);
+        assert_eq!(quartile(1, 100), 1, "one row is still visibly held");
+        assert_eq!(quartile(25, 100), 1);
+        assert_eq!(quartile(50, 100), 2);
+        assert_eq!(quartile(75, 100), 3);
+        assert_eq!(quartile(100, 100), 4);
+        assert_eq!(
+            quartile(500, 100),
+            4,
+            "and it never runs past the top shade"
+        );
+        assert_eq!(
+            quartile(5, 0),
+            4,
+            "a zero denominator does not divide by zero"
+        );
+    }
+
+    #[test]
+    fn a_share_bar_always_fills_its_width_and_never_hides_a_remainder() {
+        // 1 + 1 + 1 = 3, and 1/3 in integer percent is 33 — so three equal
+        // reasons would draw 99 and leave a sliver that is really a rounding
+        // artefact. The last segment takes the remainder, so the four always
+        // add to 100.
+        let drops = Drops {
+            before_window: 1,
+            after_window: 1,
+            before_open: 1,
+            after_close: 0,
+        };
+        let svg = share_bar(drops);
+        let total: u64 = svg
+            .split("width=\"")
+            .skip(1)
+            .filter_map(|s| s.split('"').next())
+            .filter_map(|s| s.parse::<u64>().ok())
+            .sum();
+        assert_eq!(total, 100, "the segments fill the bar exactly: {svg}");
+        assert!(svg.contains("<title>"), "each segment names itself: {svg}");
+
+        // Nothing dropped draws one flat track, not four zero-width segments.
+        let none = share_bar(Drops::default());
+        assert!(none.contains("class=\"none\""), "{none}");
+        assert!(none.contains("nothing was dropped"), "{none}");
+        assert_eq!(none.matches("<rect").count(), 1, "{none}");
+    }
+
+    #[test]
+    fn the_coverage_strip_draws_one_tick_per_row_and_no_more() {
+        assert_eq!(
+            coverage_strip(&[]),
+            "",
+            "no rows is no strip, not an empty box"
+        );
+        let strip = coverage_strip(&[true, false, true, true]);
+        assert!(strip.contains("viewBox=\"0 0 4 10\""), "{strip}");
+        assert_eq!(
+            strip.matches("<rect").count(),
+            3,
+            "one rect per HELD row, and none for the gaps: {strip}"
+        );
+        assert!(
+            strip.contains("3 of 4 row(s) on this page are held"),
+            "{strip}"
+        );
+        assert!(
+            strip.contains("x=\"0\"") && strip.contains("x=\"2\"") && strip.contains("x=\"3\"")
+        );
+        assert!(!strip.contains("x=\"1\""), "row 1 is not held: {strip}");
+    }
+
+    /// An audit row, for the page that shows them.
+    fn audit_row_fixture(ordinal: u64, loud: bool) -> AuditRow {
+        AuditRow {
+            ordinal,
+            fault: None,
+            when: "2025-07-01 15:31:02 IST".to_owned(),
+            scope: "spot".to_owned(),
+            outcome: if loud { "FAILED" } else { "STORED" }.to_owned(),
+            loud,
+            source: "/Users/you/Downloads/GDFL/Futures/-III".to_owned(),
+            window: "2025-07-01..=2025-07-01".to_owned(),
+            members: 194,
+            rows_read: 354_675,
+            bars_stored: 62_978,
+            rows_folded: 291_527,
+            counted: 194,
+            drops: Drops {
+                before_open: 0,
+                after_close: 170,
+                before_window: 0,
+                after_window: 0,
+            },
+            failures: u64::from(loud),
+            took_micros: 4_512_903,
+            note: "every row accounted for".to_owned(),
+        }
+    }
+
+    fn audit_view<'a>(rows: &'a [AuditRow], notes: &'a [String]) -> AuditView<'a> {
+        AuditView {
+            today: d(2026, 8, 7),
+            journal: JOURNAL,
+            rows,
+            page: 0,
+            last_page: 0,
+            notes,
+        }
+    }
+
+    #[test]
+    fn the_audit_page_draws_only_the_rows_it_was_given() {
+        // THE BOUND, ASSERTED AS A COUNT. The renderer draws what it is handed
+        // and nothing else — two records in, two record rows out — so the page
+        // cost is the page's, not the journal's. The reader half of the same
+        // bound is api::audit::the_tail_reads_only_the_records_it_shows.
+        let rows = [audit_row_fixture(41, false), audit_row_fixture(40, true)];
+        let html = audit_page(&audit_view(&rows, &[]));
+        assert!(html.starts_with("<!doctype html>"));
+        assert!(html.ends_with("</html>"));
+        assert_eq!(
+            html.matches("<td class=\"num\">#").count(),
+            2,
+            "two records in, two rows out: {html}"
+        );
+        assert!(html.contains("#41") && html.contains("#40"), "{html}");
+        assert!(
+            html.contains("2 record(s) held") || html.contains("showing 2"),
+            "{html}"
+        );
+
+        // Every figure the operator asked for is on the row: what was asked,
+        // what landed, what dropped and why, what failed, and how long it took.
+        assert!(html.contains("2025-07-01 15:31:02 IST"), "when: {html}");
+        assert!(html.contains("GDFL"), "what was asked: {html}");
+        assert!(html.contains(">354675<"), "rows read: {html}");
+        assert!(html.contains(">62978<"), "bars stored: {html}");
+        assert!(html.contains(">291527<"), "rows folded: {html}");
+        assert!(html.contains("4.512 s"), "how long: {html}");
+        assert!(html.contains("170 row(s) dropped"), "what dropped: {html}");
+        assert!(html.contains("1 member(s) failed"), "what failed: {html}");
+        assert!(
+            html.contains("class=\"share\""),
+            "and by which share: {html}"
+        );
+
+        // A loud outcome is loud, a calm one is not, and the badge follows.
+        assert!(html.contains("class=\"verdict loud\">FAILED"), "{html}");
+        assert!(html.contains("class=\"verdict calm\">STORED"), "{html}");
+        assert!(html.contains("ATTENTION"), "{html}");
+        for forbidden in ["<script", "javascript:", "onclick", "onload", "onerror"] {
+            assert!(!html.contains(forbidden), "{forbidden} must never appear");
+        }
+    }
+
+    #[test]
+    fn a_refused_record_takes_one_row_and_leaves_the_others_alone() {
+        let mut damaged = audit_row_fixture(7, false);
+        damaged.fault = Some("record checksum 0x00000001 != 0x00000002".to_owned());
+        damaged.loud = true;
+        let rows = [audit_row_fixture(8, false), damaged];
+        let html = audit_page(&audit_view(&rows, &[]));
+        assert!(html.contains("RECORD REFUSED"), "{html}");
+        assert!(
+            html.contains("record checksum"),
+            "with both numbers: {html}"
+        );
+        assert!(
+            html.contains("#8"),
+            "the row beside it still renders: {html}"
+        );
+        assert_eq!(
+            html.matches("RECORD REFUSED").count(),
+            1,
+            "one damaged record is one damaged row: {html}"
+        );
+    }
+
+    #[test]
+    fn an_empty_audit_page_says_nothing_was_recorded_and_shows_no_table() {
+        let html = audit_page(&audit_view(&[], &[]));
+        assert!(html.contains("nothing recorded yet"), "{html}");
+        assert!(
+            html.contains("not because a figure is missing"),
+            "empty is not the same as unmeasured, and the page says so: {html}"
+        );
+        assert!(!html.contains("<tbody>"), "{html}");
+        assert!(
+            html.contains("badge good"),
+            "an empty log is not a fault: {html}"
+        );
+    }
+
+    #[test]
+    fn the_pager_is_one_function_and_both_directions_are_reachable() {
+        assert_eq!(pager("/audit", 0, 0), "", "one page needs no pager");
+        let first = pager("/audit", 0, 2);
+        assert!(!first.contains("previous"), "{first}");
+        assert!(first.contains("/audit?page=1"), "{first}");
+        assert!(first.contains("page 1 of 3"), "{first}");
+        let middle = pager("/store", 1, 2);
+        assert!(middle.contains("/store?page=0"), "{middle}");
+        assert!(middle.contains("/store?page=2"), "{middle}");
+        assert!(middle.contains("page 2 of 3"), "{middle}");
+        let last = pager("/store", 2, 2);
+        assert!(last.contains("/store?page=1"), "{last}");
+        assert!(!last.contains("next"), "{last}");
     }
 
     #[test]
@@ -2077,28 +2971,58 @@ mod tests {
         let html = receipt_page(&Receipt {
             scope: "Spot pull",
             verdict: "NOT STARTED",
-            reason: "the fetch does not exist",
+            reason: "there is no HTTP transport",
+            good: false,
             facts: &facts,
+            footnote: "Nothing here was written to the store.",
         });
         assert!(html.starts_with("<!doctype html>"));
         assert!(html.contains("NOT STARTED"));
         assert!(html.contains("Spot pull"));
-        assert!(html.contains("the fetch does not exist"));
+        assert!(html.contains("there is no HTTP transport"));
         assert!(html.contains("<th>Target</th><td>Swept indices</td>"));
         assert!(html.contains("2022-02-09"));
         assert!(html.contains("Nothing here was written to the store"));
         assert!(html.contains("href=\"/pull\""), "a way back: {html}");
+        assert!(
+            html.contains("href=\"/audit\""),
+            "and to the record: {html}"
+        );
+        assert!(html.contains("badge bad"), "nothing ran: {html}");
+        assert!(!html.contains("class=\"halt good\""), "{html}");
+
+        // A RUN THAT STORED IS BADGED AS ONE, AND SAYS SO. Both halves used to
+        // be hardcoded: `badge bad` on every receipt, and the closing sentence
+        // "Nothing here was written to the store" under a run that wrote 194
+        // bar files.
+        let facts = [("Bars stored", "62978".to_owned())];
+        let html = receipt_page(&Receipt {
+            scope: "Spot pull",
+            verdict: "STORED",
+            reason: "every row is accounted for",
+            good: true,
+            facts: &facts,
+            footnote: "The bars named above ARE on the store root named above.",
+        });
+        assert!(html.contains("badge good"), "{html}");
+        assert!(html.contains("class=\"halt good\""), "{html}");
+        assert!(!html.contains("Nothing here was written"), "{html}");
+        assert!(html.contains("ARE on the store root"), "{html}");
+
         // A refusal is escaped like everything else.
         let facts = [("Field", "<b>x</b>".to_owned())];
         let html = receipt_page(&Receipt {
             scope: "<i>s</i>",
             verdict: "REFUSED",
             reason: "M&M",
+            good: false,
             facts: &facts,
+            footnote: "<em>nothing</em>",
         });
         assert!(html.contains("&lt;b&gt;x&lt;/b&gt;"));
         assert!(html.contains("&lt;i&gt;s&lt;/i&gt;"));
         assert!(html.contains("M&amp;M"));
+        assert!(html.contains("&lt;em&gt;nothing&lt;/em&gt;"), "{html}");
         assert!(!html.contains("<td><b>"));
     }
 
@@ -2131,12 +3055,33 @@ mod tests {
         assert!(html.contains("NSE-NIFTY"));
         assert!(html.contains("2026-07") && html.contains("2026-06"));
         assert!(html.contains(">8250<"), "the row count: {html}");
-        assert!(html.contains("class=\"num miss\">—</td>"), "{html}");
+        // CHANGED, AND NAMED: every cell now carries a swatch BEFORE its
+        // number, so the not-held cell is `class="num miss"` followed by the
+        // hollow swatch and then the dash. The assertion moved from one string
+        // to the two facts it was standing for.
+        assert!(html.contains("class=\"num miss\">"), "{html}");
+        assert!(html.contains("class=\"sw void\""), "{html}");
+        assert!(html.contains(">—</td>"), "{html}");
         assert_eq!(
             html.matches("<tr class=\"swept\">").count(),
             1,
             "exactly one of the two months is held"
         );
+        assert_eq!(
+            html.matches("<tr class=\"void\">").count(),
+            1,
+            "and the other is tinted as not held rather than left unmarked"
+        );
+        // THE POINT OF THE WHOLE CHANGE: held and not-held differ in SHAPE, so
+        // the grid is readable without reading a number. One filled square, one
+        // outlined square with a stroke through it.
+        assert_eq!(html.matches("class=\"sw q").count(), 1, "{html}");
+        assert_eq!(html.matches("class=\"sw void\"").count(), 3, "{html}");
+        // And the page says what the shades are relative to, because there is
+        // no trading calendar in this build to say what a full month is.
+        assert!(html.contains("1 of 2</b> shown row(s) are held"), "{html}");
+        assert!(html.contains("quartiles of 8250"), "{html}");
+        assert!(html.contains("class=\"strip\""), "the glance strip: {html}");
         assert!(html.contains("2 instrument-month(s) in the grid"));
         assert!(html.contains("showing 2"));
         assert!(!html.contains("class=\"pager\""), "one page, no pager");

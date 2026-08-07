@@ -458,6 +458,12 @@ pub fn fold_from_bars(bars: &[Bar], bucket: Bucket, source: Bucket) -> Result<Ve
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::indexing_slicing,
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic
+)]
 mod guard {
     use super::{Bucket, FoldError, fold_from_bars, fold_from_snapshots};
 

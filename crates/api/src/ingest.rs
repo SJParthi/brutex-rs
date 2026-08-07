@@ -517,7 +517,12 @@ pub fn parse_fno(body: &str, today: Day) -> Result<FnoRequest, Refusal> {
 /// Split from [`today_ist`] so both directions are testable without waiting for
 /// 1969: a `SystemTime` before the epoch is a value a test constructs, not a
 /// machine state it has to arrange.
-fn epoch_secs(at: SystemTime) -> i64 {
+///
+/// Public because [`crate::audit`] stamps the same number into every record it
+/// writes, and two spellings of "which second is it" is exactly the second
+/// definition `CLAUDE.md` §3 rule 1 is about.
+#[must_use]
+pub fn epoch_secs(at: SystemTime) -> i64 {
     match at.duration_since(SystemTime::UNIX_EPOCH) {
         // The saturating arm lives inside `Result::unwrap_or`, which is not
         // this repository's code to measure; it is reachable only from a clock
