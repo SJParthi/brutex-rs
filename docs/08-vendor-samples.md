@@ -93,7 +93,41 @@ GFDLNFO_TICK_01072025/Options/NIFTY25SEP2525700PE.NFO.csv
 GFDLNFO_TICK_01072025/Futures/-III/FINNIFTY-III.NFO.csv
 ```
 
-**24,264 CSV members** in one day's archive — 22,980 options, 1,284 futures.
+**12,133 CSV members** in one day's archive — **11,490 options, 642 futures**.
+
+> **This file previously said 24,264 / 22,980 / 1,284 — exactly double, and it
+> was wrong.** `unzip -Z1` lists **24,292** entries for `GDFL.zip`, of which
+> **12,145 are `__MACOSX` ghosts**: a shadow tree macOS adds when it re-zips,
+> holding a resource-fork stub for every real file. Counting them doubled every
+> figure. The counting rule is `| grep -v __MACOSX` before anything else, and
+> an archive reader that skips it will also try to parse those stubs as CSVs.
+
+## What is actually distinct — the number that matters
+
+| | |
+|---|---|
+| Distinct trading days owned | **15** |
+| TrueData | 14 — `2022-10-03,04,06,07` · `2025-06-16..20` · `2025-10-06..10` |
+| GDFL | **1** — `2025-07-01` |
+| Dates shared between the two vendors | **none** |
+
+**No date overlaps**, so the two feeds cannot be cross-checked against each
+other on any bar. That closes off the strongest possible validation and it is
+not recoverable without buying an overlapping day.
+
+**`ezyZip.zip` contains zero unique data** — it is a re-zip of GDFL's single
+day. GDFL stores that day **six times over** (extracted folder, the nested
+tick zip, `Options.zip`, `Options/Archive.zip`, and the ezyZip copy). Of 2.4 GB
+on disk, the distinct content is a fraction of it.
+
+**`GFDLNFO_BACKADJUSTED_01072025.csv` is not back-adjusted futures.** It is
+**one-minute candles** for all 12,132 tickers — 1,003,905 rows. The filename
+describes a product it does not contain, and a reader that trusts the name
+would ingest minute bars believing them to be a continuous spliced series.
+
+**TrueData's shipped API documentation contradicts its own data**, and
+`P5` in that archive is **BSE**, which `CLAUDE.md` §1 and D-0017 place out of
+scope entirely.
 
 Header row present. Date format **`DD/MM/YYYY`** — `01/07/2025` is 1 July, not
 7 January. Reading it as the other order shifts every bar by months, silently.
