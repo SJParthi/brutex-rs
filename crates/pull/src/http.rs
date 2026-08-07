@@ -265,14 +265,112 @@ pub fn decode_body(body: &str, spec: &HttpSpec) -> Result<RawWindow, FetchError>
             };
             RawWindow::decode(&arrays)
         }
-        ResponseShape::ArrayOfObjects { .. } => Err(FetchError::TransportFailed {
-            detail: "array-of-objects responses are declared in the descriptor \
-                     but no vendor in this build uses one, so no decoder was \
-                     written. Refused rather than guessed at: a decoder nobody \
-                     has run against a real body is a decoder that is wrong."
-                .to_owned(),
-        }),
+        // ONE OBJECT PER BAR — the shape `crate::vendor`'s Groww row declares.
+        //
+        // This arm refused for as long as no vendor in this build used it, and
+        // the refusal said so in as many words: *a decoder nobody has run
+        // against a real body is a decoder that is wrong.* That is still true,
+        // and it is why the fields below are read strictly by the names the
+        // descriptor gives rather than by position — a positional reader would
+        // silently file a high as a low the first time a vendor reordered.
+        //
+        // Each element carries the seven fields the parallel-array shape
+        // spreads across seven arrays, so the SAME `prices` and `numbers`
+        // conversions run per object: rupees to paisa through `csv::paisa`, no
+        // float, and a value off the tick grid refused by name.
+        ResponseShape::ArrayOfObjects { envelope } => decode_objects(&root, spec, envelope),
     }
+}
+
+/// One object per bar, into the same seven arrays the other shape arrives as.
+///
+/// # Why this transposes rather than adding a second pipeline
+///
+/// [`RawWindow::decode`] already owns the length check, the row assembly and
+/// every refusal below it. A decoder that built rows directly would be a second
+/// answer to "what is a bar", and the two would drift — the same argument
+/// `crate::ingest::from_members` makes about the two ingest paths. So this
+/// collects the objects' fields into columns and hands them to the one decoder.
+///
+/// # The length check still means something here
+///
+/// In the parallel-array shape the seven arrays can disagree; here they cannot,
+/// because they are built by walking one list. What CAN differ is an object
+/// missing a field, and that is refused **by name and by index** rather than
+/// filled in — a bar with a defaulted close is a bar that looks real.
+///
+/// # Errors
+///
+/// [`FetchError::TransportFailed`] naming the field and the element for
+/// anything that is not the declared shape, and whatever [`RawWindow::decode`]
+/// refuses.
+fn decode_objects(
+    root: &serde_json::Value,
+    spec: &HttpSpec,
+    envelope: Option<&'static str>,
+) -> Result<RawWindow, FetchError> {
+    let container = container(root, envelope)?;
+    let f = spec.fields;
+
+    // The array itself is found the same way a parallel array is: by the name
+    // the descriptor gives, inside the one container. `crate::vendor` names it
+    // through the same `FieldNames` row, so there is no second convention.
+    let items = array_at(container, f.timestamp)
+        .or_else(|_| array_at(container, "candles"))
+        .or_else(|_| {
+            container
+                .as_array()
+                .ok_or_else(|| FetchError::TransportFailed {
+                    detail: format!(
+                        "this vendor declares one object per bar, and the \
+                         container is neither an array nor holds one named \
+                         {:?}. It has: {}",
+                        f.timestamp,
+                        keys_of(container)
+                    ),
+                })
+        })?;
+
+    let mut arrays = ParallelArrays {
+        open: Vec::with_capacity(items.len()),
+        high: Vec::with_capacity(items.len()),
+        low: Vec::with_capacity(items.len()),
+        close: Vec::with_capacity(items.len()),
+        volume: Vec::with_capacity(items.len()),
+        timestamp: Vec::with_capacity(items.len()),
+        open_interest: Vec::new(),
+    };
+
+    for (i, item) in items.iter().enumerate() {
+        // A field missing from ONE object is refused naming both the field and
+        // which bar it was, because "the vendor sent 400 bars and one of them
+        // has no close" is a different fault from "the shape is wrong" and
+        // sends an operator somewhere different.
+        let one = |name: &str| -> Result<&serde_json::Value, FetchError> {
+            item.get(name).ok_or_else(|| FetchError::TransportFailed {
+                detail: format!("bar {i} carries no {name:?}. It has: {}", keys_of(item)),
+            })
+        };
+        arrays
+            .open
+            .push(one_price(one(f.open)?, f.open, spec.prices)?);
+        arrays
+            .high
+            .push(one_price(one(f.high)?, f.high, spec.prices)?);
+        arrays.low.push(one_price(one(f.low)?, f.low, spec.prices)?);
+        arrays
+            .close
+            .push(one_price(one(f.close)?, f.close, spec.prices)?);
+        arrays.volume.push(one_number(one(f.volume)?, f.volume)?);
+        arrays
+            .timestamp
+            .push(one_number(one(f.timestamp)?, f.timestamp)?);
+        if let Some(name) = f.open_interest {
+            arrays.open_interest.push(one_number(one(name)?, name)?);
+        }
+    }
+
+    RawWindow::decode(&arrays)
 }
 
 /// The unit [`decode_body`] leaves prices in, whatever the vendor quoted.
@@ -318,24 +416,36 @@ pub const DECODED_PRICE_SCALE: PriceScale = PriceScale::Paisa;
 fn prices(root: &serde_json::Value, name: &str, scale: PriceScale) -> Result<Vec<i64>, FetchError> {
     array_at(root, name)?
         .iter()
-        .map(|v| {
-            let refuse = || FetchError::TransportFailed {
-                detail: format!(
-                    "{name:?} holds {v}, which is not a price this build can put \
-                     on the paisa grid"
-                ),
-            };
-            let Some(number) = v.as_number() else {
-                return Err(refuse());
-            };
-            match scale {
-                // Already paisa: an integer count, and nothing to convert.
-                PriceScale::Paisa => number.as_i64().ok_or_else(refuse),
-                // Rupees: the text is the truth, and `csv::paisa` owns the rule.
-                PriceScale::Rupees => crate::csv::paisa(&number.to_string()).ok_or_else(refuse),
-            }
-        })
+        .map(|v| one_price(v, name, scale))
         .collect()
+}
+
+/// One price value, whatever shape carried it.
+///
+/// Shared by both response shapes so a rupee is converted the same way whether
+/// it arrived in a column or in an object — two conversions would be two
+/// answers, and the second one would lose the paise first.
+///
+/// # Errors
+///
+/// [`FetchError::TransportFailed`] naming the field and the value, for anything
+/// that is not a number or does not land exactly on the paisa grid.
+fn one_price(v: &serde_json::Value, name: &str, scale: PriceScale) -> Result<i64, FetchError> {
+    let refuse = || FetchError::TransportFailed {
+        detail: format!(
+            "{name:?} holds {v}, which is not a price this build can put on the \
+             paisa grid"
+        ),
+    };
+    let Some(number) = v.as_number() else {
+        return Err(refuse());
+    };
+    match scale {
+        // Already paisa: an integer count, and nothing to convert.
+        PriceScale::Paisa => number.as_i64().ok_or_else(refuse),
+        // Rupees: the text is the truth, and `csv::paisa` owns the rule.
+        PriceScale::Rupees => crate::csv::paisa(&number.to_string()).ok_or_else(refuse),
+    }
 }
 
 /// One named array of counts — volumes, timestamps, open interest.
@@ -351,22 +461,29 @@ fn prices(root: &serde_json::Value, name: &str, scale: PriceScale) -> Result<Vec
 fn numbers(root: &serde_json::Value, name: &str) -> Result<Vec<i64>, FetchError> {
     array_at(root, name)?
         .iter()
-        .map(|v| {
-            if let Some(n) = v.as_i64() {
-                return Ok(n);
-            }
-            let refuse = || FetchError::TransportFailed {
-                detail: format!("{name:?} holds {v}, which is not a whole number"),
-            };
-            let number = v.as_number().ok_or_else(refuse)?;
-            let hundredths = crate::csv::paisa(&number.to_string()).ok_or_else(refuse)?;
-            if hundredths % 100 == 0 {
-                Ok(hundredths / 100)
-            } else {
-                Err(refuse())
-            }
-        })
+        .map(|v| one_number(v, name))
         .collect()
+}
+
+/// One count, whatever shape carried it.
+///
+/// # Errors
+///
+/// [`FetchError::TransportFailed`] naming the field and the value.
+fn one_number(v: &serde_json::Value, name: &str) -> Result<i64, FetchError> {
+    if let Some(n) = v.as_i64() {
+        return Ok(n);
+    }
+    let refuse = || FetchError::TransportFailed {
+        detail: format!("{name:?} holds {v}, which is not a whole number"),
+    };
+    let number = v.as_number().ok_or_else(refuse)?;
+    let hundredths = crate::csv::paisa(&number.to_string()).ok_or_else(refuse)?;
+    if hundredths % 100 == 0 {
+        Ok(hundredths / 100)
+    } else {
+        Err(refuse())
+    }
 }
 
 /// The one object this vendor's bar fields are read from.
@@ -1219,17 +1336,30 @@ mod tests {
         assert!(!detail.contains("SUPERSECRET"), "never the token: {detail}");
     }
 
-    /// A shape no vendor in this build uses is refused rather than guessed at.
+    /// The object shape no longer refuses on principle — it refuses on SHAPE.
+    ///
+    /// This test used to assert "no decoder was written", which was true and is
+    /// not any more: Groww's descriptor declares one object per bar, so the
+    /// decoder exists. What must still hold is that a body which is *not* that
+    /// shape is refused by name rather than guessed at, and that the refusal
+    /// says what it did find.
     #[test]
-    fn an_array_of_objects_response_is_refused_because_no_decoder_was_written() {
+    fn an_object_shape_body_that_is_not_a_list_of_bars_is_refused_by_name() {
         let shape = HttpSpec {
             response: ResponseShape::ArrayOfObjects { envelope: None },
             ..spec(PriceScale::Rupees)
         };
         let Err(FetchError::TransportFailed { detail }) = decode_body("{}", &shape) else {
-            panic!("a decoder nobody has run against a real body is a decoder that is wrong")
+            panic!("an empty object holds no bars and must be refused")
         };
-        assert!(detail.contains("no decoder was written"), "{detail}");
+        assert!(
+            detail.contains("one object per bar"),
+            "the refusal names the shape it expected: {detail}"
+        );
+        assert!(
+            detail.contains("no keys at all"),
+            "and what it actually found: {detail}"
+        );
     }
 
     /// The blocking seam refuses by name rather than spinning a runtime per call.
@@ -1372,6 +1502,114 @@ mod tests {
                 .expect("a runtime")
                 .block_on(self.0.window_async(&one_day()))
         }
+    }
+
+    /// Groww's declared shape, decoded: one object per bar under `payload`.
+    ///
+    /// This arm refused for as long as no vendor used it. Groww's descriptor
+    /// declares it, so it is written — and written to read fields **by the
+    /// names the descriptor gives**, never by position. A positional reader
+    /// would file a high as a low the first time a vendor reordered its keys,
+    /// and every value would still be a plausible price.
+    #[test]
+    fn one_object_per_bar_decodes_through_the_same_conversions() {
+        let body = r#"{"payload":[
+            {"open":24500.75,"high":24512.00,"low":24498.50,"close":24510.25,
+             "volume":1200,"timestamp":1751341500},
+            {"open":24510.25,"high":24518.75,"low":24505.00,"close":24515.00,
+             "volume":980,"timestamp":1751341560}
+        ]}"#;
+        let spec = HttpSpec {
+            response: ResponseShape::ArrayOfObjects {
+                envelope: Some("payload"),
+            },
+            ..spec(PriceScale::Rupees)
+        };
+        let window = decode_body(body, &spec).expect("decodes");
+        assert_eq!(window.rows.len(), 2);
+        // THE SAME PAISA CONVERSION as the column shape — one implementation,
+        // so a rupee cannot be worth two different things depending on which
+        // way the vendor happened to send it.
+        assert_eq!(window.rows[0].open, 2_450_075);
+        assert_eq!(window.rows[0].close, 2_451_025);
+        assert_eq!(window.rows[1].high, 2_451_875);
+        assert_eq!(window.rows[0].volume, 1200);
+        assert_eq!(window.rows[1].timestamp, 1_751_341_560);
+    }
+
+    /// A field missing from ONE bar names the field **and which bar**.
+    ///
+    /// "the vendor sent 400 bars and one has no close" is a different fault
+    /// from "the shape is wrong", and it sends an operator somewhere different.
+    /// Filling in a default would put a bar on disk that looks entirely real.
+    #[test]
+    fn a_bar_missing_one_field_is_refused_by_field_and_by_index() {
+        let body = r#"{"payload":[
+            {"open":1,"high":1,"low":1,"close":1,"volume":1,"timestamp":1},
+            {"open":1,"high":1,"low":1,"volume":1,"timestamp":2}
+        ]}"#;
+        let spec = HttpSpec {
+            response: ResponseShape::ArrayOfObjects {
+                envelope: Some("payload"),
+            },
+            ..spec(PriceScale::Paisa)
+        };
+        let Err(FetchError::TransportFailed { detail }) = decode_body(body, &spec) else {
+            panic!("a bar with no close must be refused, not defaulted")
+        };
+        assert!(detail.contains("close"), "the field: {detail}");
+        assert!(detail.contains("bar 1"), "and which bar: {detail}");
+        assert!(detail.contains("open"), "and what it did have: {detail}");
+    }
+
+    /// The declared envelope is honoured here too — D-0049 applies to both
+    /// shapes, so one bar can never be spliced out of two objects.
+    #[test]
+    fn the_object_shape_reads_only_the_declared_envelope() {
+        let body = r#"{
+            "cached":[{"open":999,"high":999,"low":999,"close":999,"volume":1,"timestamp":1}],
+            "payload":[{"open":100,"high":100,"low":100,"close":100,"volume":7,"timestamp":2}]
+        }"#;
+        let spec = HttpSpec {
+            response: ResponseShape::ArrayOfObjects {
+                envelope: Some("payload"),
+            },
+            ..spec(PriceScale::Paisa)
+        };
+        let window = decode_body(body, &spec).expect("decodes");
+        assert_eq!(window.rows.len(), 1, "only the named envelope is read");
+        assert_eq!(window.rows[0].open, 100, "99900 would be `cached` leaking");
+        assert_eq!(window.rows[0].volume, 7);
+    }
+
+    /// An envelope the answer does not carry is refused, naming what it has.
+    #[test]
+    fn the_object_shape_refuses_a_missing_envelope_by_name() {
+        let spec = HttpSpec {
+            response: ResponseShape::ArrayOfObjects {
+                envelope: Some("payload"),
+            },
+            ..spec(PriceScale::Paisa)
+        };
+        let Err(FetchError::TransportFailed { detail }) = decode_body(r#"{"data":[]}"#, &spec)
+        else {
+            panic!("the declared envelope is absent and must be named")
+        };
+        assert!(detail.contains("payload"), "expected: {detail}");
+        assert!(detail.contains("data"), "present: {detail}");
+    }
+
+    /// An empty list is a real answer — no bars, and no refusal.
+    #[test]
+    fn an_empty_object_list_is_a_window_of_no_bars_and_not_a_failure() {
+        let spec = HttpSpec {
+            response: ResponseShape::ArrayOfObjects {
+                envelope: Some("payload"),
+            },
+            ..spec(PriceScale::Paisa)
+        };
+        let window = decode_body(r#"{"payload":[]}"#, &spec).expect("decodes");
+        assert!(window.rows.is_empty(), "no bars is not an error");
     }
 
     /// `wire_end` is the one conversion site for a non-inclusive `toDate`.

@@ -1457,6 +1457,22 @@ fn pull_forms(view: &PullView<'_>) -> String {
         "Target",
         &format!("<select name=\"target\" required>{options}</select>"),
     ));
+    // WHICH BROKER. Offered as a control rather than fixed in the route,
+    // because `CLAUDE.md` makes adding a vendor a row in `pull::vendor` and a
+    // page that names one defeats that.
+    //
+    // Dhan is first, and therefore the default, because its descriptor is the
+    // only one VERIFIED against a live body — the first real call returned
+    // `DH-905 securityId is required`, which is a vendor confirming its own
+    // shape. Groww's response shape has never been seen, and the note below
+    // says so rather than letting an operator discover it.
+    out.push_str(&field(
+        "Broker",
+        "<select name=\"vendor\">\
+         <option value=\"dhan\">Dhan — reached live; descriptor confirmed by the vendor</option>\
+         <option value=\"groww\">Groww — never reached; response shape UNVERIFIED</option>\
+         </select>",
+    ));
     let _ = write!(
         out,
         "<div class=\"pair\">{}{}</div>",

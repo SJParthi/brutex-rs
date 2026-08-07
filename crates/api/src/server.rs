@@ -1419,7 +1419,11 @@ async fn broker_window(
     let identity =
         pull::ssm::AwsIdentity::discover().map_err(|why| format!("no AWS identity: {why}"))?;
 
-    let vendor = brutex_core::vendor::Vendor::Dhan;
+    // WHICH BROKER, FROM THE REQUEST — not hardcoded. `CLAUDE.md`: adding a
+    // vendor is a row in `pull::vendor`, and a route that names one defeats
+    // that. Dhan when unstated, because it is the one whose descriptor has been
+    // verified against a live body.
+    let vendor = asked.vendor;
     let path = config
         .path_for(vendor, "access-token")
         .map_err(|why| format!("the parameter path could not be built: {why}"))?;
@@ -1433,10 +1437,29 @@ async fn broker_window(
         .map_err(|why| format!("the broker credential could not be read: {}", why.detail))?;
 
     // The descriptor is the single source of every vendor difference — URL,
-    // auth header, date format, field names. `CLAUDE.md`: adding a broker is a
-    // row in `crate::vendor`, not an edit here.
-    let pull::vendor::Transport::Http(spec) = pull::vendor::Feed::Dhan.descriptor().transport
-    else {
+    // auth header, date format, response shape, field names, timestamp
+    // encoding, price scale. `CLAUDE.md`: adding a broker is a row in
+    // `crate::vendor`, not an edit here, and this is the line that keeps that
+    // true — Groww and Dhan differ in six of those fields and share every line
+    // of code below.
+    let feed = match vendor {
+        brutex_core::vendor::Vendor::Dhan => pull::vendor::Feed::Dhan,
+        brutex_core::vendor::Vendor::Groww => pull::vendor::Feed::Groww,
+        // `Vendor` is `#[non_exhaustive]`, so a vendor added to `crates/core`
+        // without a feed in `crates/pull` lands here. It REFUSES BY NAME rather
+        // than falling back to one of the two above: silently pulling Dhan's
+        // bars for a request that said something else is the shape `CLAUDE.md`
+        // §4 bans, and it would file another broker's prices under this one's.
+        other => {
+            return Err(format!(
+                "{} is a vendor this build has no HTTP feed for. Adding one is \
+                 a row in pull::vendor, and until it exists nothing is pulled \
+                 rather than the wrong thing being pulled.",
+                other.as_str()
+            ));
+        }
+    };
+    let pull::vendor::Transport::Http(spec) = feed.descriptor().transport else {
         return Err(format!(
             "{} declares a local-archive transport, not an HTTP one",
             vendor.as_str()

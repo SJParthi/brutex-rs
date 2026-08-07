@@ -344,6 +344,15 @@ pub struct SpotRequest {
     pub target: SpotTarget,
     /// The operator's inclusive range.
     pub window: Window,
+    /// Which broker to ask.
+    ///
+    /// Parsed rather than hardcoded, because `CLAUDE.md` makes adding a vendor
+    /// a row in `pull::vendor` — and a route that names one defeats that. An
+    /// unstated or unknown vendor is **Dhan**, which is the one whose
+    /// descriptor has been verified against a live body; Groww's has not, and
+    /// defaulting to the unverified one would make a first-time operator debug
+    /// a shape nobody has confirmed.
+    pub vendor: brutex_core::vendor::Vendor,
 }
 
 /// One expired-derivative pull, validated.
@@ -507,7 +516,29 @@ pub fn parse_spot(body: &str, today: Day) -> Result<SpotRequest, Refusal> {
     Ok(SpotRequest {
         target,
         window: parse_window(body, today)?,
+        vendor: parse_vendor(&param(body, "vendor")),
     })
+}
+
+/// Which broker a request names, defaulting to the verified one.
+///
+/// # Why an unknown vendor is not a refusal
+///
+/// Every other field on this form refuses what it does not understand, and this
+/// one does not — deliberately. The vendor is a *route*, not a claim about the
+/// data: naming one that does not exist cannot corrupt anything, and the form
+/// offers a fixed list so the only way to send a wrong one is to hand-build the
+/// POST. Falling back is safe here in a way it is nowhere else on this page.
+///
+/// The fallback is **Dhan** because its descriptor is the one verified against
+/// a live body. Groww's is not, and defaulting to the unverified one would make
+/// a first-time operator debug a response shape nobody has confirmed.
+#[must_use]
+pub fn parse_vendor(raw: &str) -> brutex_core::vendor::Vendor {
+    brutex_core::vendor::Vendor::ALL
+        .into_iter()
+        .find(|v| v.as_str().eq_ignore_ascii_case(raw))
+        .unwrap_or(brutex_core::vendor::Vendor::Dhan)
 }
 
 /// One expired-derivative request, out of a form body.
