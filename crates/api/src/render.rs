@@ -303,6 +303,52 @@ const LOUD: [&str; 5] = [
     "UNCHECKED",
 ];
 
+/// One value, encoded to sit inside a URL query string.
+///
+/// # `escape` is not this, and using it here silently truncated a symbol
+///
+/// [`escape`] turns `&` into `&amp;`, which is correct for TEXT inside HTML and
+/// wrong for a VALUE inside a URL. Links were built with it:
+///
+/// ```text
+/// format!("/bars?symbol={}&segment={}…", escape(symbol), …)
+/// ```
+///
+/// so the symbol `GVT&D` produced `?symbol=GVT&amp;D&segment=…`, and
+/// [`crate::server::param`] splits a query on `&` alone. The server therefore
+/// saw `symbol=GVT`, a stray `amp;D`, and the rest — a different instrument,
+/// fetched and rendered with no error anywhere.
+///
+/// This is not a corner case. The live masters carry **1,007 Dhan symbols and
+/// 521 Groww symbols containing `&`**, and `GVT&D` has F&O contracts of its own
+/// (`NSE-GVT&D-25Aug26-1800-CE`), so it sits inside the requested pull scope.
+///
+/// # Why the output needs no further escaping
+///
+/// Everything outside the RFC 3986 unreserved set — `ALPHA / DIGIT / - . _ ~` —
+/// becomes `%XX`. None of the five characters [`escape`] rewrites can survive
+/// that, so the result is safe in an attribute as it stands and must NOT be
+/// passed through [`escape`] afterwards: `%26` would become `%26` still, but a
+/// future edit that reordered them would double-encode.
+///
+/// [`crate::server::percent_decode`] is the other half and already existed;
+/// this closes the round trip.
+#[must_use]
+pub fn query_value(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for byte in raw.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(char::from(byte));
+            }
+            _ => {
+                let _ = write!(out, "%{byte:02X}");
+            }
+        }
+    }
+    out
+}
+
 /// Escapes the five characters that change HTML meaning.
 ///
 /// # Examples
@@ -354,12 +400,18 @@ impl View<'_> {
         page: Option<usize>,
     ) -> String {
         let mut out = String::with_capacity(64);
+        // THE SEPARATOR IS HTML, THE VALUES ARE URL. `&amp;` between pairs is
+        // correct in an attribute — the browser un-escapes it to `&` and that
+        // is the separator it should be. The VALUES were escaped the same way,
+        // which meant a search for `M&M` produced `q=M&amp;M`, the browser sent
+        // `q=M&M`, and `server::param` split there: the search became `M`.
+        // Values are percent-encoded now; see `query_value`.
         let _ = write!(
             out,
             "q={}&amp;sort={}&amp;u={}",
-            escape(self.query),
-            escape(sort.unwrap_or(self.sort)),
-            escape(active.unwrap_or(self.active)),
+            query_value(self.query),
+            query_value(sort.unwrap_or(self.sort)),
+            query_value(active.unwrap_or(self.active)),
         );
         if self.all {
             out.push_str("&amp;all=1");
@@ -2223,12 +2275,15 @@ pub fn bars_page(view: &BarsView<'_>) -> String {
 
     // The pager keeps every narrowing in the URL, so a page of prices is
     // linkable — the same property `/store` and `/instruments` have.
+    // `query_value`, NOT `escape` — see `query_value`'s own docs. `escape`
+    // produced `?symbol=GVT&amp;D`, and `server::param` splits on `&`, so a
+    // symbol with an ampersand in it became a different, shorter symbol.
     let base = format!(
         "/bars?symbol={}&segment={}&vendor={}&month={}",
-        escape(view.symbol),
-        escape(view.segment),
-        escape(view.vendor),
-        escape(view.month)
+        query_value(view.symbol),
+        query_value(view.segment),
+        query_value(view.vendor),
+        query_value(view.month)
     );
     body.push_str(&pager(&base, view.page, view.last_page));
     body.push_str(
@@ -2725,7 +2780,18 @@ mod tests {
         // No overrides: the current state, verbatim. The ampersand in the
         // search is escaped, because a symbol really can contain one.
         let keep = v.link_params(None, None, None);
-        assert!(keep.contains("q=M&amp;M"), "the search is escaped: {keep}");
+        // WAS: assert!(keep.contains("q=M&amp;M"), "the search is escaped")
+        //
+        // That asserted the defect and called it correct. `&amp;` in an href is
+        // un-escaped by the browser to `&`, which `server::param` treats as the
+        // pair separator — so this link carried the search `M`, not `M&M`, and
+        // the test blessed it. A query VALUE is percent-encoded, not
+        // HTML-escaped; `render::query_value_tests` asserts the round trip
+        // through the server's own parser rather than either spelling.
+        assert!(
+            keep.contains("q=M%26M"),
+            "the search value is percent-encoded so it survives param(): {keep}"
+        );
         assert!(keep.contains("sort=isin"));
         assert!(keep.contains("u=ntm"));
         assert!(keep.contains("&amp;all=1"));
@@ -3984,5 +4050,69 @@ mod tests {
         assert_eq!(universe_cell(Universe::NONE), "<td>—</td>");
         // Never a raw ampersand, even in a hardcoded label.
         assert!(!r.contains("F&O<"));
+    }
+}
+
+#[cfg(test)]
+mod query_value_tests {
+    use super::*;
+
+    /// **A LINK THIS SERVER BUILDS SURVIVES ITS OWN PARSER.**
+    ///
+    /// Links were built with [`escape`], which is HTML escaping. `GVT&D` became
+    /// `?symbol=GVT&amp;D`, and [`crate::server::param`] splits a query on `&`,
+    /// so the server read `symbol=GVT` — a different instrument, rendered with
+    /// no error. The live masters hold 1,007 Dhan and 521 Groww symbols with an
+    /// ampersand, and `GVT&D` has F&O contracts, so this is a live path.
+    ///
+    /// The assertion is the ROUND TRIP rather than the encoding: encode a value,
+    /// put it in a query beside another parameter, parse it back with the real
+    /// parser, and require the value returned to be the value that went in. That
+    /// cannot pass while the two halves disagree, whatever either one spells.
+    #[test]
+    fn a_value_in_a_link_round_trips_through_the_servers_own_parser() {
+        for raw in [
+            "GVT&D", // a real NSE symbol, and an F&O underlying
+            "ARE&M",
+            "M&M",
+            "NSE-GVT&D-25Aug26-1800-CE",
+            "a b",  // a space, which `+`-decodes
+            "100%", // a literal percent
+            "a=b",  // the pair separator
+            "x#y",  // a fragment marker
+            "π",    // multi-byte
+            "",
+        ] {
+            let encoded = query_value(raw);
+            // Beside a SECOND parameter, because the failure was that the value
+            // ran into the next one.
+            let query = format!("symbol={encoded}&segment=INDEX");
+            assert_eq!(
+                crate::server::param(&query, "symbol"),
+                raw,
+                "{raw:?} encoded to {encoded:?} and came back as something else"
+            );
+            assert_eq!(
+                crate::server::param(&query, "segment"),
+                "INDEX",
+                "{raw:?} encoded to {encoded:?} and swallowed the next parameter"
+            );
+        }
+    }
+
+    /// The output carries nothing an HTML attribute would have to escape, which
+    /// is why it is written into an `href` directly and must not be escaped
+    /// again.
+    #[test]
+    fn the_encoding_is_safe_in_an_attribute_without_further_escaping() {
+        for raw in ["GVT&D", "a\"b", "a<b>c", "it's"] {
+            let encoded = query_value(raw);
+            assert_eq!(
+                escape(&encoded),
+                encoded,
+                "{encoded:?} still needs HTML escaping, so the two would have to \
+                 be composed and the order would matter"
+            );
+        }
     }
 }

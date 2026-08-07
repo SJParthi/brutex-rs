@@ -439,7 +439,8 @@ pub fn page_number(raw: &str) -> usize {
 }
 
 /// Decodes `+` and `%XX` escapes.
-fn percent_decode(s: &str) -> String {
+#[must_use]
+pub fn percent_decode(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
