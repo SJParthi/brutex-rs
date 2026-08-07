@@ -3952,3 +3952,210 @@ once where `upper` is exactly `0.5` at zero so both arms return the same
 number. Both are now a question about the **sign**, which has no boundary for a
 mutant to sit on. That is the general repair for this class: an unreachable
 boundary is a design smell before it is a coverage problem.
+
+---
+
+## D-0047 · 2026-08-07 · The date picker is a one-month drill-down, and only one panel on a form can be open
+
+**Numbering:** the last entry on this branch is D-0046. Per that entry's own
+lesson, this number is **provisional until merge** — it was chosen by reading
+this branch's ledger, and any unmerged branch that has also claimed 0047 wins if
+it merges first.
+
+### What was wrong
+
+`crates/api/src/calendar.rs` emitted the twelve years, the twelve months and the
+thirty-one days **on screen together**. The panel stood about 600 px tall, every
+control the widget owned was visible at once, nothing said which strip to touch
+first, and the day grid drawn was the grid for whichever (year, month) happened
+to be selected — including none. With more than one picker open the panels
+overlapped.
+
+### What replaces it
+
+Dhan's shape: **one month**, with `‹ August 2026 ›` above it, the title a button
+that drills down to the months and from there to the years.
+
+**Three panes and no extra control to switch them.** Which pane shows is a
+function of which radios are already checked, read by `:has()`:
+
+| Checked | Pane |
+|---|---|
+| nothing | the twelve years |
+| a year | the twelve months |
+| a year and a month | that month's grid |
+
+So the picker advances on its own. Going back needs the one thing a `<label>`
+cannot do — **uncheck** a radio — so each of the two groups carries one more
+radio whose value is the empty string, and the header title is a label for it.
+Checking a sibling is what unchecks the real one. The group then posts an empty
+value, and `api::ingest::parse_day_field` now reads *any* empty piece as
+`Refusal::FieldMissing` rather than composing `-08-06` and calling it a malformed
+ISO date — the same unfinished date, named correctly.
+
+Cost: **57 controls per field**, up from 55. The two extra are the empty-valued
+radios.
+
+### And the overlap is closed structurally, not by tuning
+
+Cutting the panel down did not fix it, and measuring said so: at 1440×900 with
+every picker forced open, the expiry panel still hung **303 px** over the panel
+belonging to the field on the row beneath it. Any panel taller than its own row
+reaches the next one, so no width and no height settles this.
+
+**The popover latch is now a radio, not a checkbox.** The five latches on a form
+are five members of one group named `cal`, so at most one is checked and opening
+a picker closes whatever was open. Two panels cannot coexist to be laid out
+badly. A radio cannot untick itself, so each panel carries an explicit `Close`
+pointing at the group's resting member — `calendar::shut`, emitted once per form
+and `checked`, which is also what makes every panel start shut.
+
+**One per form and not one per page**, because a radio group is scoped to its
+form owner: two inputs with the same name in two `<form>`s are two groups. That
+scoping is the scope wanted — the ingest page's two forms are two cards side by
+side. Measured after the change: **zero overlapping pairs** across all six
+reachable (spot × F&O) open combinations at 1440×900.
+
+### Two things fixed in passing, both latent
+
+- **Months past the ceiling were clickable.** All twelve months are always
+  emitted, so in the cap's own year the ones after it led to a grid of days the
+  server refused one by one. They are now greyed by a computed rule, the same way
+  impossible days always were.
+- **`first_year` offered years no date can exist in.** `max.year() - 11` answers
+  1959 for a cap in 1970, and `pull::session::Day` is validated into 1970..=9999.
+  Unreachable from this page, whose ceilings are today and yesterday, and wrong
+  anyway. Floored at `MIN_YEAR`, imported rather than restated.
+
+### Still no JavaScript
+
+Four tests in `crates/api/src/render` assert `<script>` never appears in any page
+this server emits, and `calendar::tests::nothing_the_picker_emits_is_a_script`
+now asserts it over the widget itself, so a regression is named where it happens
+rather than three call sites away. `docs/06-limits.md` §31 records the one thing
+the constraint costs: the month arrows do not cross a year boundary.
+
+Verified in a live browser at 1440×900: pane progression, header text, arrow
+targets, the ceiling on both months and days, day-1 column alignment, and the
+readout reading back `6 Aug '26`.
+
+---
+
+## D-0048 · 2026-08-07 · The `/store` coverage grid takes its axis from the census, never from the instrument master
+
+### The contradiction
+
+The page reported **`0 of 200 held`** on the same screen as **`62,978 rows`**,
+and both numbers were computed correctly from the same file.
+
+The grid built its instrument axis from the merged instrument master, filtered to
+spot indices, and turned each `InstrumentKey` into an `EntryKey` to probe with.
+**That translation cannot be made faithfully.** An `InstrumentKey` names an
+instrument the way an exchange master does — an underlying plus a `Kind`, so a
+futures contract is `(ABB, Future{expiry})`. A manifest entry names it the way the
+*store* does: whatever string the pull plan called it.
+
+On this operator's disk that is `ABB-III`, segment `FNO` — a vendor archive's own
+continuous-contract spelling, in which `III` is a position in a roll and not an
+expiry. Verified at the byte level against `~/.brutex/store/manifest/dhan.man`:
+**194 entries, every one `exchange=NSE, segment=FNO`, zero `INDEX`**, 62,978 rows
+in total.
+
+So `entry_key` returned `None` for every future and option, the axis filtered
+itself down to spot indices, and the probes that were issued asked about
+`(NSE, INDEX, NIFTY)` — a key nothing had ever written. Every cell missed. This
+is not a display bug: it is the page answering a question about the master while
+claiming to describe the store.
+
+### The decision
+
+**The axis is the union of what the censuses hold and what the engine sweeps.**
+
+- `pull::manifest::Manifest::held_keys` enumerates the index — a census that
+  cannot be enumerated can only confirm a guess.
+- `api::census::Series` is an `EntryKey` with the month dropped: the store's own
+  spelling, so the axis and the probes are the same values and a miss means *not
+  held* rather than *not askable*. It renders as `NSE-FNO-ABB-III`.
+- `api::census::held_series` unions the held keys with `NSE-INDEX-NIFTY` and
+  `NSE-INDEX-BANKNIFTY`, sorts, and dedups. The swept pair is always present
+  because `CLAUDE.md` §1 fixes the engine surface at exactly those two and their
+  absence is the single most important thing this page can report — before the
+  first ingest a blank grid would say nothing where "two rows, neither held" says
+  what to do next.
+- A vendor whose manifest is absent or unreadable contributes nothing and invents
+  nothing. `VendorCensus::note` is separately loud about why.
+
+Computed once in `Site::new`, for the same reason D-0039 moved the censuses
+there. Cost recorded in `docs/06-limits.md` §32.
+
+### Verified against the real store
+
+`62978 row(s) across 194 committed entr(ies)` · `7056 instrument-month(s)` ·
+page 1 showing **`4 of 200` held** — `NSE-FNO-ABB-III`, `ABCAPITAL-III`,
+`ADANIENSOL-III`, `ADANIENT-III`, each at `2025-07` — with `NSE-INDEX-NIFTY` and
+`NSE-INDEX-BANKNIFTY` correctly shown as not held.
+
+---
+
+## D-0049 · 2026-08-07 · A bar's seven fields come from one JSON object, named by the descriptor's `envelope`
+
+`crates/pull/src/http.rs`.
+
+Each of the seven fields used to resolve itself: look at the top level, and
+failing that search **every** value one level down for a key of that name, taking
+the first hit. The intent was to tolerate a vendor that wraps its payload in a
+`data` object, and with exactly one such object it worked.
+
+**With two it silently spliced them.** `{"cached":{…},"live":{…}}` — or a primary
+beside a fallback, or two exchanges in one answer — resolves `open` against
+whichever object `serde_json` yields first and `close` against whichever holds a
+key of that name, and those need not be the same object. `serde_json`'s default
+map is sorted, so which object won was decided by **alphabetical order of the
+wrapper keys**: stable, and stably wrong.
+
+Nothing downstream could catch it. The seven-array length check passes when both
+objects hold the same number of bars, which is exactly when two such objects
+appear together, so the result is a window of well-formed bars that no vendor ever
+quoted, landing on disk looking exactly like a real one.
+
+**`ResponseShape::{ParallelArrays, ArrayOfObjects}` have carried an `envelope`
+field all along and the decoder ignored it.** It is now the answer: one container
+resolved once, all seven fields read from it, no fallback and no second place to
+look.
+
+`envelope` for both brokers in this build is **UNVERIFIED against a live body** —
+no vendor has been reached from this process yet. If it is wrong the refusal names
+the key expected *and lists the keys actually present*, which is a one-row diff in
+`crate::vendor` to fix. Guessing instead is what produced the splice.
+
+---
+
+## D-0050 · 2026-08-07 · The vendor client does not follow redirects, because the credential travels in a header no HTTP client knows to strip
+
+`crates/pull/src/http.rs`.
+
+`reqwest` follows up to ten redirects by default. On a cross-origin hop it strips
+the headers it considers sensitive — `Authorization`, `Cookie`,
+`Proxy-Authorization`, `WWW-Authenticate`. **It has no way to know that this
+vendor's credential is not one of those.**
+
+Dhan's descriptor names its credential header `access-token` with
+`AuthScheme::Raw`. That is a custom header like any other, so a `302` from the
+bars endpoint would have put a live broker token on a socket to whatever host the
+`Location` named, and the strip list would not have fired because the name is not
+on it. No log, no counter, no failure. Groww's is `Authorization` and *is*
+stripped — but only cross-origin: a redirect to another path on a host that has
+been taken over still carries it.
+
+**`Policy::none`.** Nothing legitimate is lost: `bars_path` is a fixed path on a
+fixed `base_url` in the descriptor, and a broker's historical-bars endpoint
+answering 3xx is not a route change this build should silently chase. The 3xx
+comes back as a response, `is_success` is false, and it becomes
+`FetchError::VendorRefused` carrying the status — so the operator sees `302`, the
+`Location`, and a sentence saying why it was not followed, and decides.
+`CLAUDE.md` §4: degrade loudly and name the reason, never both silently.
+
+Proved over two real loopback sockets: the origin answers `302` pointing at a
+second listener, the origin **is** sent the token (or the test would prove
+nothing), and the second listener is **never connected to**. Confirmed to fail
+with the policy removed.

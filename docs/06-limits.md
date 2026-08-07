@@ -2096,3 +2096,74 @@ Two more were removed rather than tested, in `normal.rs`: `x > 0.0` appeared
 twice where `x` can never be zero — once past the saturating tail, once where
 `upper` is exactly `0.5` at zero and both arms return the same number. Both are
 now written as a question about the **sign**, which has no boundary at all.
+
+## 30. There is no incremental type-ahead on the symbol fields, and there cannot be one
+
+Referenced by `crates/api/src/render.rs` since the `<datalist>` was removed and
+**not written until now** — a pointer to a section that did not exist is exactly
+the kind of quiet gap this file is for.
+
+A `<datalist>` over the ~750-symbol universe was put on the instruments search
+box and the F&O underlying so that typing would narrow the choices. It does
+narrow. It also made **Chrome open the full list on focus, before a single
+character is typed**, and draw a `▼` beside the field — so it read as a dropdown
+of 750 items, which is the shape it was meant to replace. Suppressing the
+indicator with `::-webkit-calendar-picker-indicator` removed the arrow and did
+not stop the focus behaviour: that popup belongs to the browser, not to the page,
+and no CSS or attribute cancels it.
+
+Three ways to get true type-to-filter, and only one is available here:
+
+1. A script filtering a list on each keystroke. `CLAUDE.md` §2 forbids it, and
+   four tests assert `<script>` never appears in any page this server emits.
+2. A server round-trip per keystroke. Also needs a script to fire it.
+3. A server round-trip on **submit**: type a symbol, press Enter, get matches.
+
+Option 3 already existed on the instruments page and always had — the
+`method="get"` form searches the whole universe rather than the rendered page,
+and its result is a linkable, reloadable URL. **So: there is no incremental
+type-ahead on this surface, and there will not be one while §2 stands.**
+
+## 31. The calendar's month arrows do not cross a year boundary
+
+`crates/api/src/calendar.rs`. The day pane's header is `‹ August 2026 ›` and the
+arrows are `<label>`s for the neighbouring month's radio. **A `<label>` drives
+exactly one control.** Stepping from January back to December would have to check
+`m12` *and* the previous year's radio — two controls on one click, which no
+markup expresses and which `CLAUDE.md` §2 forbids solving with a script.
+
+So January's `‹` and December's `›` are inert spans, greyed and
+`pointer-events:none`, rather than labels that would silently do the wrong thing.
+The header title between them clears the month and drops to the month pane, whose
+own title clears the year and drops to the year pane, so **changing year is two
+clicks and is always available.** Asserted by
+`calendar::tests::the_arrows_step_one_month_and_do_not_cross_a_year_boundary`.
+
+This is a limit of the no-script constraint, not an oversight, and the cost is
+one extra click on 2 of the 12 months.
+
+## 32. `census::held_series` is O(keys log keys), and it is the only thing on `/store` that is not O(1)
+
+`crates/api/src/census.rs`, and `pull::manifest::Manifest::held_keys` beneath it.
+
+The coverage grid's instrument axis is now read out of the censuses rather than
+out of the instrument master (D-0048), which means enumerating every key each
+manifest holds and sorting them. That is **O(keys) to collect and O(keys log keys)
+to sort**, and no arrangement of a hash index makes it less.
+
+**It is not on a request path.** `api::server::Site::new` computes it once at
+startup, beside the `Manifest::open` that is already O(entries) and the master
+read that measured 150 ms per request when it was wrongly per-request (D-0039).
+Every `/store` request is then ordinal arithmetic into that vector plus one hash
+probe per cell, unchanged.
+
+The sort is not an optimisation and cannot be dropped: the pager addresses a row
+by **ordinal**, and `HashMap` iteration order is not stable between runs, so an
+unsorted axis would put a different instrument on page 3 after every restart and
+two reloads would disagree about what is held.
+
+**What is not bounded:** the axis grows with the store. At the 194 series on the
+operator's disk today the sort is immeasurable; at the ~248,000 entries
+`docs/07-o1-architecture.md` uses as its scale figure it would be a startup cost
+of the same order as the manifest load itself, which is already accepted there.
+**That has not been measured**, and this file does not claim it has.

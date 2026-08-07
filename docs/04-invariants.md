@@ -418,6 +418,34 @@ Added by D-0038. Every row here is proven by a test that runs today.
 | A-13 | The coverage grid is addressed by ordinal arithmetic, so a page builds only the rows it shows | `api::census::the_grid_is_addressed_by_arithmetic_and_pages_without_building_the_rest` | ✓ |
 | A-14 | A page past the end of the grid clamps to the last page rather than erroring or emptying | `api::server::the_store_page_reads_zero_as_zero_and_pages_past_the_end_by_clamping` · `api::server::the_store_grid_pages_when_it_is_larger_than_one_page` | ✓ |
 | A-15 | A nav entry for a page that does not exist is shown disabled, never hidden and never linked | `api::server::the_server_answers_every_route_and_then_shuts_down_gracefully` | ✓ |
+| A-16 | The coverage grid's axis is the store's own vocabulary, so a manifest holding only F&O futures still reaches the grid — rows held and cells held cannot disagree about an empty store | `api::census::a_store_of_nothing_but_futures_still_reaches_the_grid` | ✓ |
+| A-17 | A census that is absent or unreadable contributes no series to the axis and invents none; two vendors holding one series contribute one row | `api::census::an_unloadable_census_adds_nothing_to_the_axis` | ✓ |
+| A-18 | The two swept series are always on the axis, held or not, so a fresh install names what it is missing | `api::census::a_store_of_nothing_but_futures_still_reaches_the_grid` · `api::server::a_site_with_no_universe_still_shows_the_two_instruments_that_matter` | ✓ |
+| A-19 | A series renders as the store names it, and `Series::of` and `Series::at` are inverses, so the axis and the probe are the same values | `api::census::a_series_reads_back_as_the_store_names_it` | ✓ |
+| A-20 | No page this server emits contains a script, and the date picker — the widget most tempted to need one — contains none either | `api::render::the_page_contains_no_script_at_all` · `api::calendar::nothing_the_picker_emits_is_a_script` | ✓ |
+| A-21 | At most one date panel per form can be open, so two panels cannot overlap at any viewport | `api::calendar::the_latch_is_a_radio_so_two_panels_cannot_be_open_at_once` | ✓ |
+| A-22 | Exactly one pane of the picker is shown at a time, chosen by which radios are checked and by no extra control | `api::calendar::three_panes_are_emitted_and_the_year_pane_is_the_one_with_no_prerequisite` | ✓ |
+| A-23 | A month arrow steps exactly one month and never crosses a year boundary; the two that would are inert spans, not labels | `api::calendar::the_arrows_step_one_month_and_do_not_cross_a_year_boundary` | ✓ |
+| A-24 | No control in the picker is `required`, because an unfocusable `required` control blocks submission in silence | `api::calendar::no_control_in_the_picker_is_required` · `api::server::the_pickers_do_not_block_submission_and_do_not_close_on_their_own_chrome` | ✓ |
+| A-25 | Nothing later than a field's ceiling can be clicked — not a day, and not a month in the ceiling's own year | `api::calendar::the_computed_rules_cover_alignment_the_month_end_and_the_ceiling` | ✓ |
+| A-26 | The picker never offers a year no `Day` can hold | `api::calendar::the_offered_span_ends_at_the_cap_and_is_twelve_years_long` | ✓ |
+
+## The vendor socket
+
+Added by D-0049 and D-0050. `crates/pull/src/http.rs` is the only code in this
+repository that reaches a broker, so every row here is about a bar that must not
+be invented and a credential that must not travel.
+
+| # | Must hold | Proven by | |
+|---|---|---|---|
+| H-01 | Every one of a bar's seven fields is read from the **one** object the descriptor's `envelope` names, so a bar can never be assembled from two different JSON objects | `pull::http::one_bar_can_never_be_assembled_from_two_different_objects` | ✓ |
+| H-02 | With no envelope declared, the top level is the only place looked; a wrapped body is refused rather than rummaged through | `pull::http::no_envelope_means_the_top_level_and_nowhere_else` | ✓ |
+| H-03 | A declared envelope the answer does not carry is refused naming the key expected **and** the keys present, so a wrong descriptor is a one-row diff | `pull::http::a_missing_envelope_names_the_key_expected_and_the_keys_present` | ✓ |
+| H-04 | Arrays under a declared envelope are found, and only there | `pull::http::arrays_under_the_declared_envelope_are_found` | ✓ |
+| H-05 | A redirect is never followed, so the credential never reaches a host the descriptor did not name — proven over two real sockets, and confirmed to fail without the policy | `pull::http::a_redirect_is_refused_and_the_token_never_reaches_its_target` | ✓ |
+| H-06 | A redirect is reported as `VendorRefused` carrying its status, the `Location`, and the reason — never silently, and never carrying the credential | `pull::http::a_redirect_is_refused_and_the_token_never_reaches_its_target` | ✓ |
+| H-07 | An ordinary refusal still carries the vendor's own words and its own status, so a 429 stays distinguishable from a 500 | `pull::http::a_non_redirect_refusal_carries_the_body_and_its_status` | ✓ |
+| H-08 | The credential never appears in a `Debug` rendering, and the blocking seam refuses by name rather than silently blocking | `pull::http::the_sync_seam_refuses_and_the_token_is_never_printed` | ✓ |
 
 ## Cross-cutting
 
