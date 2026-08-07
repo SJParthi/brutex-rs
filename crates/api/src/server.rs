@@ -730,28 +730,35 @@ async fn health(
 ///
 /// # What is true
 ///
-/// `pull::fetch` exists and is the transport seam; `pull::rate::Governor`
-/// exists and D-0037 is its decision. What does not exist is an **HTTP
-/// implementation of [`pull::fetch::BarSource`]** — the only implementor in
-/// this build is `pull::fetch::FakeSource`, and `crates/pull/Cargo.toml`
-/// declares no HTTP client — so no socket can be opened from here. The
-/// local-archive half needs none of that and runs for real.
+/// `pull::fetch` is the transport seam and `pull::rate::Governor` is D-0037's
+/// adaptive governor; both exist. `crates/pull/src/http.rs` now exists too, and
+/// `crates/pull/Cargo.toml` declares `reqwest` — **so a socket can be opened
+/// from this process for the first time.** What is still missing is the wiring:
+/// `HttpSource` is asynchronous and the `/pull` route is synchronous, so the
+/// route does not call it and no credential has yet been read on this path.
+///
+/// The distinction matters and the banner must keep it. "There is no socket"
+/// and "there is a socket nothing calls" are different states, and an operator
+/// who is told the first when the second is true will look in the wrong place.
 ///
 /// The claim is checkable rather than taken: every name in it is a path, and
 /// `api::server::tests::the_ingest_page_names_what_exists_and_what_does_not` is
-/// what stops it going stale silently a second time.
-pub const HTTP_UNAVAILABLE: &str = "THE LOCAL-ARCHIVE PATH RUNS AND THE HTTP \
-     PATH DOES NOT EXIST. crates/pull/src/fetch.rs and crates/pull/src/rate.rs \
-     are both present — pull::fetch::BarSource is the transport seam and \
-     pull::rate::Governor is the adaptive governor of D-0037 — but the only \
-     implementor of BarSource in this build is pull::fetch::FakeSource, and \
-     crates/pull/Cargo.toml declares no HTTP client, so no socket can be opened \
-     from this process. A spot pull that names a local vendor folder therefore \
-     RUNS: it reads the files, writes bar files and records the manifest, and \
-     the counters below are that run's. A spot pull with the folder left blank, \
-     and every expired-F&O request, is understood, echoed back with the exact \
-     dates that would go on the wire, and then REFUSED with 503 — no vendor is \
-     contacted and nothing is written.";
+/// what stops it going stale silently a second time — which is exactly what it
+/// caught when `reqwest` was added.
+pub const HTTP_UNAVAILABLE: &str = "THE LOCAL-ARCHIVE PATH RUNS. THE HTTP PATH \
+     IS BUILT BUT NOT YET WIRED TO THIS ROUTE. crates/pull/src/fetch.rs, \
+     crates/pull/src/rate.rs and crates/pull/src/http.rs are all present — \
+     pull::fetch::BarSource is the transport seam, pull::rate::Governor is the \
+     adaptive governor of D-0037, and pull::http::HttpSource is the vendor \
+     client, driven entirely by the descriptor in pull::vendor. What is missing \
+     is one join: HttpSource answers through window_async, this route is \
+     synchronous, and nothing here calls it — so no credential has been read \
+     and no vendor is contacted from this process. A spot pull that names \
+     a local vendor folder therefore RUNS: it reads the files, writes bar files \
+     and records the manifest, and the counters below are that run's. A spot \
+     pull with the folder left blank, and every expired-F&O request, is \
+     understood, echoed back with the exact dates that would go on the wire, \
+     and then REFUSED with 503 — nothing is written.";
 
 /// Everything every request renders from, read once at startup.
 ///
@@ -2999,17 +3006,40 @@ mod tests {
         );
         assert!(!html.contains("method=\"get\""), "and never a GET: {html}");
 
-        // THE DATE FIELDS ARE PLAIN TEXT IN ISO, NOT `type=date`, and the
-        // assertion changed with the code rather than being deleted.
-        // `type=date` renders in the BROWSER'S LOCALE — macOS showed
-        // `dd/mm/yyyy` — while TradingView, Dhan and the vendor wire all use
-        // `2026-08-01`. Worse, `01/07/2025` is ambiguous, and this codebase has
-        // already been bitten by exactly that reading GDFL.
+        // EVERY DATE FIELD IS A CLICKABLE MONTH GRID, and the assertion changed
+        // with the code rather than being deleted — twice now.
+        //
+        // `type=date` was first and renders in the BROWSER'S LOCALE — macOS
+        // showed `dd/mm/yyyy`, and `01/07/2025` is 1 July here and 7 January in
+        // half the world, an ambiguity this codebase has already been bitten by
+        // reading GDFL. A text box with `placeholder="YYYY-MM-DD"` was second
+        // and fixed the ambiguity by making the operator type, which is not a
+        // fix. Third is `api::calendar`: a grid you click, rendered here.
+        assert_eq!(
+            html.matches("class=\"readout\"").count(),
+            5,
+            "two on the spot form, three on the F&O form, all clickable"
+        );
         assert_eq!(
             html.matches("placeholder=\"YYYY-MM-DD\"").count(),
-            5,
-            "two on the spot form, three on the F&O form, all unambiguous"
+            0,
+            "nobody types a date on this page any more"
         );
+        // THE IDS MUST BE UNIQUE. Both forms have a field called `from`, and an
+        // id is document-wide — so a collision would silently point the spot
+        // picker's label at the F&O picker's checkbox and clicking one would
+        // open the other. Counted rather than eyeballed.
+        {
+            let mut ids: Vec<&str> = html
+                .match_indices("id=\"o-")
+                .filter_map(|(i, _)| html[i + 4..].split('"').next())
+                .collect();
+            let total = ids.len();
+            ids.sort_unstable();
+            ids.dedup();
+            assert_eq!(ids.len(), total, "two pickers share an id: {ids:?}");
+            assert_eq!(total, 5, "one popover latch per date field");
+        }
         assert_eq!(
             html.matches("type=\"date\"").count(),
             0,
@@ -3043,7 +3073,7 @@ mod tests {
         // the claim is checkable, so the test can hold it to being true.
         assert!(html.contains("ARCHIVE ONLY"), "{html}");
         assert!(
-            html.contains("THE LOCAL-ARCHIVE PATH RUNS AND THE HTTP PATH DOES NOT EXIST"),
+            html.contains("THE LOCAL-ARCHIVE PATH RUNS. THE HTTP PATH IS BUILT BUT NOT YET WIRED"),
             "{html}"
         );
         assert!(
@@ -3051,8 +3081,9 @@ mod tests {
             "the stale claim must not come back: {html}"
         );
         assert!(
-            html.contains("FakeSource"),
-            "and the ONE implementor that does exist is named: {html}"
+            html.contains("pull::http::HttpSource"),
+            "and the client that now exists is named, so an operator knows \
+             where the missing join is: {html}"
         );
         assert!(
             !html.contains("<div class=\"cv\">0</div>"),
@@ -4011,15 +4042,22 @@ mod tests {
     /// about a file is checkable by looking at the file, so this looks.
     #[test]
     fn the_ingest_page_names_what_exists_and_what_does_not() {
-        // THE CLAIM: fetch.rs and rate.rs are present, FakeSource is the only
-        // implementor of BarSource, and crates/pull declares no HTTP client.
-        // Every one of those is a fact about a tracked file, so it is read
-        // rather than asserted from memory.
+        // THE CLAIM, IN ITS CURRENT FORM: fetch.rs, rate.rs and http.rs are all
+        // present; HttpSource answers through `window_async`; and the route
+        // does not call it. Every one of those is a fact about a tracked file,
+        // so it is read rather than asserted from memory.
+        //
+        // THIS TEST DID ITS JOB. The banner used to say "crates/pull declares
+        // no HTTP client", and the assertion below used to be
+        // `!manifest.contains("reqwest")`. Adding the dependency turned the
+        // sentence false and turned this test red in the same commit — which is
+        // the entire reason it exists. It was updated to the new truth, not
+        // deleted, and the new truth is narrower and therefore easier to break.
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("crates/")
             .join("pull");
-        for file in ["src/fetch.rs", "src/rate.rs"] {
+        for file in ["src/fetch.rs", "src/rate.rs", "src/http.rs"] {
             assert!(
                 root.join(file).is_file(),
                 "the banner claims crates/pull/{file} is present — it must be"
@@ -4030,25 +4068,29 @@ mod tests {
             fetch.contains("pub trait BarSource"),
             "the seam the banner names must be there"
         );
-        let implementors = [
-            "src/fetch.rs",
-            "src/ingest.rs",
-            "src/vendor.rs",
-            "src/work.rs",
-        ]
-        .into_iter()
-        .filter_map(|f| std::fs::read_to_string(root.join(f)).ok())
-        .map(|text| text.matches("impl BarSource for").count())
-        .sum::<usize>();
-        assert_eq!(
-            implementors, 1,
-            "the banner says FakeSource is the ONLY implementor; a second one \
-             makes that sentence false and this test is where it is caught"
-        );
         let manifest = std::fs::read_to_string(root.join("Cargo.toml")).expect("Cargo.toml");
         assert!(
-            !manifest.contains("reqwest"),
-            "the banner says crates/pull declares no HTTP client"
+            manifest.contains("reqwest"),
+            "the banner says the HTTP client is BUILT; the dependency must be \
+             declared for that to be true"
+        );
+        let http = std::fs::read_to_string(root.join("src/http.rs")).expect("http.rs");
+        assert!(
+            http.contains("pub async fn window_async"),
+            "the banner names window_async as the method that works"
+        );
+
+        // THE OTHER HALF, AND THE ONE THAT MATTERS MOST: this route must not
+        // call the vendor. A test that only checked the client exists would
+        // pass just as happily once the wiring landed, and the banner would
+        // then be telling an operator nothing is contacted while it was.
+        let me = std::fs::read_to_string(Path::new(file!()))
+            .or_else(|_| std::fs::read_to_string("crates/api/src/server.rs"))
+            .unwrap_or_default();
+        assert!(
+            !me.contains("HttpSource::new"),
+            "the banner says this route never contacts a vendor; constructing \
+             an HttpSource here makes that false"
         );
 
         // AND THE PAGE SAYS EXACTLY THAT, with none of the old sentence left.
@@ -4057,8 +4099,8 @@ mod tests {
         let html = pull_html(&site, day(2026, 8, 7));
         assert!(html.contains("crates/pull/src/fetch.rs"), "{html}");
         assert!(html.contains("crates/pull/src/rate.rs"), "{html}");
-        assert!(html.contains("pull::fetch::FakeSource"), "{html}");
-        assert!(html.contains("declares no HTTP client"), "{html}");
+        assert!(html.contains("crates/pull/src/http.rs"), "{html}");
+        assert!(html.contains("no credential has been read"), "{html}");
         for stale in [
             "no vendor fetch and",
             "there is no pull::fetch",

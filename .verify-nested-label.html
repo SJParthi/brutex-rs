@@ -1,0 +1,35 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>nested label repro</title>
+<style>
+.pick{position:relative;display:block}
+.pick input{position:absolute;opacity:0;width:0;height:0;pointer-events:none}
+.readout{display:flex;gap:6px;cursor:pointer;padding:10px 13px;border:1px solid #999;border-radius:11px}
+.cal{display:none;position:absolute;z-index:40;top:calc(100% + 8px);left:0;min-width:290px;background:#fff;border:1px solid #999;border-radius:15px;padding:12px}
+.popopen:checked~.cal{display:block}
+.cal .dow{display:grid;grid-template-columns:repeat(7,1fr);gap:3px}
+.cal .dow span{text-align:center;font-size:10px;padding:3px 0}
+.cal .pad{display:grid;grid-template-columns:repeat(7,1fr);gap:3px}
+.cal .pad label{cursor:pointer;text-align:center;padding:7px 0}
+.field{margin:0 0 12px}
+.field>span{display:block;font-size:10.5px}
+</style>
+<label class="field"><span>From (inclusive)</span><div class="pick cap20260807">
+<input type="checkbox" id="o-sfrom" class="popopen">
+<label class="readout" for="o-sfrom"><span class="v-ph">Pick a date</span><span class="v-ico">R</span></label>
+<div class="cal">
+ <div class="strip yr">
+  <input type="radio" name="from_y" id="sfromy2026" value="2026" class="y2026" required><label for="sfromy2026">2026</label>
+ </div>
+ <div class="strip mo">
+  <input type="radio" name="from_m" id="sfromm8" value="8" class="m8" required><label for="sfromm8">Aug</label>
+ </div>
+ <div class="dow"><span>Mo</span><span>Tu</span><span>We</span><span>Th</span><span>Fr</span><span>Sa</span><span>Su</span></div>
+ <div class="pad">
+  <input type="radio" name="from_d" id="sfromd1" value="1" class="d1" required><label for="sfromd1" class="c1">1</label>
+  <input type="radio" name="from_d" id="sfromd2" value="2" class="d2" required><label for="sfromd2" class="c2">2</label>
+ </div>
+ <p class="calnote">Latest that can be asked for: <b>2026-08-07</b>.</p>
+</div>
+</div></label>
+<pre id="log"></pre>

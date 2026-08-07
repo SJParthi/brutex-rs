@@ -401,15 +401,63 @@ pub fn parse_day(field: &'static str, text: &str) -> Result<Day, Refusal> {
     })
 }
 
+/// One date field, however the client chose to send it.
+///
+/// **Two spellings, one parser.** The calendar in [`crate::calendar`] posts three
+/// integers — `{field}_y`, `{field}_m`, `{field}_d` — because that is what keeps
+/// a no-script picker down to 55 controls instead of 4,464. A hand-built POST,
+/// `curl`, and every test written before the picker existed send the whole
+/// `{field}=YYYY-MM-DD`. Both arrive here.
+///
+/// The triple is **composed into the ISO string and handed to [`parse_day`]**
+/// rather than validated separately. That is the point: one definition of what a
+/// date is, so the picker cannot be accepted by rules the wire form is not, and
+/// `Day::new` still owns the leap year. Zero-padding on the way in also means a
+/// client that posts `m=8` and one that posts `m=08` get the same answer.
+///
+/// ISO wins when both are present — it is the explicit form, and the picker
+/// never sends it.
+///
+/// # Errors
+///
+/// [`Refusal::FieldMissing`] when neither spelling is present, and whatever
+/// [`parse_day`] refuses — including a triple with a piece missing, which
+/// composes to something that is not a date and is refused as one.
+pub fn parse_day_field(body: &str, field: &'static str) -> Result<Day, Refusal> {
+    let iso = param(body, field);
+    if !iso.is_empty() {
+        return parse_day(field, &iso);
+    }
+    let (y, m, d) = (
+        param(body, &format!("{field}_y")),
+        param(body, &format!("{field}_m")),
+        param(body, &format!("{field}_d")),
+    );
+    if y.is_empty() && m.is_empty() && d.is_empty() {
+        return Err(Refusal::FieldMissing { field });
+    }
+    // Padded so `8` and `08` mean the same August, then parsed by the one
+    // parser. A piece that is not a number stays un-padded and fails the width
+    // check inside `parse_day`, which is where a malformed date belongs.
+    let pad = |text: &str, width: usize| -> String {
+        text.parse::<u16>()
+            .map_or_else(|_| text.to_owned(), |n| format!("{n:0width$}"))
+    };
+    parse_day(
+        field,
+        &format!("{}-{}-{}", pad(&y, 4), pad(&m, 2), pad(&d, 2)),
+    )
+}
+
 /// The operator's inclusive window, from the two date fields both forms carry.
 ///
 /// # Errors
 ///
-/// Whatever [`parse_day`] refuses, [`Refusal::WindowBackwards`], or
+/// Whatever [`parse_day_field`] refuses, [`Refusal::WindowBackwards`], or
 /// [`Refusal::WindowTooLong`].
 pub fn parse_window(body: &str, today: Day) -> Result<Window, Refusal> {
-    let from = parse_day("from", &param(body, "from"))?;
-    let to = parse_day("to", &param(body, "to"))?;
+    let from = parse_day_field(body, "from")?;
+    let to = parse_day_field(body, "to")?;
     let window = Window::new(from, to).map_err(|why| Refusal::WindowBackwards { why })?;
     let days = window.days();
     if days > MAX_WINDOW_DAYS {
@@ -489,7 +537,7 @@ pub fn parse_fno(body: &str, today: Day) -> Result<FnoRequest, Refusal> {
     }
     let series = Series::from_slug(&raw).ok_or(Refusal::UnknownSeries { got: raw })?;
 
-    let expiry = parse_day("expiry", &param(body, "expiry"))?;
+    let expiry = parse_day_field(body, "expiry")?;
     // THE GATE. Strictly behind today: a contract expiring today is still
     // trading today, and `CLAUDE.md` §8's argument about a fall-back applies
     // here too — `<=` would admit exactly the case the rule exists to exclude.

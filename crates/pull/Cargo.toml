@@ -36,6 +36,16 @@ brutex_core = { path = "../core", package = "core", version = "0.1.0" }
 # reuse.
 store = { path = "../store", version = "0.1.0" }
 
+# THE SOCKET. Taken now and not before, because until this change nothing in
+# this crate could reach a vendor: `pull::fetch::BarSource` had exactly one
+# implementor and it answered from memory. `default-features = false` with
+# `rustls-tls` keeps OpenSSL and its C toolchain out — CLAUDE.md section 2
+# bans a vendored binding to another language, and CI gate 13 walks Cargo.lock
+# for exactly that.
+reqwest = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+
 [lints]
 workspace = true
 

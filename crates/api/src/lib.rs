@@ -29,6 +29,7 @@
 #![forbid(unsafe_code)]
 
 pub mod audit;
+pub mod calendar;
 pub mod catalog;
 pub mod census;
 pub mod ingest;

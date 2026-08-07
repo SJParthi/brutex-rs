@@ -30,6 +30,7 @@
 //! because they are never touched.
 
 use crate::audit::{DROP_REASONS, Drops};
+use crate::calendar;
 use crate::census::{Coverage, VendorCensus};
 use crate::ingest::{Series, SpotTarget};
 use brutex_core::instrument::{InstrumentKey, Kind};
@@ -80,6 +81,7 @@ input[type=text]{font:inherit;padding:10px 14px;border:1px solid var(--line);bor
 min-width:min(24rem,100%);background:var(--panel);color:var(--ink);box-shadow:var(--sh);\
 transition:border-color .2s,box-shadow .2s}\
 input[type=text]:focus{outline:0;border-color:var(--acc);box-shadow:0 0 0 4px color-mix(in srgb,var(--acc) 18%,transparent)}\
+input[list]::-webkit-calendar-picker-indicator{display:none!important;opacity:0;width:0;height:0}\
 button{font:inherit;font-weight:700;padding:10px 20px;border:0;border-radius:11px;cursor:pointer;\
 background:linear-gradient(135deg,var(--acc),var(--acc2));color:#fff;\
 box-shadow:0 5px 16px color-mix(in srgb,var(--acc) 34%,transparent);transition:transform .2s,box-shadow .2s}\
@@ -842,12 +844,14 @@ pub fn instruments_page(view: &View<'_>) -> String {
     let _ = write!(
         body,
         "<form method=\"get\" action=\"/instruments\">\
-         <input type=\"text\" name=\"q\" placeholder=\"NIFTY, BANKNIFTY, RELIANCE…\" \
-         value=\"{}\" autofocus>\
+         <input type=\"text\" name=\"q\" list=\"all-syms\" autocomplete=\"off\" \
+         placeholder=\"start typing — NIFTY, BANKNIFTY, RELIANCE…\" \
+         value=\"{}\" autofocus>{}\
          <button type=\"submit\">Search</button>\
          <a href=\"/instruments\">clear</a>\
          <a href=\"/instruments?all={}\">{}</a></form>",
         escape(query),
+        suggestions("all-syms", &brutex_core::universe::NIFTY_TOTAL_MARKET),
         u8::from(!all),
         if all {
             "show tracked only (NIFTY Total Market + indices)"
@@ -954,13 +958,25 @@ pub fn instruments_page(view: &View<'_>) -> String {
 /// Extracted because three pages now open identically, and three copies of a
 /// `<head>` is three places for a `<meta viewport>` to go missing from one.
 fn open(title: &str, current: &str) -> String {
-    let mut out = String::with_capacity(STYLE.len() + 512);
+    open_with(title, current, "")
+}
+
+/// [`open`], plus a stylesheet only one page needs.
+///
+/// The ingest page carries the picker's geometry — one rule per (year, month)
+/// offered, computed by [`calendar::dynamic_css`] because CSS cannot work out
+/// which column a 1st falls in. It is emitted **only there**: the store and
+/// audit pages have no date fields, and shipping a few thousand unused
+/// selectors to them would be paying for a widget they do not draw.
+fn open_with(title: &str, current: &str, extra: &str) -> String {
+    let mut out = String::with_capacity(STYLE.len() + extra.len() + 512);
     out.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">");
     out.push_str("<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">");
     out.push_str("<title>");
     out.push_str(&escape(title));
     out.push_str("</title><style>");
     out.push_str(STYLE);
+    out.push_str(extra);
     out.push_str("</style></head><body>");
     out.push_str(&nav(current));
     out
@@ -1206,35 +1222,62 @@ fn field(label: &str, control: &str) -> String {
     )
 }
 
-/// A `YYYY-MM-DD` input, capped at `max`.
-fn date_input(name: &str, max: Day) -> String {
-    // A TEXT INPUT, NOT `type="date"`, AND THAT IS THE WHOLE POINT.
-    //
-    // `<input type="date">` renders in the BROWSER'S LOCALE, which this server
-    // cannot influence: on macOS it showed `dd/mm/yyyy` behind a native
-    // year-scroll widget. TradingView shows `2026-08-01`. Dhan shows
-    // `2026-08-01`. The vendor wire takes `2026-08-01`. Three out of four
-    // agreed and the fourth was the one the operator had to type into.
-    //
-    // Worse than merely inconsistent: the displayed order was *ambiguous*.
-    // `01/07/2025` is 1 July here and 7 January in half the world, and this
-    // codebase has already been bitten by exactly that ambiguity once — GDFL
-    // writes `DD/MM/YYYY` and reading it the other way shifts every bar by
-    // months into a file that is internally consistent and completely wrong.
-    // A form that renders the same ambiguity is the same defect one layer up.
-    //
-    // `pattern` is a courtesy and `parse_day` is the rule: the server splits
-    // ten characters into three integers and hands them to `Day::new`, which
-    // owns every calendar rule. A hand-built POST is refused by the same check
-    // that greys the field.
-    format!(
-        "<input type=\"text\" name=\"{}\" value=\"\" placeholder=\"YYYY-MM-DD\" \
-         pattern=\"\\d{{4}}-\\d{{2}}-\\d{{2}}\" maxlength=\"10\" \
-         title=\"ISO 8601, the same shape TradingView, Dhan and the vendor wire \
-         all use: {max} is the latest that can be asked for\" \
-         inputmode=\"numeric\" required>",
-        escape(name)
-    )
+/// A date field, as a clickable month grid capped at `max`.
+///
+/// # Three shapes tried, and why this is the third
+///
+/// `<input type="date">` came first and was wrong: it renders in the *browser's*
+/// locale, which this server cannot influence, and on this operator's machine
+/// that was `dd/mm/yyyy`. `01/07/2025` is 1 July here and 7 January in half the
+/// world — and this codebase has already been bitten by exactly that ambiguity,
+/// because GDFL writes `DD/MM/YYYY` and reading it the other way shifts every
+/// bar by months into a file that is internally consistent and totally wrong.
+///
+/// A plain text box with `placeholder="YYYY-MM-DD"` came second. It fixed the
+/// ambiguity by making the operator **type**, which is not a fix. Dhan puts a
+/// month grid on screen and you click a number; so does `TradingView`.
+///
+/// So: a month grid, rendered here, in HTML and CSS with no script — see
+/// [`crate::calendar`] for how, and for why the absence of a script is a
+/// property rather than a limitation.
+///
+/// `form` scopes the element ids. **Both forms on the ingest page have a field
+/// called `from`**, and an `id` is document-wide — so without the prefix the
+/// spot picker's label would carry `for="o-from"` and toggle whichever checkbox
+/// the browser found first, which is the F&O one. The `name` stays unprefixed,
+/// because that is what the server reads.
+fn date_input(form: &str, name: &str, max: Day) -> String {
+    calendar::picker(name, &format!("{form}{name}"), max)
+}
+
+/// A type-ahead list for a text input, from a compile-time table.
+///
+/// # Why this is a list and not a dropdown
+///
+/// The F&O underlying is one of 213 symbols and the instrument search runs over
+/// 750. Both are far too many to scroll and far too easy to get one character
+/// wrong, so neither a `<select>` nor a bare text box is right. `<datalist>` is
+/// the element that is neither — **start typing and only the matches appear** —
+/// and the browser does the filtering, which is why this needs no script.
+///
+/// **One correction that mattered.** Chrome renders a `▼` indicator beside any
+/// `list=` input and dumps *every* option when it is clicked, which is exactly
+/// the dropdown this is not supposed to be. [`STYLE`] suppresses that indicator,
+/// so suggestions appear on typing and not before. Firefox shows no indicator at
+/// all and needs nothing.
+///
+/// The source is `brutex_core::universe`, a `const` array, so what the field
+/// offers is exactly what [`crate::ingest::parse_fno`] will accept. A separate
+/// hand-kept list would drift, and the drift would surface as a suggestion the
+/// server then refuses.
+fn suggestions(id: &str, items: &[&str]) -> String {
+    let mut out = String::with_capacity(items.len() * 24 + 32);
+    let _ = write!(out, "<datalist id=\"{}\">", escape(id));
+    for item in items {
+        let _ = write!(out, "<option value=\"{}\">", escape(item));
+    }
+    out.push_str("</datalist>");
+    out
 }
 
 /// One run, as the page shows it.
@@ -1350,8 +1393,8 @@ fn pull_forms(view: &PullView<'_>) -> String {
     let _ = write!(
         out,
         "<div class=\"pair\">{}{}</div>",
-        field("From (inclusive)", &date_input("from", today)),
-        field("To (inclusive)", &date_input("to", today)),
+        field("From (inclusive)", &date_input("s", "from", today)),
+        field("To (inclusive)", &date_input("s", "to", today)),
     );
     // THE LOCAL-ARCHIVE FIELD. Half the vendors are not APIs — TrueData and
     // GDFL sell folders of CSVs — and that half needs no socket, no token and
@@ -1377,7 +1420,11 @@ fn pull_forms(view: &PullView<'_>) -> String {
     );
     out.push_str(&field(
         "Underlying",
-        "<input type=\"text\" name=\"underlying\" placeholder=\"NIFTY, BANKNIFTY, RELIANCE…\" required>",
+        &format!(
+            "<input type=\"text\" name=\"underlying\" list=\"fno-syms\" autocomplete=\"off\" \
+             placeholder=\"start typing — NIFTY, BANKNIFTY, RELIANCE…\" required>{}",
+            suggestions("fno-syms", &brutex_core::universe::FNO_UNDERLYINGS)
+        ),
     ));
     let mut series = String::with_capacity(128);
     for s in Series::ALL {
@@ -1396,13 +1443,13 @@ fn pull_forms(view: &PullView<'_>) -> String {
             "Series",
             &format!("<select name=\"series\" required>{series}</select>")
         ),
-        field("Expiry", &date_input("expiry", expiry_max)),
+        field("Expiry", &date_input("f", "expiry", expiry_max)),
     );
     let _ = write!(
         out,
         "<div class=\"pair\">{}{}</div>",
-        field("From (inclusive)", &date_input("from", expiry_max)),
-        field("To (inclusive)", &date_input("to", expiry_max)),
+        field("From (inclusive)", &date_input("f", "from", expiry_max)),
+        field("To (inclusive)", &date_input("f", "to", expiry_max)),
     );
     out.push_str("<button type=\"submit\">Start expired-series pull</button>");
     out.push_str("</form>");
@@ -1596,7 +1643,15 @@ fn journal_note(note: JournalNote<'_>) -> String {
 /// The ingest page: two forms, and an honest account of what this build can do.
 #[must_use]
 pub fn pull_page(view: &PullView<'_>) -> String {
-    let mut body = open("brutex · ingest", "/pull");
+    // The two ceilings this page actually uses, passed rather than assumed:
+    // today for spot, yesterday for anything carrying an expiry. Every picker
+    // shares the rules generated from them.
+    let caps = [view.today, yesterday(view.today)];
+    let mut body = open_with(
+        "brutex · ingest",
+        "/pull",
+        &format!("{}{}", calendar::CAL_STYLE, calendar::dynamic_css(&caps)),
+    );
     body.push_str(&hero(
         "NSE · SPOT AND EXPIRED F&O · POST ONLY",
         "Ingest,<br>on the record.",
