@@ -2207,6 +2207,36 @@ async fn bars_get(
     (code, axum::response::Html(body))
 }
 
+/// The `/bars` page with no rows on it, and the reason why.
+///
+/// Both of this route's refusals — a month that cannot be parsed and a vendor
+/// this build has no feed for — render the same shape, so they share it. A
+/// second copy is a second place for the two to drift into describing the
+/// store differently.
+fn bars_refusal(
+    site: &Site,
+    symbol: &str,
+    segment: &str,
+    vendor: &str,
+    trouble: &'static str,
+) -> (axum::http::StatusCode, String) {
+    (
+        axum::http::StatusCode::BAD_REQUEST,
+        render::bars_page(&render::BarsView {
+            symbol,
+            segment,
+            vendor,
+            month: "—",
+            rows: &[],
+            total: 0,
+            page: 0,
+            last_page: 0,
+            trouble: Some(trouble),
+            store_root: &site.store_root.display().to_string(),
+        }),
+    )
+}
+
 /// One month of bars, or a named refusal.
 ///
 /// Every failure arm here names what it looked for: an unreadable month must
@@ -2232,10 +2262,25 @@ pub fn bars_html(site: &Site, query: &str) -> (axum::http::StatusCode, String) {
             raw
         }
     };
-    let vendor = brutex_core::vendor::Vendor::ALL
-        .into_iter()
-        .find(|v| v.as_str() == param(query, "vendor"))
-        .unwrap_or(brutex_core::vendor::Vendor::Dhan);
+    // ONE PARSER, shared with the pull form. This route had its own copy that
+    // compared with `==` while `ingest::parse_vendor` used
+    // `eq_ignore_ascii_case`, so `?vendor=Groww` meant a different vendor here
+    // than there — one question, two answers, and BOTH silently fell back to
+    // Dhan. Being served Dhan's copy of a month after asking for Groww's, under
+    // HTTP 200, is the worst class of defect in this repository: a wrong answer
+    // wearing the shape of a right one.
+    let asked_vendor = param(query, "vendor");
+    let Some(vendor) = ingest::parse_vendor(&asked_vendor) else {
+        return bars_refusal(
+            site,
+            &symbol,
+            &segment,
+            "—",
+            "that is not a vendor this build has a feed for. Refused rather \
+             than answered from another vendor's prefix — a month served from \
+             the wrong feed looks exactly like the right one.",
+        );
+    };
     let page = page_number(query);
 
     let month = {
@@ -2245,22 +2290,14 @@ pub fn bars_html(site: &Site, query: &str) -> (axum::http::StatusCode, String) {
     };
 
     let Some(month) = month else {
-        return (
-            axum::http::StatusCode::BAD_REQUEST,
-            render::bars_page(&render::BarsView {
-                symbol: &symbol,
-                segment: &segment,
-                vendor: vendor.as_str(),
-                month: "—",
-                rows: &[],
-                total: 0,
-                page: 0,
-                last_page: 0,
-                trouble: Some(
-                    "no month was named. A bar file is addressed by                      (vendor, exchange, segment, symbol, timeframe, month) and                      the month is the one part that cannot be defaulted —                      ?month=2025-07",
-                ),
-                store_root: &site.store_root.display().to_string(),
-            }),
+        return bars_refusal(
+            site,
+            &symbol,
+            &segment,
+            vendor.as_str(),
+            "no month was named. A bar file is addressed by (vendor, exchange, \
+             segment, symbol, timeframe, month) and the month is the one part \
+             that cannot be defaulted — ?month=2025-07",
         );
     };
 

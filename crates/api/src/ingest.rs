@@ -241,6 +241,14 @@ pub enum Refusal {
         /// What arrived.
         got: String,
     },
+    /// A vendor was named, and it is not one this build has a feed for.
+    ///
+    /// Distinct from naming none at all, which still defaults — see
+    /// [`parse_vendor`] for why that half of the old behaviour is kept.
+    UnknownVendor {
+        /// What arrived.
+        got: String,
+    },
     /// The underlying is not a symbol this engine can even name.
     BadUnderlying {
         /// What arrived.
@@ -308,6 +316,12 @@ impl fmt::Display for Refusal {
             Self::UnknownSeries { ref got } => {
                 write!(f, "REFUSED · {got:?} is neither a future nor an option")
             }
+            Self::UnknownVendor { ref got } => write!(
+                f,
+                "REFUSED · {got:?} is not a vendor this build has a feed for. \
+                 Nothing was pulled rather than another vendor's bars being \
+                 filed under a prefix you did not ask for"
+            ),
             Self::BadUnderlying { ref got } => {
                 write!(f, "REFUSED · {got:?} is not a symbol this engine can name")
             }
@@ -516,29 +530,47 @@ pub fn parse_spot(body: &str, today: Day) -> Result<SpotRequest, Refusal> {
     Ok(SpotRequest {
         target,
         window: parse_window(body, today)?,
-        vendor: parse_vendor(&param(body, "vendor")),
+        vendor: {
+            let raw = param(body, "vendor");
+            parse_vendor(&raw).ok_or(Refusal::UnknownVendor { got: raw })?
+        },
     })
 }
 
-/// Which broker a request names, defaulting to the verified one.
+/// Which broker a request names: `None` when it named one this build cannot serve.
 ///
-/// # Why an unknown vendor is not a refusal
+/// # An UNNAMED vendor still defaults; a WRONGLY named one no longer does
 ///
-/// Every other field on this form refuses what it does not understand, and this
-/// one does not — deliberately. The vendor is a *route*, not a claim about the
-/// data: naming one that does not exist cannot corrupt anything, and the form
-/// offers a fixed list so the only way to send a wrong one is to hand-build the
-/// POST. Falling back is safe here in a way it is nowhere else on this page.
+/// The default when the field is absent is **Dhan**, because its descriptor is
+/// the one verified against a live body — defaulting to the unverified one
+/// would make a first-time operator debug a response shape nobody has
+/// confirmed. That half of the original reasoning is sound and is kept.
 ///
-/// The fallback is **Dhan** because its descriptor is the one verified against
-/// a live body. Groww's is not, and defaulting to the unverified one would make
-/// a first-time operator debug a response shape nobody has confirmed.
+/// The other half is not, and it was not wrong when it was written. It said:
+///
+/// > The vendor is a *route*, not a claim about the data: naming one that does
+/// > not exist cannot corrupt anything.
+///
+/// That was true while the vendor only chose which host to call. It stopped
+/// being true when `Plan.vendor` became the STORE PREFIX: bars land under
+/// `bars/<vendor>/…`, so coercing an unrecognised name to Dhan files one
+/// broker's prices under another's path — which `pull::vendor::Feed::store_vendor`
+/// documents as destroying D-0019's per-vendor independence irreversibly. The
+/// justification quietly outlived the fact it rested on.
+///
+/// The form offering a fixed list was the other prop under that argument, and
+/// `/bars` knocks it out: it is a GET whose vendor comes from a hand-typed
+/// query string with no list at all.
+///
+/// So: absent means Dhan and says so; present-but-unknown refuses by name.
 #[must_use]
-pub fn parse_vendor(raw: &str) -> brutex_core::vendor::Vendor {
+pub fn parse_vendor(raw: &str) -> Option<brutex_core::vendor::Vendor> {
+    if raw.is_empty() {
+        return Some(brutex_core::vendor::Vendor::Dhan);
+    }
     brutex_core::vendor::Vendor::ALL
         .into_iter()
         .find(|v| v.as_str().eq_ignore_ascii_case(raw))
-        .unwrap_or(brutex_core::vendor::Vendor::Dhan)
 }
 
 /// One expired-derivative request, out of a form body.
@@ -1257,5 +1289,73 @@ mod tests {
             today_ist().is_ok(),
             "the host clock names a day this build renders"
         );
+    }
+}
+
+#[cfg(test)]
+mod vendor_parse_tests {
+    use super::*;
+
+    /// **A NAMED VENDOR IS NEVER SILENTLY REPLACED BY ANOTHER.**
+    ///
+    /// Two copies of this parse existed. `/bars` compared with `==`,
+    /// `parse_vendor` with `eq_ignore_ascii_case`, and both ended
+    /// `.unwrap_or(Vendor::Dhan)` — so `?vendor=Groww` resolved differently on
+    /// the two routes and *both* answers were Dhan. Asking for one broker's
+    /// copy of a month and being served another's, under HTTP 200, is a wrong
+    /// answer wearing the shape of a right one.
+    ///
+    /// The old behaviour was argued for in this file: "the vendor is a route,
+    /// not a claim about the data: naming one that does not exist cannot
+    /// corrupt anything". True when written. False once `Plan.vendor` became
+    /// the store prefix — coercing to Dhan files one broker's prices under
+    /// another's path.
+    #[test]
+    fn a_vendor_this_build_cannot_serve_is_refused_rather_than_replaced() {
+        // Absent still defaults, and that half was always sound: Dhan is the
+        // descriptor verified against a live body.
+        assert_eq!(parse_vendor(""), Some(brutex_core::vendor::Vendor::Dhan));
+
+        // Every real vendor round-trips through its own wire spelling, in any
+        // case, because an operator types a query string by hand.
+        for vendor in brutex_core::vendor::Vendor::ALL {
+            for spelling in [
+                vendor.as_str().to_owned(),
+                vendor.as_str().to_uppercase(),
+                {
+                    let mut s = vendor.as_str().to_owned();
+                    s[..1].make_ascii_uppercase();
+                    s
+                },
+            ] {
+                assert_eq!(
+                    parse_vendor(&spelling),
+                    Some(vendor),
+                    "{spelling:?} must resolve to {vendor:?}, not fall back"
+                );
+            }
+        }
+
+        // AND THE HALF THAT WAS WRONG: a name this build has no feed for is
+        // `None`, so a caller must refuse rather than pick something.
+        for wrong in ["zerodha", "upstox", "DHANN", "gro ww", "0", "'"] {
+            assert_eq!(
+                parse_vendor(wrong),
+                None,
+                "{wrong:?} named a vendor this build cannot serve; returning \
+                 Some(_) here is how a month gets served from the wrong prefix"
+            );
+        }
+    }
+
+    /// The refusal names what it refused, so an operator can see the typo.
+    #[test]
+    fn the_refusal_carries_the_word_that_was_rejected() {
+        let refusal = Refusal::UnknownVendor {
+            got: "zerodha".to_owned(),
+        };
+        let said = refusal.to_string();
+        assert!(said.contains("zerodha"), "{said}");
+        assert!(said.starts_with("REFUSED"), "{said}");
     }
 }
