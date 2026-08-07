@@ -72,3 +72,4 @@
 pub mod config;
 pub mod manifest;
 pub mod secret;
+pub mod session;

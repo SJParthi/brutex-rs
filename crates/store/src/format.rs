@@ -259,6 +259,100 @@ impl Bar {
     pub const fn close_price(&self) -> Paisa {
         Paisa::from_raw(self.close)
     }
+
+    /// The 56-byte image of this record, little-endian, in field order.
+    ///
+    /// # Why an explicit encoder rather than a cast of the struct
+    ///
+    /// `#[repr(C)]` fixes the field *order*, not the byte order, so a struct
+    /// reinterpreted as bytes is the host's endianness — and this file is meant
+    /// to be the same bytes on every host, which is the argument
+    /// `docs/02-store-format.md` already makes about the block length. Casting
+    /// would also need `unsafe`, and every crate here carries
+    /// `#![forbid(unsafe_code)]`. Little-endian matches the header, whose every
+    /// field `crate::header` writes with `to_le_bytes`, so one file has one byte
+    /// order rather than two.
+    ///
+    /// It lives here rather than in the crate that ingests, because
+    /// `docs/02-store-format.md` §3 is the authority for these bytes and a
+    /// second encoder in `crates/pull` would be a second definition of the
+    /// format, free to drift. `CLAUDE.md` §5's arrow points one way: `pull`
+    /// depends on `store`.
+    #[must_use]
+    pub fn image(&self) -> [u8; RECORD_LEN] {
+        let mut out = [0u8; RECORD_LEN];
+        write_at(&mut out, 0, self.ts_micros.to_le_bytes());
+        write_at(&mut out, 8, self.open.to_le_bytes());
+        write_at(&mut out, 16, self.high.to_le_bytes());
+        write_at(&mut out, 24, self.low.to_le_bytes());
+        write_at(&mut out, 32, self.close.to_le_bytes());
+        write_at(&mut out, 40, self.volume.to_le_bytes());
+        write_at(&mut out, 48, self.open_interest.to_le_bytes());
+        out
+    }
+
+    /// Decodes one record.
+    ///
+    /// There is nothing to validate here and that is deliberate:
+    /// `docs/02-store-format.md` §3 — *"a record has no structure that a lost
+    /// write violates"*. An all-zero record is a legal flat bar. Detecting a
+    /// lost write is [`crate::block`]'s job, and range validation happens at the
+    /// ingest boundary before a byte is written, never on the way back in.
+    ///
+    /// # Errors
+    ///
+    /// [`FormatError::RecordTooShort`] when fewer than [`RECORD_STRIDE`] bytes
+    /// are offered. Refused rather than zero-filled: a short tail is
+    /// `store::unit`'s ragged-file case, and inventing the missing bytes would
+    /// manufacture a bar nobody wrote.
+    pub fn decode(bytes: &[u8]) -> Result<Self, FormatError> {
+        let mut image = [0u8; RECORD_LEN];
+        if bytes.len() < RECORD_LEN {
+            return Err(FormatError::RecordTooShort { len: bytes.len() });
+        }
+        for (dst, src) in image.iter_mut().zip(bytes.iter()) {
+            *dst = *src;
+        }
+        Ok(Self {
+            ts_micros: i64::from_le_bytes(le_bytes(&image, 0)),
+            open: i64::from_le_bytes(le_bytes(&image, 8)),
+            high: i64::from_le_bytes(le_bytes(&image, 16)),
+            low: i64::from_le_bytes(le_bytes(&image, 24)),
+            close: i64::from_le_bytes(le_bytes(&image, 32)),
+            volume: i64::from_le_bytes(le_bytes(&image, 40)),
+            open_interest: i64::from_le_bytes(le_bytes(&image, 48)),
+        })
+    }
+}
+
+/// [`RECORD_STRIDE`] as a length, for the record image.
+///
+/// Written as a literal in both widths rather than converted, for the reason
+/// `crate::header` gives about every other paired constant: a conversion here
+/// would carry a failure arm no test could reach. The assertion keeps the two
+/// honest.
+pub const RECORD_LEN: usize = 56;
+
+const _: () = assert!(RECORD_STRIDE == 56 && RECORD_LEN == 56);
+
+/// Writes `src` at `offset` in a record image.
+///
+/// Index-free, because `clippy::indexing_slicing` is denied across this
+/// workspace and an encoder is exactly where a panicking index would eventually
+/// be reached by an offset that moved.
+fn write_at<const N: usize>(out: &mut [u8; RECORD_LEN], offset: usize, src: [u8; N]) {
+    for (dst, byte) in out.iter_mut().skip(offset).zip(src) {
+        *dst = byte;
+    }
+}
+
+/// Reads `N` little-endian bytes at `offset` from a record image.
+fn le_bytes<const N: usize>(image: &[u8; RECORD_LEN], offset: usize) -> [u8; N] {
+    let mut out = [0u8; N];
+    for (dst, src) in out.iter_mut().zip(image.iter().skip(offset)) {
+        *dst = *src;
+    }
+    out
 }
 
 /// Something about the bytes is wrong.
@@ -276,6 +370,15 @@ pub enum FormatError {
     OffsetOverflow,
     /// A slot buffer is shorter than [`SLOT_LEN`].
     SlotTooShort {
+        /// Bytes the caller supplied.
+        len: usize,
+    },
+    /// A record buffer is shorter than [`RECORD_STRIDE`].
+    ///
+    /// Distinct from [`FormatError::SlotTooShort`] because a short *record* and
+    /// a short *slot* are two different files being wrong in two different
+    /// places, and one message for both sends a reader to the wrong offset.
+    RecordTooShort {
         /// Bytes the caller supplied.
         len: usize,
     },
@@ -412,6 +515,9 @@ impl std::fmt::Display for FormatError {
             Self::OffsetOverflow => f.write_str("record offset overflows u64"),
             Self::SlotTooShort { len } => {
                 write!(f, "header slot is {len} bytes, needs {SLOT_LEN}")
+            }
+            Self::RecordTooShort { len } => {
+                write!(f, "record is {len} bytes, needs {RECORD_STRIDE}")
             }
             Self::HeaderRegionTooShort { slots, need } => {
                 write!(f, "header region holds {slots} whole slots, needs {need}")
