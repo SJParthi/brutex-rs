@@ -81,7 +81,6 @@ input[type=text]{font:inherit;padding:10px 14px;border:1px solid var(--line);bor
 min-width:min(24rem,100%);background:var(--panel);color:var(--ink);box-shadow:var(--sh);\
 transition:border-color .2s,box-shadow .2s}\
 input[type=text]:focus{outline:0;border-color:var(--acc);box-shadow:0 0 0 4px color-mix(in srgb,var(--acc) 18%,transparent)}\
-input[list]::-webkit-calendar-picker-indicator{display:none!important;opacity:0;width:0;height:0}\
 button{font:inherit;font-weight:700;padding:10px 20px;border:0;border-radius:11px;cursor:pointer;\
 background:linear-gradient(135deg,var(--acc),var(--acc2));color:#fff;\
 box-shadow:0 5px 16px color-mix(in srgb,var(--acc) 34%,transparent);transition:transform .2s,box-shadow .2s}\
@@ -844,14 +843,13 @@ pub fn instruments_page(view: &View<'_>) -> String {
     let _ = write!(
         body,
         "<form method=\"get\" action=\"/instruments\">\
-         <input type=\"text\" name=\"q\" list=\"all-syms\" autocomplete=\"off\" \
-         placeholder=\"start typing — NIFTY, BANKNIFTY, RELIANCE…\" \
-         value=\"{}\" autofocus>{}\
+         <input type=\"text\" name=\"q\" autocomplete=\"off\" \
+         placeholder=\"type a symbol and press Enter — NIFTY, RELIANCE…\" \
+         value=\"{}\" autofocus>\
          <button type=\"submit\">Search</button>\
          <a href=\"/instruments\">clear</a>\
          <a href=\"/instruments?all={}\">{}</a></form>",
         escape(query),
-        suggestions("all-syms", &brutex_core::universe::NIFTY_TOTAL_MARKET),
         u8::from(!all),
         if all {
             "show tracked only (NIFTY Total Market + indices)"
@@ -1250,35 +1248,34 @@ fn date_input(form: &str, name: &str, max: Day) -> String {
     calendar::picker(name, &format!("{form}{name}"), max)
 }
 
-/// A type-ahead list for a text input, from a compile-time table.
-///
-/// # Why this is a list and not a dropdown
-///
-/// The F&O underlying is one of 213 symbols and the instrument search runs over
-/// 750. Both are far too many to scroll and far too easy to get one character
-/// wrong, so neither a `<select>` nor a bare text box is right. `<datalist>` is
-/// the element that is neither — **start typing and only the matches appear** —
-/// and the browser does the filtering, which is why this needs no script.
-///
-/// **One correction that mattered.** Chrome renders a `▼` indicator beside any
-/// `list=` input and dumps *every* option when it is clicked, which is exactly
-/// the dropdown this is not supposed to be. [`STYLE`] suppresses that indicator,
-/// so suggestions appear on typing and not before. Firefox shows no indicator at
-/// all and needs nothing.
-///
-/// The source is `brutex_core::universe`, a `const` array, so what the field
-/// offers is exactly what [`crate::ingest::parse_fno`] will accept. A separate
-/// hand-kept list would drift, and the drift would surface as a suggestion the
-/// server then refuses.
-fn suggestions(id: &str, items: &[&str]) -> String {
-    let mut out = String::with_capacity(items.len() * 24 + 32);
-    let _ = write!(out, "<datalist id=\"{}\">", escape(id));
-    for item in items {
-        let _ = write!(out, "<option value=\"{}\">", escape(item));
-    }
-    out.push_str("</datalist>");
-    out
-}
+// THERE IS NO `suggestions()` HERE ANY MORE, AND ITS ABSENCE IS THE FIX.
+//
+// A `<datalist>` over the 750-symbol universe was put on the search box and the
+// F&O underlying so that typing would narrow the choices. It does narrow — but
+// **Chrome opens the full list on focus, before a single character is typed**,
+// and draws a `▼` indicator beside the field. Both make it read as a dropdown
+// of 750 items, which is exactly the shape it was meant to replace.
+//
+// Suppressing the indicator with `::-webkit-calendar-picker-indicator` removed
+// the arrow and did NOT stop the focus behaviour: that popup belongs to the
+// browser, not to this page, and no CSS or attribute cancels it.
+//
+// Three ways to get true type-to-filter, and only one is available here:
+//
+//   1. A script filtering a list on each keystroke. `CLAUDE.md` §2 forbids it,
+//      and four tests assert `<script>` never appears in any page emitted here.
+//   2. A server round-trip per keystroke. Also needs a script to fire it.
+//   3. A server round-trip on SUBMIT: type a symbol, press Enter, get matches.
+//
+// Option 3 already existed on the instruments page and always had: the
+// `method="get"` form searches the whole universe rather than the rendered
+// page, and its result is a linkable, reloadable URL. The datalist was not
+// adding to that — it was covering it with a list nobody asked for. Removed
+// rather than tuned, because a control that does the wrong thing well is still
+// doing the wrong thing.
+//
+// `docs/06-limits.md` §30 records what that leaves: there is **no incremental
+// type-ahead** on this surface, and there cannot be one without a script.
 
 /// One run, as the page shows it.
 ///
@@ -1420,11 +1417,8 @@ fn pull_forms(view: &PullView<'_>) -> String {
     );
     out.push_str(&field(
         "Underlying",
-        &format!(
-            "<input type=\"text\" name=\"underlying\" list=\"fno-syms\" autocomplete=\"off\" \
-             placeholder=\"start typing — NIFTY, BANKNIFTY, RELIANCE…\" required>{}",
-            suggestions("fno-syms", &brutex_core::universe::FNO_UNDERLYINGS)
-        ),
+        "<input type=\"text\" name=\"underlying\" autocomplete=\"off\" \
+         placeholder=\"NIFTY, BANKNIFTY, RELIANCE…\" required>",
     ));
     let mut series = String::with_capacity(128);
     for s in Series::ALL {
