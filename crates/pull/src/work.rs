@@ -189,7 +189,7 @@ impl Work {
 /// # Ok::<(), store::path::PathError>(())
 /// ```
 #[must_use]
-pub fn gaps(requested: &[Cell], held: &HashSet<Cell>) -> Work {
+pub fn gaps<S: core::hash::BuildHasher>(requested: &[Cell], held: &HashSet<Cell, S>) -> Work {
     let mut work = Work {
         // Reserved from a bound known before the loop — law 2, so the vector
         // never grows mid-pass.

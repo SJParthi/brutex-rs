@@ -3247,13 +3247,19 @@ property-based or concurrency proof that has ever run.**
 **4 · X-06 carried a tick over a gate that exits 1.** Measured by running the CI
 command itself: `cargo llvm-cov --workspace --locked --fail-under-lines 100
 --fail-under-regions 100 --summary-only`, cargo-llvm-cov 0.8.4 → **exit 1**,
-TOTAL **97.41% regions**, **96.93% lines**, 94.72% functions. The row now
-carries the figure, the date and the command, and a table naming all six short
-files. `crates/pull/src/vendor.rs` is at **0.00%** — 445 regions, 366 lines,
-every one uncovered, in a tracked file with no `#[test]` in it, alongside
-`archive.rs`, `fetch.rs` and `csv.rs`. The figure is recorded **as a dated
-number rather than a tick** so the next reader re-runs the command instead of
-believing the table.
+TOTAL **96.75% regions**, **96.24% lines**, 93.88% functions at commit
+`79c5e80`. The row now carries the figure, the commit, the date and the command,
+and a table naming all eight short files. **Two are at 0.00%** —
+`crates/pull/src/vendor.rs` and `crates/pull/src/ingest.rs`, 613 regions and 466
+lines between them, both tracked and neither containing a single `#[test]` —
+alongside `archive.rs`, `fetch.rs`, `csv.rs` and `fold.rs`.
+
+**The number moved twice while this entry was being written.** The first run
+measured 97.41% / 96.93% over six short files; `1f98bb5`, `eb95996` and
+`79c5e80` then landed and it fell to the figure above over eight. An audit
+before that measured 95.31% lines / 95.91% regions. The gate was red at all
+three points and the tick looked equally right at each — which is the whole
+argument for recording a command, a commit and a date instead.
 
 **5 · `docs/07-o1-architecture.md` layer 12 was `✓` over a bound it never
 held.** The row read *"a fixed row cap with paging. Never O(universe)"* while
