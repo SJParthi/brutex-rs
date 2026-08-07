@@ -405,7 +405,7 @@ pub fn parse_day(field: &'static str, text: &str) -> Result<Day, Refusal> {
 ///
 /// **Two spellings, one parser.** The calendar in [`crate::calendar`] posts three
 /// integers — `{field}_y`, `{field}_m`, `{field}_d` — because that is what keeps
-/// a no-script picker down to 55 controls instead of 4,464. A hand-built POST,
+/// a no-script picker down to 57 controls instead of 4,464. A hand-built POST,
 /// `curl`, and every test written before the picker existed send the whole
 /// `{field}=YYYY-MM-DD`. Both arrive here.
 ///
@@ -420,9 +420,9 @@ pub fn parse_day(field: &'static str, text: &str) -> Result<Day, Refusal> {
 ///
 /// # Errors
 ///
-/// [`Refusal::FieldMissing`] when neither spelling is present, and whatever
-/// [`parse_day`] refuses — including a triple with a piece missing, which
-/// composes to something that is not a date and is refused as one.
+/// [`Refusal::FieldMissing`] when neither spelling is present, and when the
+/// triple is there but incomplete — a piece absent and a piece present-but-empty
+/// are the same unfinished date. Otherwise whatever [`parse_day`] refuses.
 pub fn parse_day_field(body: &str, field: &'static str) -> Result<Day, Refusal> {
     let iso = param(body, field);
     if !iso.is_empty() {
@@ -433,7 +433,20 @@ pub fn parse_day_field(body: &str, field: &'static str) -> Result<Day, Refusal> 
         param(body, &format!("{field}_m")),
         param(body, &format!("{field}_d")),
     );
-    if y.is_empty() && m.is_empty() && d.is_empty() {
+    // ANY PIECE MISSING IS A DATE THAT WAS NOT FINISHED, NOT A MALFORMED ONE.
+    //
+    // This used to require all three to be empty before saying so, and compose
+    // whatever was left otherwise — so a triple with the month cleared became
+    // the string `-08-06`, which came back as `DateNotIso` naming a format the
+    // operator never typed.
+    //
+    // The picker made that reachable by design. Its drill-down header steps
+    // back a pane by checking a radio whose value is the empty string (see
+    // `crate::calendar`), because checking a sibling is the only way a
+    // `<label>` can uncheck a radio — so a half-picked date now arrives with a
+    // piece present and EMPTY rather than absent. Both spellings mean the same
+    // thing and both belong in the same refusal.
+    if y.is_empty() || m.is_empty() || d.is_empty() {
         return Err(Refusal::FieldMissing { field });
     }
     // Padded so `8` and `08` mean the same August, then parsed by the one

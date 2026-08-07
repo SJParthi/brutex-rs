@@ -1273,11 +1273,15 @@ fn field_unlabelled(label: &str, control: &str) -> String {
 ///
 /// `form` scopes the element ids. **Both forms on the ingest page have a field
 /// called `from`**, and an `id` is document-wide — so without the prefix the
-/// spot picker's label would carry `for="o-from"` and toggle whichever checkbox
-/// the browser found first, which is the F&O one. The `name` stays unprefixed,
+/// spot picker's label would carry `for="o-from"` and toggle whichever latch the
+/// browser found first, which is the F&O one. The `name` stays unprefixed,
 /// because that is what the server reads.
+///
+/// It is also the form the picker's `Close` points at, so every form that calls
+/// this must emit [`calendar::shut`] once — see that function for why the pairing
+/// is per form rather than per page.
 fn date_input(form: &str, name: &str, max: Day) -> String {
-    calendar::picker(name, &format!("{form}{name}"), max)
+    calendar::picker(name, &format!("{form}{name}"), form, max)
 }
 
 // THERE IS NO `suggestions()` HERE ANY MORE, AND ITS ABSENCE IS THE FIX.
@@ -1405,6 +1409,10 @@ fn pull_forms(view: &PullView<'_>) -> String {
          NSE only — there is no BSE and no MCX on this surface.</p>\
          <form class=\"pull\" method=\"post\" action=\"/pull/spot\">",
     );
+    // The resting member of this form's popover group, and the reason every
+    // panel in it starts closed. One per form: a radio group is scoped to its
+    // form owner, so the F&O form below carries its own.
+    out.push_str(&calendar::shut("s"));
     let mut options = String::with_capacity(512);
     for &(target, members) in view.targets {
         let _ = write!(
@@ -1447,6 +1455,8 @@ fn pull_forms(view: &PullView<'_>) -> String {
          already expired. These are stored and never swept.</p>\
          <form class=\"pull\" method=\"post\" action=\"/pull/fno\">",
     );
+    // This form's own popover group. See the spot form above.
+    out.push_str(&calendar::shut("f"));
     out.push_str(&field(
         "Underlying",
         "<input type=\"text\" name=\"underlying\" autocomplete=\"off\" \
@@ -1893,7 +1903,7 @@ fn coverage_table(view: &StoreView<'_>) -> String {
         let _ = write!(
             out,
             "<tr class=\"{cls}\"><td>{}</td><td>{}</td><td>1m</td>",
-            escape(&row.key.to_string()),
+            escape(&row.series.to_string()),
             escape(&row.month.to_string()),
         );
         for &(_, n) in &row.rows {
@@ -3249,15 +3259,20 @@ mod tests {
 
     #[test]
     fn the_store_page_marks_a_held_month_and_dashes_one_it_does_not_hold() {
-        let nifty_key = nifty();
+        let nifty_key = crate::census::Series {
+            exchange: Exchange::Nse,
+            segment: brutex_core::instrument::Segment::Index,
+            symbol: brutex_core::symbol::Symbol::new("NIFTY").expect("valid"),
+            timeframe: store::path::Timeframe::MINUTE_1,
+        };
         let month = store::path::YearMonth::new(2026, 7).expect("valid");
         let held = Coverage {
-            key: nifty_key,
+            series: nifty_key,
             month,
             rows: vec![(Vendor::Groww, Some(8_250)), (Vendor::Dhan, None)],
         };
         let absent = Coverage {
-            key: nifty_key,
+            series: nifty_key,
             month: store::path::YearMonth::new(2026, 6).expect("valid"),
             rows: vec![(Vendor::Groww, None), (Vendor::Dhan, None)],
         };
@@ -3273,7 +3288,7 @@ mod tests {
         });
         assert!(html.starts_with("<!doctype html>"));
         assert!(html.ends_with("</html>"));
-        assert!(html.contains("NSE-NIFTY"));
+        assert!(html.contains("NSE-INDEX-NIFTY"));
         assert!(html.contains("2026-07") && html.contains("2026-06"));
         assert!(html.contains(">8250<"), "the row count: {html}");
         // CHANGED, AND NAMED: every cell now carries a swatch BEFORE its
