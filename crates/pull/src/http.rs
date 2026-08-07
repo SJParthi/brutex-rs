@@ -97,6 +97,30 @@ impl HttpSource {
     pub fn new(spec: HttpSpec, token: String) -> Result<Self, FetchError> {
         let client = reqwest::Client::builder()
             .timeout(core::time::Duration::from_secs(REQUEST_TIMEOUT_SECS))
+            // ── REDIRECTS ARE NOT FOLLOWED, AND THE REASON IS THE CREDENTIAL ──
+            //
+            // `reqwest` follows up to ten redirects by default, and on a
+            // cross-origin hop it strips the headers it considers sensitive:
+            // `Authorization`, `Cookie`, `Proxy-Authorization`,
+            // `WWW-Authenticate`. **It has no way to know that this vendor's
+            // credential is not in one of those.** Dhan's descriptor names its
+            // header `access-token` (`crate::vendor`, `AuthScheme::Raw`), which
+            // is a custom header like any other, so a 302 from the bars
+            // endpoint would put a live broker token on a socket to whatever
+            // host the `Location` named — and the strip list would not fire,
+            // because the name is not on it. Groww's is `Authorization` and is
+            // stripped, but only cross-origin: a redirect to another path on a
+            // host that has been taken over still carries it.
+            //
+            // Nothing legitimate is lost. `bars_path` is a fixed path on a
+            // fixed `base_url` in the descriptor; a broker's historical-bars
+            // endpoint answering 3xx is not a route change this build should
+            // silently chase. With `Policy::none` the 3xx comes back as a
+            // response, `is_success` is false, and `window_async` turns it into
+            // `VendorRefused` carrying the status — so the operator sees `302`
+            // and the `Location`, and decides. `CLAUDE.md` §4: degrade loudly
+            // and name the reason, never both silently.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|why| FetchError::TransportFailed {
                 detail: format!("the HTTPS client could not be built: {why}"),
@@ -184,7 +208,26 @@ pub fn decode_body(body: &str, spec: &HttpSpec) -> Result<RawWindow, FetchError>
         })?;
 
     match spec.response {
-        ResponseShape::ParallelArrays { .. } => {
+        ResponseShape::ParallelArrays { envelope } => {
+            // EVERY FIELD IS READ FROM ONE OBJECT, RESOLVED ONCE.
+            //
+            // Each of the seven used to be looked up on its own, and each
+            // lookup fell back to searching *every* value one level below the
+            // root for a key of that name. So a body holding two objects that
+            // both carry bar fields — a payload beside a cached copy, a primary
+            // beside a fallback, two exchanges in one answer — could have its
+            // `open` taken from the first and its `close` from the second, and
+            // the bar assembled from them never existed.
+            //
+            // Nothing downstream could catch it. The seven-array length check
+            // passes when both objects hold the same number of bars, which is
+            // exactly when two such objects would appear together, and the
+            // result is a window of well-formed bars that no vendor ever sent.
+            //
+            // The descriptor has always carried `envelope` and this decoder
+            // ignored it. It is now the answer: one container, named by the
+            // row in `crate::vendor`, and all seven fields come out of it.
+            let root = container(&root, envelope)?;
             let f = spec.fields;
             let arrays = ParallelArrays {
                 // PRICES GO THROUGH `prices`, NOT `numbers`, AND THE
@@ -201,12 +244,12 @@ pub fn decode_body(body: &str, spec: &HttpSpec) -> Result<RawWindow, FetchError>
                 // rupees here is a snap at the wrong granularity in the wrong
                 // place. `prices` therefore scales first and rounds once, while
                 // the paise are still in the float.
-                open: prices(&root, f.open, spec.prices)?,
-                high: prices(&root, f.high, spec.prices)?,
-                low: prices(&root, f.low, spec.prices)?,
-                close: prices(&root, f.close, spec.prices)?,
-                volume: numbers(&root, f.volume)?,
-                timestamp: numbers(&root, f.timestamp)?,
+                open: prices(root, f.open, spec.prices)?,
+                high: prices(root, f.high, spec.prices)?,
+                low: prices(root, f.low, spec.prices)?,
+                close: prices(root, f.close, spec.prices)?,
+                volume: numbers(root, f.volume)?,
+                timestamp: numbers(root, f.timestamp)?,
                 // OPEN INTEREST IS OPTIONAL AND ITS ABSENCE IS NOT A ZERO.
                 // A spot index has none, so the descriptor leaves the name
                 // `None` and no array is looked for. When the descriptor DOES
@@ -216,7 +259,7 @@ pub fn decode_body(body: &str, spec: &HttpSpec) -> Result<RawWindow, FetchError>
                 // means zero, so a silent `Vec::new()` here would later read
                 // back as real open interest of nothing.
                 open_interest: match f.open_interest {
-                    Some(name) => numbers(&root, name)?,
+                    Some(name) => numbers(root, name)?,
                     None => Vec::new(),
                 },
             };
@@ -326,25 +369,98 @@ fn numbers(root: &serde_json::Value, name: &str) -> Result<Vec<i64>, FetchError>
         .collect()
 }
 
-/// The array a field names, wherever in the body it sits.
+/// The one object this vendor's bar fields are read from.
 ///
-/// Searches the top level first, then one level down, because vendors wrap
-/// their payload in a `data` object about as often as they do not. Two levels
-/// and no further: an unbounded search would find a field of the right name in
-/// the wrong place and report success.
+/// # The search this replaces could build a bar out of two objects
+///
+/// Every field used to resolve itself: look at the top level, and failing that
+/// look inside **each** value one level down for a key of that name, taking the
+/// first hit. The intent was to tolerate a vendor that wraps its payload in a
+/// `data` object, and in a body with exactly one such object it did.
+///
+/// In a body with two it silently spliced them. `{"live":{...},"cached":{...}}`
+/// — or a primary beside a fallback, or two exchanges in one answer — resolves
+/// `open` against whichever object `serde_json` yields first and `close` against
+/// whichever holds a key of that name, and those need not be the same object.
+/// The seven-array length check downstream cannot see it: two objects describing
+/// the same window hold the same number of bars, so the lengths agree and a
+/// window of bars that were never quoted together lands on disk looking exactly
+/// like a real one. `serde_json`'s default map is sorted, so which object won
+/// was decided by *alphabetical order of the wrapper keys* — stable, and
+/// stably wrong.
+///
+/// So there is no search. [`crate::vendor`]'s `envelope` says where the bars
+/// are, one container is resolved from it here, and all seven fields come out of
+/// that container.
+///
+/// # A descriptor that is wrong says so
+///
+/// `envelope` for the brokers in this build is **UNVERIFIED against a live
+/// body** — no vendor has been reached from this process yet (see the module
+/// header). If it is wrong, the refusal below names the key that was expected
+/// and lists the keys that were actually there, which is a one-row diff to fix.
+/// Guessing instead is what produced the splice.
+///
+/// # Errors
+///
+/// [`FetchError::TransportFailed`] when the declared envelope is absent.
+fn container<'a>(
+    root: &'a serde_json::Value,
+    envelope: Option<&'static str>,
+) -> Result<&'a serde_json::Value, FetchError> {
+    let Some(key) = envelope else {
+        return Ok(root);
+    };
+    root.get(key).ok_or_else(|| FetchError::TransportFailed {
+        detail: format!(
+            "the descriptor says this vendor hangs its bars under {key:?}, and \
+             the answer has no such key. It has: {}",
+            keys_of(root)
+        ),
+    })
+}
+
+/// As much of a vendor's refusal as belongs in an error.
+///
+/// A refusal body is unbounded input from outside, and an error string is a
+/// thing that reaches a log — so it is cut, at characters rather than bytes so
+/// the cut cannot land inside one.
+fn trim(body: &str) -> String {
+    body.chars().take(500).collect()
+}
+
+/// The keys of a JSON object, for a refusal that tells an operator what to fix.
+///
+/// Names only — **never a value**, because a value here is vendor data and a
+/// refusal is a string that reaches a log.
+fn keys_of(value: &serde_json::Value) -> String {
+    value.as_object().map_or_else(
+        || "nothing — the answer is not an object".to_owned(),
+        |o| {
+            let names: Vec<&str> = o.keys().map(String::as_str).collect();
+            if names.is_empty() {
+                "no keys at all".to_owned()
+            } else {
+                names.join(", ")
+            }
+        },
+    )
+}
+
+/// The array a field names, **in the one container the descriptor chose**.
+///
+/// No fallback and no second place to look: see [`container`] for what looking
+/// in a second place cost.
 fn array_at<'a>(
     root: &'a serde_json::Value,
     name: &str,
 ) -> Result<&'a Vec<serde_json::Value>, FetchError> {
-    let found = root.get(name).or_else(|| {
-        root.as_object()
-            .and_then(|o| o.values().find_map(|v| v.get(name)))
-    });
-    let Some(array) = found.and_then(serde_json::Value::as_array) else {
+    let Some(array) = root.get(name).and_then(serde_json::Value::as_array) else {
         return Err(FetchError::TransportFailed {
             detail: format!(
-                "the vendor's answer has no array named {name:?} at the top \
-                 level or one below it"
+                "the vendor's answer has no array named {name:?} where the \
+                 descriptor says the bars are. It has: {}",
+                keys_of(root)
             ),
         });
     };
@@ -402,11 +518,37 @@ impl HttpSource {
 
         let status = answer.status().as_u16();
         if !answer.status().is_success() {
-            let detail = answer.text().await.unwrap_or_default();
-            return Err(FetchError::VendorRefused {
-                status,
-                detail: detail.chars().take(500).collect(),
+            // A REDIRECT IS NOW A REFUSAL, SO IT HAS TO SAY SO IN WORDS.
+            //
+            // The client does not follow one (see `new`), which means a 3xx
+            // arrives here instead of silently becoming a request to another
+            // host carrying the credential. Its body is almost always empty, so
+            // without this the operator would get `302` and nothing else. The
+            // `Location` is named — it is the vendor's own routing, not a
+            // secret — and the credential is not, because it never appears in
+            // anything this function can reach.
+            let hint = answer.status().is_redirection().then(|| {
+                let target = answer
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .map_or_else(
+                        || "no Location header".to_owned(),
+                        |v| v.chars().take(200).collect(),
+                    );
+                format!(
+                    "this build does not follow redirects, because the \
+                     credential travels in a header no HTTP client knows to \
+                     strip. The vendor wanted to send this request to: {target}"
+                )
             });
+            let body: String = answer.text().await.unwrap_or_default();
+            let detail = match hint {
+                Some(why) if body.is_empty() => why,
+                Some(why) => format!("{why} — and it said: {}", trim(&body)),
+                None => trim(&body),
+            };
+            return Err(FetchError::VendorRefused { status, detail });
         }
 
         let text = answer
@@ -444,6 +586,18 @@ mod tests {
     /// A descriptor with only the fields the decoder reads, so a test says what
     /// it is testing. `prices` is the parameter every price case turns on.
     fn spec(prices: PriceScale) -> HttpSpec {
+        spec_under(prices, None)
+    }
+
+    /// The same descriptor, declaring where its bars hang.
+    fn spec_under(prices: PriceScale, envelope: Option<&'static str>) -> HttpSpec {
+        HttpSpec {
+            response: ResponseShape::ParallelArrays { envelope },
+            ..spec_top(prices)
+        }
+    }
+
+    fn spec_top(prices: PriceScale) -> HttpSpec {
         HttpSpec {
             base_url: "https://vendor.invalid",
             bars_path: "/bars",
@@ -620,13 +774,113 @@ mod tests {
         );
     }
 
-    /// The arrays may sit one level down, under an envelope key.
+    /// The arrays may sit one level down — **when the descriptor says so.**
     #[test]
-    fn arrays_one_level_below_the_root_are_found() {
+    fn arrays_under_the_declared_envelope_are_found() {
         let body = r#"{"data":{"open":[100.5],"high":[100.5],"low":[100.5],
                        "close":[100.5],"volume":[7],"timestamp":[1751337900]}}"#;
-        let window = decode_body(body, &spec(PriceScale::Rupees)).expect("decodes");
+        let window =
+            decode_body(body, &spec_under(PriceScale::Rupees, Some("data"))).expect("decodes");
         assert_eq!(window.rows[0].open, 10_050);
+    }
+
+    /// **ONE BAR, TWO OBJECTS.** The defect this envelope exists to close.
+    ///
+    /// Each field used to resolve itself: top level first, then the first value
+    /// one level down holding a key of that name. With two such objects in one
+    /// body the seven fields could come from either, and `serde_json`'s map is
+    /// sorted — so `cached` won over `live` by alphabet, on every field that
+    /// `live` did not also have at the same place.
+    ///
+    /// Nothing downstream catches it. Two objects describing the same window
+    /// hold the same number of bars, so the seven-array length check passes and
+    /// the spliced bar reaches the store looking exactly like a real one.
+    ///
+    /// Here `cached` quotes a stale 999 and `live` quotes 100.5. A decoder that
+    /// searches returns a bar built from both. A decoder told where to look
+    /// returns `live`'s bar, whole.
+    #[test]
+    fn one_bar_can_never_be_assembled_from_two_different_objects() {
+        let body = r#"{
+            "cached":{"open":[999],"high":[999],"low":[999],"close":[999],
+                      "volume":[1],"timestamp":[1]},
+            "live":{"open":[100.5],"high":[100.5],"low":[100.5],"close":[100.5],
+                    "volume":[7],"timestamp":[1751337900]}
+        }"#;
+        let window =
+            decode_body(body, &spec_under(PriceScale::Rupees, Some("live"))).expect("decodes");
+        let row = &window.rows[0];
+        assert_eq!(
+            (row.open, row.high, row.low, row.close),
+            (10_050, 10_050, 10_050, 10_050),
+            "every price comes from `live`; a 99900 anywhere here is `cached` \
+             leaking into a bar that was never quoted"
+        );
+        assert_eq!(row.volume, 7, "and so does the volume");
+        assert_eq!(row.timestamp, 1_751_337_900, "and the timestamp");
+
+        // The other object is reachable only by naming it, which is the point:
+        // which bar you get is the descriptor's decision, never the alphabet's.
+        let stale =
+            decode_body(body, &spec_under(PriceScale::Rupees, Some("cached"))).expect("decodes");
+        assert_eq!(stale.rows[0].open, 99_900);
+    }
+
+    /// With no envelope declared, the top level is the only place looked.
+    ///
+    /// A body that wraps its bars is then refused by name rather than
+    /// rummaged through — the refusal is what tells an operator to add the
+    /// envelope to the descriptor's row.
+    #[test]
+    fn no_envelope_means_the_top_level_and_nowhere_else() {
+        let wrapped = r#"{"data":{"open":[1],"high":[1],"low":[1],"close":[1],
+                          "volume":[1],"timestamp":[1]}}"#;
+        let Err(FetchError::TransportFailed { detail }) =
+            decode_body(wrapped, &spec(PriceScale::Rupees))
+        else {
+            panic!("the descriptor says top level, so `data` is not searched")
+        };
+        assert!(
+            detail.contains("open"),
+            "the refusal names the field: {detail}"
+        );
+        assert!(
+            detail.contains("data"),
+            "and lists what the answer does have, so the descriptor can be \
+             corrected: {detail}"
+        );
+    }
+
+    /// A declared envelope the answer does not carry is refused, and the
+    /// refusal carries the two things needed to fix the descriptor.
+    #[test]
+    fn a_missing_envelope_names_the_key_expected_and_the_keys_present() {
+        let body = r#"{"payload":{"open":[1],"high":[1],"low":[1],"close":[1],
+                       "volume":[1],"timestamp":[1]}}"#;
+        let Err(FetchError::TransportFailed { detail }) =
+            decode_body(body, &spec_under(PriceScale::Rupees, Some("data")))
+        else {
+            panic!("the declared envelope is absent and must be named")
+        };
+        assert!(detail.contains("\"data\""), "the key expected: {detail}");
+        assert!(detail.contains("payload"), "the key present: {detail}");
+
+        // A body that is not an object at all says that rather than listing
+        // keys it does not have.
+        let Err(FetchError::TransportFailed { detail }) =
+            decode_body("[1,2,3]", &spec_under(PriceScale::Rupees, Some("data")))
+        else {
+            panic!("an array is not an envelope")
+        };
+        assert!(detail.contains("not an object"), "{detail}");
+
+        // And an object with no keys at all.
+        let Err(FetchError::TransportFailed { detail }) =
+            decode_body("{}", &spec_under(PriceScale::Rupees, Some("data")))
+        else {
+            panic!("an empty object holds no envelope")
+        };
+        assert!(detail.contains("no keys at all"), "{detail}");
     }
 
     /// The blocking seam refuses by name rather than silently blocking, and
@@ -639,6 +893,429 @@ mod tests {
         assert!(!shown.contains("SUPERSECRET"), "the token leaked: {shown}");
         assert!(shown.contains("<redacted>"), "and it says so: {shown}");
         assert_eq!(source.url(), "https://vendor.invalid/bars");
+    }
+
+    /// A server on loopback that answers once and reports what it was sent.
+    ///
+    /// Raw sockets and hand-written HTTP, because `crates/pull` takes `tokio`
+    /// without the `net` feature and a test is not a reason to widen a
+    /// dependency. `std::net` in a plain thread is enough to prove where a
+    /// header did and did not go.
+    ///
+    /// Returns the base URL to point a descriptor at, and a handle that yields
+    /// the request line and headers of whatever arrived — or `None` if nothing
+    /// ever connected, which is the assertion that matters below.
+    fn listener(
+        answer: Option<String>,
+    ) -> (
+        String,
+        std::sync::mpsc::Receiver<String>,
+        std::net::SocketAddr,
+    ) {
+        use std::io::{Read as _, Write as _};
+        let socket = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let addr = socket.local_addr().expect("an address");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = socket.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let seen = String::from_utf8_lossy(buf.get(..n).unwrap_or(&[])).into_owned();
+            let _ = tx.send(seen);
+            if let Some(ref body) = answer {
+                let _ = stream.write_all(body.as_bytes());
+            }
+            let _ = stream.flush();
+        });
+        (format!("http://{addr}"), rx, addr)
+    }
+
+    /// **THE CREDENTIAL MUST NOT FOLLOW A REDIRECT.**
+    ///
+    /// `reqwest` follows up to ten by default and strips only the headers it
+    /// knows are sensitive — `Authorization`, `Cookie`, `Proxy-Authorization`,
+    /// `WWW-Authenticate`. Dhan's descriptor calls its credential header
+    /// `access-token`, which is on none of those lists, so a 302 from the bars
+    /// endpoint would have carried a live broker token to whatever host the
+    /// `Location` named. Nothing would have logged it and nothing would have
+    /// failed.
+    ///
+    /// This drives it over two real loopback sockets: the origin answers `302`
+    /// pointing at the second, and the second must never be connected to at all.
+    #[test]
+    fn a_redirect_is_refused_and_the_token_never_reaches_its_target() {
+        // The hop answers nothing, because nothing must ever ask it.
+        let (hop_url, hop_seen, _) = listener(None);
+        let redirect = format!(
+            "HTTP/1.1 302 Found\r\nLocation: {hop_url}/stolen\r\nContent-Length: 0\r\n\
+             Connection: close\r\n\r\n"
+        );
+        let (origin_url, origin_seen, _) = listener(Some(redirect));
+
+        let spec = HttpSpec {
+            base_url: Box::leak(origin_url.into_boxed_str()),
+            ..spec(PriceScale::Rupees)
+        };
+        let source = HttpSource::new(spec, "SUPERSECRET".to_owned()).expect("a client builds");
+        let request = BarRequest {
+            window: crate::session::Window::new(
+                crate::session::Day::new(2025, 7, 1).expect("a real day"),
+                crate::session::Day::new(2025, 7, 1).expect("a real day"),
+            )
+            .expect("a real window"),
+            cadence: crate::session::Cadence::Minute,
+        };
+        let outcome = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime")
+            .block_on(source.window_async(&request));
+
+        // The origin was reached, and it WAS sent the credential — otherwise
+        // this test would pass by never authenticating at all.
+        let sent = origin_seen
+            .recv_timeout(core::time::Duration::from_secs(5))
+            .expect("the origin was contacted");
+        assert!(
+            sent.contains("SUPERSECRET"),
+            "the descriptor's own header must carry the token to the vendor, \
+             or this test proves nothing: {sent}"
+        );
+
+        // THE HOP WAS NEVER CONTACTED. This is the whole assertion.
+        assert!(
+            hop_seen
+                .recv_timeout(core::time::Duration::from_secs(1))
+                .is_err(),
+            "the redirect was followed and the credential left for a host the \
+             descriptor never named"
+        );
+
+        // And the 302 came back as a refusal that says what happened.
+        let Err(FetchError::VendorRefused { status, detail }) = outcome else {
+            panic!("a redirect is a refusal this build reports, not one it hides")
+        };
+        assert_eq!(status, 302, "the status reaches the caller");
+        assert!(detail.contains("stolen"), "the Location is named: {detail}");
+        assert!(
+            detail.contains("does not follow redirects"),
+            "and the reason is named: {detail}"
+        );
+        assert!(
+            !detail.contains("SUPERSECRET"),
+            "the refusal must never carry the credential: {detail}"
+        );
+    }
+
+    /// An ordinary refusal still carries the vendor's own words, and a 429 is
+    /// still distinguishable from a 500 — the redirect arm did not swallow them.
+    #[test]
+    fn a_non_redirect_refusal_carries_the_body_and_its_status() {
+        let body = "rate limited, try later";
+        let (url, _seen, _) = listener(Some(format!(
+            "HTTP/1.1 429 Too Many Requests\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        )));
+        let spec = HttpSpec {
+            base_url: Box::leak(url.into_boxed_str()),
+            ..spec(PriceScale::Rupees)
+        };
+        let source = HttpSource::new(spec, "SUPERSECRET".to_owned()).expect("a client builds");
+        let request = BarRequest {
+            window: crate::session::Window::new(
+                crate::session::Day::new(2025, 7, 1).expect("a real day"),
+                crate::session::Day::new(2025, 7, 1).expect("a real day"),
+            )
+            .expect("a real window"),
+            cadence: crate::session::Cadence::Minute,
+        };
+        let outcome = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime")
+            .block_on(source.window_async(&request));
+
+        let Err(FetchError::VendorRefused { status, detail }) = outcome else {
+            panic!("429 is a refusal the governor needs to see")
+        };
+        assert_eq!(
+            status, 429,
+            "the governor's business, not a flattened 'failed'"
+        );
+        assert_eq!(detail, body, "the vendor's own words, unchanged");
+        assert!(
+            !detail.contains("redirect"),
+            "and no redirect wording: {detail}"
+        );
+    }
+
+    /// One window, fetched over a real socket, end to end.
+    ///
+    /// Everything else here drives one seam. This drives all of them at once —
+    /// the header, the wire dates, the status check, the size bound and the
+    /// decode — because until this test existed `window_async`'s success path
+    /// was the one part of the vendor client no test had ever entered.
+    #[test]
+    fn a_window_is_fetched_decoded_and_returned_over_a_real_socket() {
+        let body = r#"{"open":[24500.75],"high":[24500.75],"low":[24500.75],
+                       "close":[24500.75],"volume":[250],"timestamp":[1751337900],
+                       "open_interest":[41]}"#;
+        let (url, seen, _) = listener(Some(format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )));
+        let spec = HttpSpec {
+            base_url: Box::leak(url.into_boxed_str()),
+            fields: FieldNames {
+                open_interest: Some("open_interest"),
+                ..spec(PriceScale::Rupees).fields
+            },
+            ..spec(PriceScale::Rupees)
+        };
+        let window = source_of(spec, "SUPERSECRET")
+            .block_on_window()
+            .expect("a window comes back");
+        let row = &window.rows[0];
+        assert_eq!(row.open, 2_450_075, "the paise survive the whole path");
+        assert_eq!(row.volume, 250);
+        assert_eq!(
+            row.open_interest,
+            Some(41),
+            "a declared field is read, not zeroed"
+        );
+
+        // And the request that produced it carried the descriptor's own header
+        // and the descriptor's own wire dates — `toDate` exclusive, so the day
+        // AFTER the operator's last day.
+        let sent = seen
+            .recv_timeout(core::time::Duration::from_secs(5))
+            .expect("the vendor was contacted");
+        assert!(
+            sent.contains("access-token: SUPERSECRET") || sent.contains("x-token: SUPERSECRET")
+        );
+        assert!(sent.contains("2025-07-01"), "fromDate: {sent}");
+        assert!(sent.contains("2025-07-02"), "toDate is exclusive: {sent}");
+    }
+
+    /// A `GET` vendor puts its window in the query string, not in a body.
+    #[test]
+    fn a_get_vendor_carries_its_window_in_the_query_string() {
+        let (url, seen, _) = listener(Some(
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\
+             Connection: close\r\n\r\n"
+                .to_owned(),
+        ));
+        let spec = HttpSpec {
+            base_url: Box::leak(url.into_boxed_str()),
+            method: Method::Get,
+            range_end: RangeEnd::Inclusive,
+            auth: Auth {
+                header: "authorization",
+                scheme: AuthScheme::Bearer,
+            },
+            ..spec(PriceScale::Rupees)
+        };
+        let outcome = source_of(spec, "SUPERSECRET").block_on_window();
+        let sent = seen
+            .recv_timeout(core::time::Duration::from_secs(5))
+            .expect("the vendor was contacted");
+        assert!(sent.starts_with("GET /bars?"), "a GET with a query: {sent}");
+        assert!(sent.contains("from=2025-07-01"), "{sent}");
+        assert!(
+            sent.contains("to=2025-07-01"),
+            "an inclusive vendor takes the day unchanged: {sent}"
+        );
+        assert!(
+            sent.contains("authorization: Bearer SUPERSECRET"),
+            "the Bearer scheme is a prefix on the value, not a second header: {sent}"
+        );
+        // A 5xx is not the governor's business and is not a redirect either, so
+        // it carries neither redirect wording nor a body it does not have.
+        let Err(FetchError::VendorRefused { status, detail }) = outcome else {
+            panic!("500 is a refusal")
+        };
+        assert_eq!(status, 500);
+        assert!(
+            detail.is_empty(),
+            "no body, and nothing invented: {detail:?}"
+        );
+    }
+
+    /// A redirect with no `Location`, and a redirect that also says something.
+    ///
+    /// Both arms of the refusal's wording, which the two-socket test above does
+    /// not reach: it always sends a `Location` and never a body.
+    #[test]
+    fn a_redirect_says_so_with_or_without_a_location_and_with_or_without_a_body() {
+        let bare = "HTTP/1.1 307 Temporary Redirect\r\nContent-Length: 0\r\n\
+                    Connection: close\r\n\r\n";
+        let (url, _seen, _) = listener(Some(bare.to_owned()));
+        let no_location = HttpSpec {
+            base_url: Box::leak(url.into_boxed_str()),
+            ..spec(PriceScale::Rupees)
+        };
+        let Err(FetchError::VendorRefused { status, detail }) =
+            source_of(no_location, "SUPERSECRET").block_on_window()
+        else {
+            panic!("a 307 is still a redirect this build refuses")
+        };
+        assert_eq!(status, 307);
+        assert!(detail.contains("no Location header"), "{detail}");
+        assert!(detail.contains("does not follow redirects"), "{detail}");
+
+        // And one that redirects AND explains itself.
+        let chatty = "moved, ask elsewhere";
+        let (url, _seen, _) = listener(Some(format!(
+            "HTTP/1.1 301 Moved Permanently\r\nLocation: https://elsewhere.invalid/x\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{chatty}",
+            chatty.len()
+        )));
+        let with_body = HttpSpec {
+            base_url: Box::leak(url.into_boxed_str()),
+            ..spec(PriceScale::Rupees)
+        };
+        let Err(FetchError::VendorRefused { status, detail }) =
+            source_of(with_body, "SUPERSECRET").block_on_window()
+        else {
+            panic!("a 301 is still a redirect this build refuses")
+        };
+        assert_eq!(status, 301);
+        assert!(detail.contains("elsewhere.invalid"), "the target: {detail}");
+        assert!(detail.contains(chatty), "and the vendor's words: {detail}");
+        assert!(!detail.contains("SUPERSECRET"), "never the token: {detail}");
+    }
+
+    /// A shape no vendor in this build uses is refused rather than guessed at.
+    #[test]
+    fn an_array_of_objects_response_is_refused_because_no_decoder_was_written() {
+        let shape = HttpSpec {
+            response: ResponseShape::ArrayOfObjects { envelope: None },
+            ..spec(PriceScale::Rupees)
+        };
+        let Err(FetchError::TransportFailed { detail }) = decode_body("{}", &shape) else {
+            panic!("a decoder nobody has run against a real body is a decoder that is wrong")
+        };
+        assert!(detail.contains("no decoder was written"), "{detail}");
+    }
+
+    /// The blocking seam refuses by name rather than spinning a runtime per call.
+    #[test]
+    fn the_blocking_seam_refuses_and_names_the_asynchronous_one() {
+        let source = HttpSource::new(spec(PriceScale::Rupees), "SUPERSECRET".to_owned())
+            .expect("a client builds");
+        let Err(FetchError::TransportFailed { detail }) = source.window(&one_day()) else {
+            panic!("the sync seam cannot work and must say so")
+        };
+        assert!(
+            detail.contains("window_async"),
+            "it names the one that does: {detail}"
+        );
+        assert!(!detail.contains("SUPERSECRET"), "{detail}");
+    }
+
+    /// A count written as a decimal means the count, and a fractional one does
+    /// not mean anything.
+    ///
+    /// `250.0` of something is two hundred and fifty; `250.5` of something is a
+    /// shape this build does not understand, and it says so rather than
+    /// truncating. Same text parser as a price, with the hundredths required to
+    /// be zero.
+    #[test]
+    fn a_count_written_as_a_decimal_is_read_and_a_fractional_one_is_refused() {
+        let whole = r#"{"open":[1],"high":[1],"low":[1],"close":[1],
+                        "volume":[250.0],"timestamp":[1751337900.0]}"#;
+        let window = decode_body(whole, &spec(PriceScale::Paisa)).expect("decodes");
+        assert_eq!(window.rows[0].volume, 250, "250.0 of anything is 250");
+        assert_eq!(window.rows[0].timestamp, 1_751_337_900);
+
+        for bad in ["250.5", "\"250\"", "250.005"] {
+            let body = format!(
+                "{{\"open\":[1],\"high\":[1],\"low\":[1],\"close\":[1],\
+                  \"volume\":[{bad}],\"timestamp\":[1]}}"
+            );
+            let Err(FetchError::TransportFailed { detail }) =
+                decode_body(&body, &spec(PriceScale::Paisa))
+            else {
+                panic!("{bad} is not a whole count and must be refused, not truncated")
+            };
+            assert!(detail.contains("volume"), "the refusal names it: {detail}");
+        }
+    }
+
+    /// A socket that never answers is a named transport failure, and the
+    /// refusal cannot carry the credential — `reqwest`'s own words never
+    /// include a header this code set.
+    #[test]
+    fn a_host_that_cannot_be_reached_is_named_and_never_carries_the_token() {
+        // Port 1 on loopback: bound by nothing, and refused immediately rather
+        // than left to the 30-second timeout.
+        let spec = HttpSpec {
+            base_url: "http://127.0.0.1:1",
+            ..spec(PriceScale::Rupees)
+        };
+        let Err(FetchError::TransportFailed { detail }) =
+            source_of(spec, "SUPERSECRET").block_on_window()
+        else {
+            panic!("an unreachable host is a transport failure, not a window")
+        };
+        assert!(detail.contains("127.0.0.1:1"), "the URL is named: {detail}");
+        assert!(detail.contains("was not reached"), "{detail}");
+        assert!(
+            !detail.contains("SUPERSECRET"),
+            "the token leaked: {detail}"
+        );
+    }
+
+    /// The last day this calendar can name has no successor to put on the wire,
+    /// so an exclusive vendor is refused there rather than wrapping.
+    #[test]
+    fn the_last_nameable_day_has_no_exclusive_successor_and_says_so() {
+        let last = crate::session::Day::new(9999, 12, 31).expect("the last day");
+        let Err(FetchError::TransportFailed { detail }) =
+            HttpSource::wire_end(last, RangeEnd::Exclusive, DateFormat::DashedYmd)
+        else {
+            panic!("9999-12-31 has no day after it")
+        };
+        assert!(detail.contains("9999-12-31"), "the day is named: {detail}");
+        // An inclusive vendor takes it unchanged, because it needs no successor.
+        assert_eq!(
+            HttpSource::wire_end(last, RangeEnd::Inclusive, DateFormat::DashedYmd)
+                .expect("unchanged"),
+            "9999-12-31"
+        );
+    }
+
+    /// A one-day request, which is every socket test's window.
+    fn one_day() -> BarRequest {
+        BarRequest {
+            window: crate::session::Window::new(
+                crate::session::Day::new(2025, 7, 1).expect("a real day"),
+                crate::session::Day::new(2025, 7, 1).expect("a real day"),
+            )
+            .expect("a real window"),
+            cadence: crate::session::Cadence::Minute,
+        }
+    }
+
+    /// A source, and a runtime to drive its one asynchronous method.
+    fn source_of(spec: HttpSpec, token: &str) -> Driven {
+        Driven(HttpSource::new(spec, token.to_owned()).expect("a client builds"))
+    }
+
+    struct Driven(HttpSource);
+
+    impl Driven {
+        fn block_on_window(&self) -> Result<RawWindow, FetchError> {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a runtime")
+                .block_on(self.0.window_async(&one_day()))
+        }
     }
 
     /// `wire_end` is the one conversion site for a non-inclusive `toDate`.
