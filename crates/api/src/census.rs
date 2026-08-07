@@ -527,6 +527,178 @@ pub fn held_series(censuses: &[VendorCensus]) -> Vec<Series> {
     out
 }
 
+/// **Every instrument-month the store actually holds**, newest first.
+///
+/// # Why the grid needed a second shape
+///
+/// [`held_series`] gives the *axis*, and [`coverage_page`] crosses it with 36
+/// months — `instruments × months`, which is the right shape for "what am I
+/// missing". It is the wrong shape for "what do I have", and that is the
+/// question an operator opens `/store` to ask.
+///
+/// Measured on this operator's disk: **7,056 cells, of which 194 are held**.
+/// The page opened on 36 consecutive rows of `NSE-INDEX-BANKNIFTY` with a dash
+/// in every column, and the 194 real entries began somewhere on page 2 — so a
+/// store holding 62,978 bars *looked* empty, twice over. The first time was a
+/// probing bug (D-0048). The second time the probes were right and the page
+/// still opened on nothing, because a mostly-empty product is mostly empty.
+///
+/// This returns the entries themselves: one row per `(series, month)` that some
+/// vendor holds, and nothing else. **194 rows instead of 7,056**, and the first
+/// one has data in it.
+///
+/// # Cost
+///
+/// O(entries log entries), and it runs where [`held_series`] runs — once, at
+/// startup, in `api::server::Site::new`. `docs/06-limits.md` §32 covers both.
+///
+/// Sorted newest month first, then by series, because a store is read the way a
+/// bank statement is: the recent end matters most. Deterministic for the reason
+/// the axis is — a page addressed by ordinal cannot have a different row on it
+/// after a restart.
+#[must_use]
+pub fn held_entries(censuses: &[VendorCensus]) -> Vec<(Series, YearMonth)> {
+    let mut out: Vec<(Series, YearMonth)> = Vec::new();
+    for census in censuses {
+        if let Census::Held { ref manifest } = census.state {
+            out.extend(manifest.held_keys().map(|k| (Series::of(k), k.month)));
+        }
+    }
+    // Newest month first, then the series' own order. `Reverse` on the month
+    // alone, so two entries in one month still read alphabetically.
+    out.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    out.dedup();
+    out
+}
+
+/// What an operator narrowed the store page down to.
+///
+/// # Why a store page needs filters at all
+///
+/// `/store` answers "what do I have". With 194 entries that is a list; with the
+/// 248,000 `docs/07-o1-architecture.md` uses as its scale figure it is a list
+/// nobody can read. And the question is never really "what do I have" — it is
+/// "do I have **NIFTY** futures for **July**", which is four narrowings at once:
+/// the kind of instrument, its name, the bar length, and a span of months.
+///
+/// Every field is `None` by default and every `None` matches everything, so the
+/// unfiltered page is the same page it always was and a filter can only ever
+/// remove rows. That is what makes the count honest: `showing N of M` is a
+/// statement about this filter, not about the store.
+#[derive(Debug, Clone, Default)]
+pub struct StoreFilter {
+    /// Index, cash or F&O. `None` is all three.
+    pub segment: Option<Segment>,
+    /// A case-insensitive substring of the symbol — `NIFTY` finds
+    /// `NSE-INDEX-NIFTY` and `NSE-FNO-BANKNIFTY-III` alike.
+    pub symbol: Option<String>,
+    /// The bar length. `None` is every timeframe the store holds.
+    pub timeframe: Option<Timeframe>,
+    /// Earliest month to show, inclusive.
+    pub from: Option<YearMonth>,
+    /// Latest month to show, inclusive.
+    pub to: Option<YearMonth>,
+}
+
+impl StoreFilter {
+    /// Whether one held entry survives this filter.
+    ///
+    /// Every arm is a comparison on a fixed-width field except the symbol,
+    /// which is a substring search over at most `Symbol`'s 24 bytes — bounded,
+    /// so this is O(1) per entry rather than O(1) per *character of the store*.
+    #[must_use]
+    pub fn keeps(&self, series: &Series, month: YearMonth) -> bool {
+        if self.segment.is_some_and(|s| s != series.segment) {
+            return false;
+        }
+        if self.timeframe.is_some_and(|t| t != series.timeframe) {
+            return false;
+        }
+        if self.from.is_some_and(|f| month < f) {
+            return false;
+        }
+        if self.to.is_some_and(|t| month > t) {
+            return false;
+        }
+        match self.symbol {
+            // Upper-cased both sides rather than lower: every symbol this store
+            // holds is upper-case already, so this folds only the operator's
+            // typing and never allocates for the stored side twice.
+            Some(ref needle) if !needle.is_empty() => series
+                .symbol
+                .as_str()
+                .to_uppercase()
+                .contains(&needle.to_uppercase()),
+            _ => true,
+        }
+    }
+
+    /// Whether anything at all was narrowed.
+    ///
+    /// The page says "showing every month held" or "showing N of M" depending,
+    /// and a filter that silently matched everything would make the second
+    /// sentence a lie.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.segment.is_none()
+            && self.timeframe.is_none()
+            && self.from.is_none()
+            && self.to.is_none()
+            && self.symbol.as_ref().is_none_or(String::is_empty)
+    }
+}
+
+/// Every held entry this filter keeps.
+///
+/// # Cost, stated
+///
+/// **O(entries)** — one pass with a bounded test per entry. Not O(1), and it is
+/// on a request path, which `docs/06-limits.md` §36 records rather than hides.
+/// It is the same bargain `/instruments` search already made (§24): a store of
+/// 194 entries filters immeasurably fast, and at 248,000 it is one pass over a
+/// vector already in memory, with no allocation per row and no disk touched.
+///
+/// The alternative — an index per filterable field, maintained on write — is
+/// four more things to keep in step with the manifest for a question asked by a
+/// human at human speed. Recorded as a deliberate choice, not an oversight.
+#[must_use]
+pub fn filtered(entries: &[(Series, YearMonth)], filter: &StoreFilter) -> Vec<(Series, YearMonth)> {
+    if filter.is_empty() {
+        return entries.to_vec();
+    }
+    entries
+        .iter()
+        .filter(|&&(series, month)| filter.keeps(&series, month))
+        .copied()
+        .collect()
+}
+
+/// One page of [`held_entries`], as the grid renders it.
+///
+/// Ordinal arithmetic, exactly as [`coverage_page`] uses: a request for page 5
+/// touches the rows of page 5 and builds nothing for the rest.
+#[must_use]
+pub fn held_page(
+    entries: &[(Series, YearMonth)],
+    censuses: &[VendorCensus],
+    skip: usize,
+    take: usize,
+) -> Vec<Coverage> {
+    entries
+        .iter()
+        .skip(skip)
+        .take(take)
+        .map(|&(series, month)| Coverage {
+            series,
+            month,
+            rows: censuses
+                .iter()
+                .map(|c| (c.vendor, c.rows_for(&series.at(month))))
+                .collect(),
+        })
+        .collect()
+}
+
 /// The two series the engine sweeps, as the store spells them.
 ///
 /// `CLAUDE.md` §1 fixes the surface at exactly these two. They are always on the

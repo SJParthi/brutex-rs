@@ -780,6 +780,9 @@ pub struct Site {
     pub series: Vec<census::Series>,
     /// Folders holding CSVs, walked once at startup rather than per render.
     pub folders: Vec<String>,
+    /// Every instrument-month some vendor holds, newest first — the rows
+    /// `/store` opens on, as opposed to the mostly-empty product of the axis.
+    pub entries: Vec<(census::Series, store::path::YearMonth)>,
     /// How many instruments each spot target covers, in
     /// [`ingest::SpotTarget::ALL`] order.
     ///
@@ -839,10 +842,17 @@ impl Site {
         // `~/Downloads` -- a directory this repository does not own and cannot
         // bound. Same move D-0039 made for the master. See render::folder_suggestions.
         let folders = render::folder_suggestions();
+        // WHAT THE STORE ACTUALLY HOLDS, as rows rather than as a product.
+        // The axis above crossed with 36 months is 7,056 cells of which 194
+        // are held, so `/store` opened on 36 blank BANKNIFTY rows and the real
+        // entries began on page 2. Computed here for the same reason the axis
+        // is: once, at startup. See census::held_entries.
+        let entries = census::held_entries(&censuses);
         Self {
             read,
             censuses,
             series,
+            entries,
             folders,
             targets,
             store_root,
@@ -1673,7 +1683,12 @@ async fn store_get(
     let (code, body) = dated(ingest::today_ist(), "Store", |today| {
         (
             axum::http::StatusCode::OK,
-            store_html(&site, today, page_number(uri.query().unwrap_or(""))),
+            store_html(
+                &site,
+                today,
+                page_number(uri.query().unwrap_or("")),
+                uri.query().unwrap_or(""),
+            ),
         )
     });
     (code, axum::response::Html(body))
@@ -1685,20 +1700,54 @@ async fn store_get(
 /// no file, and a page that 500s on a fresh install is a page that is broken
 /// exactly when an operator most needs to look at it.
 #[must_use]
-pub fn store_html(site: &Site, today: Day, page: usize) -> String {
-    // The grid is instruments × months and both factors are bounded, so the
-    // last page is a division rather than a walk, and `?page=999` clamps to
-    // somewhere real for the same reason `/instruments` does.
-    let total = census::grid_rows(site.series.len());
-    let last_page = total.saturating_sub(1) / PAGE_ROWS;
+pub fn store_html(site: &Site, today: Day, page: usize, query: &str) -> String {
+    // ── THE PAGE OPENS ON WHAT IS HELD, NOT ON THE PRODUCT ───────────────
+    //
+    // It used to render `series × 36 months` unconditionally: 7,056 cells on
+    // this operator's disk, of which 194 are held. So `/store` opened on 36
+    // consecutive blank rows of one index and the real entries began on page
+    // two — a store holding 62,978 bars that LOOKED empty, which is the same
+    // sentence D-0048 was written to stop being true.
+    //
+    // `show=gaps` still renders the product, because "what am I missing" is a
+    // real question. It is just not the first one.
+    let filter = store_filter(query);
+    let held_only = param(query, "show") != "gaps";
+
+    let (rows, total, last_page) = if held_only {
+        let kept = census::filtered(&site.entries, &filter);
+        let total = kept.len();
+        let last = total.saturating_sub(1) / PAGE_ROWS;
+        let page = page.min(last);
+        (
+            census::held_page(
+                &kept,
+                &site.censuses,
+                page.saturating_mul(PAGE_ROWS),
+                PAGE_ROWS,
+            ),
+            total,
+            last,
+        )
+    } else {
+        // The product, as before: bounded by construction, so the last page is
+        // a division rather than a walk and `?page=999` clamps.
+        let total = census::grid_rows(site.series.len());
+        let last = total.saturating_sub(1) / PAGE_ROWS;
+        let page = page.min(last);
+        (
+            census::coverage_page(
+                &site.series,
+                &site.censuses,
+                today,
+                page.saturating_mul(PAGE_ROWS),
+                PAGE_ROWS,
+            ),
+            total,
+            last,
+        )
+    };
     let page = page.min(last_page);
-    let rows = census::coverage_page(
-        &site.series,
-        &site.censuses,
-        today,
-        page.saturating_mul(PAGE_ROWS),
-        PAGE_ROWS,
-    );
     let mut notes = vec![format!(
         "store root: {} — every figure here is a field read of one manifest \
          header, and every grid cell is one hash probe",
@@ -1746,7 +1795,36 @@ pub fn store_html(site: &Site, today: Day, page: usize) -> String {
         last_page,
         total,
         notes: &notes,
+        filter: Some(&filter),
+        held: site.entries.len(),
+        held_only,
     })
+}
+
+/// The four narrowings, out of a query string.
+///
+/// Every one is optional and a missing or malformed value is simply `None` —
+/// there is no refusal here on purpose. A filter is a *view*, not a request to
+/// change anything, and answering `?from=banana` with an error page would be
+/// louder than the mistake deserves. What it must never do is silently apply a
+/// DIFFERENT filter than the one shown, which is why the controls render from
+/// this same struct: what the bar shows is what was parsed.
+fn store_filter(query: &str) -> census::StoreFilter {
+    let month = |raw: &str| -> Option<store::path::YearMonth> {
+        let (y, m) = raw.split_once('-')?;
+        store::path::YearMonth::new(y.parse().ok()?, m.parse().ok()?).ok()
+    };
+    let symbol = param(query, "symbol");
+    census::StoreFilter {
+        segment: brutex_core::instrument::Segment::parse(&param(query, "kind")).ok(),
+        symbol: (!symbol.is_empty()).then_some(symbol),
+        // Not offered in the bar yet: the store holds one timeframe today, and
+        // a control with one option is a control that lies about having a
+        // choice. The field is parsed so a URL can still carry it.
+        timeframe: None,
+        from: month(&param(query, "from")),
+        to: month(&param(query, "to")),
+    }
 }
 
 /// Every route this server answers, serving from an already-loaded site.
@@ -3201,7 +3279,7 @@ mod tests {
         // be an error — this is the page you look at to find out why.
         let dir = agreeing("storeabsent");
         let site = site("storeabsent", &dir);
-        let html = store_html(&site, day(2026, 8, 7), 0);
+        let html = store_html(&site, day(2026, 8, 7), 0, "show=gaps");
 
         assert!(html.starts_with("<!doctype html>"));
         assert!(html.ends_with("</html>"));
@@ -3245,7 +3323,7 @@ mod tests {
         let dir = agreeing("storezero");
         let site = Site::new(universe(&dir), census::read_all(&root), root);
 
-        let html = store_html(&site, day(2026, 8, 7), 0);
+        let html = store_html(&site, day(2026, 8, 7), 0, "show=gaps");
         assert!(
             html.contains("<div class=\"cv\">0</div>"),
             "zero months: {html}"
@@ -3264,8 +3342,8 @@ mod tests {
 
         // PAGING PAST THE END CLAMPS. `?page=999` is a stale bookmark, not an
         // attack, and it must land somewhere real.
-        let first = store_html(&site, day(2026, 8, 7), 0);
-        let past = store_html(&site, day(2026, 8, 7), 999);
+        let first = store_html(&site, day(2026, 8, 7), 0, "show=gaps");
+        let past = store_html(&site, day(2026, 8, 7), 999, "show=gaps");
         assert_eq!(past, first, "an out-of-range page clamps to the last one");
         assert!(
             past.contains("NSE-INDEX-NIFTY"),
@@ -3295,21 +3373,21 @@ mod tests {
             .collect();
         assert_eq!(census::grid_rows(site.series.len()), 360);
 
-        let first = store_html(&site, day(2026, 8, 7), 0);
+        let first = store_html(&site, day(2026, 8, 7), 0, "show=gaps");
         assert!(first.contains("page 1 of 2"), "{first}");
         assert!(first.contains("next"), "{first}");
         assert!(!first.contains("previous"), "no previous to nowhere");
         assert!(first.contains("360 instrument-month(s)"), "{first}");
         assert!(first.contains("showing 200"), "{first}");
 
-        let last = store_html(&site, day(2026, 8, 7), 1);
+        let last = store_html(&site, day(2026, 8, 7), 1, "show=gaps");
         assert!(last.contains("page 2 of 2"), "{last}");
         assert!(last.contains("previous"), "{last}");
         assert!(!last.contains("next &rarr;"), "{last}");
         assert!(last.contains("showing 160"), "the remainder: {last}");
 
         // And past the end clamps onto that last page exactly.
-        assert_eq!(store_html(&site, day(2026, 8, 7), 99), last);
+        assert_eq!(store_html(&site, day(2026, 8, 7), 99, "show=gaps"), last);
     }
 
     #[test]
@@ -3583,7 +3661,7 @@ mod tests {
         assert_eq!(site.series.len(), 2, "the engine surface, exactly");
         assert_eq!(site.targets, [0, 0, 0], "and no target has members");
 
-        let html = store_html(&site, day(2026, 8, 7), 0);
+        let html = store_html(&site, day(2026, 8, 7), 0, "show=gaps");
         assert!(
             html.contains("NSE-INDEX-NIFTY") && html.contains("NSE-INDEX-BANKNIFTY"),
             "{html}"
@@ -4247,7 +4325,7 @@ mod tests {
         let page = audit_html(&site, day(2026, 8, 7), 0);
         assert!(page.contains("UNREADABLE —"), "{page}");
         assert!(page.contains("ATTENTION"), "the badge is loud: {page}");
-        let store = store_html(&site, day(2026, 8, 7), 0);
+        let store = store_html(&site, day(2026, 8, 7), 0, "show=gaps");
         assert!(store.contains("UNAVAILABLE — audit journal"), "{store}");
 
         // AND THE RECEIPT NAMES THE LOST RECORD. A run whose 256 bytes could
@@ -4529,7 +4607,7 @@ mod tests {
         std::fs::write(&path, manifest.image()).expect("writes");
 
         let site = Site::load(&dir, &root);
-        let html = store_html(&site, day(2026, 8, 7), 0);
+        let html = store_html(&site, day(2026, 8, 7), 0, "show=gaps");
 
         // The counter card reads the file, not a guess.
         assert!(
@@ -4583,7 +4661,7 @@ mod tests {
     fn the_store_page_says_when_its_counters_are_older_than_the_last_pull() {
         let dir = agreeing("storestale");
         let site = site("storestale", &dir);
-        let fresh = store_html(&site, day(2026, 8, 7), 0);
+        let fresh = store_html(&site, day(2026, 8, 7), 0, "show=gaps");
         assert!(
             !fresh.contains("these manifests were read at"),
             "nothing has happened yet: {fresh}"
@@ -4601,7 +4679,7 @@ mod tests {
                 "",
             ))
             .expect("appends");
-        let stale = store_html(&site, day(2026, 8, 7), 0);
+        let stale = store_html(&site, day(2026, 8, 7), 0, "show=gaps");
         assert!(
             stale.contains("UNCHECKED — a pull ran at"),
             "the staleness is named, not left to be discovered: {stale}"

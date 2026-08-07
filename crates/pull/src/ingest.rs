@@ -241,10 +241,31 @@ pub fn from_dir(
 ) -> Result<Ingested, archive::ArchiveError> {
     // Only the column layout and the vendor are needed here; `one`
     // destructures the rest.
-    let Plan {
-        columns, vendor, ..
-    } = plan;
+    let Plan { columns, .. } = plan;
     let members = archive::read_dir(dir, columns)?;
+    Ok(from_members(&members, store_root, plan))
+}
+
+/// Every member, through the census, the store and the counter file.
+///
+/// # Why this is its own function
+///
+/// It was the back half of [`from_dir`], reachable only by naming a directory.
+/// The broker path has no directory — [`crate::http::HttpSource`] answers with
+/// a [`crate::fetch::RawWindow`] in memory — and it needs every line of this:
+/// the census read before any bar is written, the degraded-census note, the
+/// per-member land/fold/append, the folded drop counts, the counter row, the
+/// one install after the loop, and each of the failures named along the way.
+///
+/// Copying it for the second caller would have been two implementations of
+/// "what a pull does", and the second one would have been wrong first. So both
+/// callers build `Member`s and hand them here, and a bar fetched from a broker
+/// takes byte-for-byte the same path to disk as one read from a folder.
+///
+/// See [`from_window`] for the broker's side of that.
+#[must_use]
+pub fn from_members(members: &[Member], store_root: &Path, plan: Plan<'_>) -> Ingested {
+    let Plan { vendor, .. } = plan;
     let mut done = Ingested {
         members: members.len(),
         ..Ingested::default()
@@ -265,7 +286,7 @@ pub fn from_dir(
                 instrument: census_path.display().to_string(),
                 why,
             });
-            return Ok(done);
+            return done;
         }
     };
 
@@ -288,7 +309,7 @@ pub fn from_dir(
     }
     let mut publish = repairing;
 
-    for member in &members {
+    for member in members {
         done.rows_read += member.rows.len();
         match one(member, store_root, plan) {
             Ok(landed) => {
@@ -349,7 +370,41 @@ pub fn from_dir(
         });
     }
 
-    Ok(done)
+    done
+}
+
+/// One window fetched from a broker, through the same path a folder takes.
+///
+/// # The join this repository was one function short of
+///
+/// `docs/05-decisions.md` D-0035 stopped at the credential port; the page's own
+/// banner has said since then that "what is missing is one join". This is it.
+///
+/// [`crate::http::HttpSource::window_async`] answers with a
+/// [`crate::fetch::RawWindow`] — the same seven parallel arrays a CSV member
+/// decodes into — so the broker's rows are wrapped in a [`Member`] and handed to
+/// [`from_members`]. **Nothing downstream can tell the two apart**, which is the
+/// point: the session filter, the drop census, the fold, the append, the counter
+/// row and every refusal are one implementation, not two.
+///
+/// `instrument` is what the store will file the bars under, and it comes from
+/// the caller because only the caller knows which contract it asked the broker
+/// for. `origin` is recorded on the member so a refusal downstream can name
+/// where the rows came from — a URL here, where a folder path would be.
+#[must_use]
+pub fn from_window(
+    raw: &crate::fetch::RawWindow,
+    instrument: &str,
+    origin: &str,
+    store_root: &Path,
+    plan: Plan<'_>,
+) -> Ingested {
+    let member = Member {
+        path: std::path::PathBuf::from(origin),
+        instrument: instrument.to_owned(),
+        rows: raw.rows.clone(),
+    };
+    from_members(std::slice::from_ref(&member), store_root, plan)
 }
 
 /// What one member put on disk, and the counter row that describes it.

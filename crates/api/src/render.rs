@@ -87,6 +87,30 @@ box-shadow:0 5px 16px color-mix(in srgb,var(--acc) 34%,transparent);transition:t
 button:hover{transform:translateY(-2px);box-shadow:0 9px 24px color-mix(in srgb,var(--acc) 42%,transparent)}\
 form a{color:var(--dim);font-size:13px;text-decoration:none}\
 form a:hover{color:var(--acc)}\
+.filters{padding:18px 20px}\
+.fbar{display:flex;flex-wrap:wrap;gap:16px 22px;align-items:flex-end;margin:0;max-width:none;padding:0}\
+.fgroup{display:flex;flex-direction:column;gap:7px}\
+.flabel{font-size:10.5px;font-weight:750;letter-spacing:1.2px;text-transform:uppercase;color:var(--dim)}\
+.pills{display:flex;flex-wrap:wrap;gap:6px}\
+.pills input{position:absolute;opacity:0;width:0;height:0;pointer-events:none}\
+.pills label{cursor:pointer;font-size:13px;font-weight:650;padding:8px 14px;border-radius:999px;\
+border:1px solid var(--line);color:var(--dim);background:var(--panel);transition:all .16s;\
+user-select:none;white-space:nowrap}\
+.pills label:hover{border-color:var(--acc);color:var(--ink);transform:translateY(-1px)}\
+.pills input:checked+label{background:linear-gradient(135deg,var(--acc),var(--acc2));color:#fff;\
+border-color:transparent;box-shadow:0 3px 10px color-mix(in srgb,var(--acc) 34%,transparent)}\
+.fbar input[type=text]{font:inherit;font-size:14px;padding:9px 13px;border:1px solid var(--line);\
+border-radius:10px;background:var(--panel);color:var(--ink);min-width:0;width:auto;\
+transition:border-color .16s,box-shadow .16s}\
+.fbar input[type=text]:focus{outline:none;border-color:var(--acc);\
+box-shadow:0 0 0 3px color-mix(in srgb,var(--acc) 18%,transparent)}\
+.fgo{flex-direction:row;align-items:center;gap:12px}\
+.fbar button{font:inherit;font-size:14px;font-weight:700;padding:10px 22px;border:0;border-radius:10px;\
+cursor:pointer;color:#fff;background:linear-gradient(135deg,var(--acc),var(--acc2));\
+box-shadow:0 3px 12px color-mix(in srgb,var(--acc) 34%,transparent);transition:transform .16s}\
+.fbar button:hover{transform:translateY(-1px)}\
+.fbar .clear{font-size:13px;color:var(--dim);text-decoration:none;border-bottom:1px solid transparent}\
+.fbar .clear:hover{color:var(--acc);border-bottom-color:var(--acc)}\
 details.notes{margin:0 auto 16px;max-width:1180px;background:var(--panel);\
 border:1px solid var(--line);border-radius:13px;box-shadow:var(--sh);\
 color:var(--dim);font-size:13px;overflow:hidden}\
@@ -1814,6 +1838,108 @@ pub struct StoreView<'a> {
     pub total: usize,
     /// Everything an operator has to be told.
     pub notes: &'a [String],
+    /// What the operator narrowed to, so the controls render already set and a
+    /// link is shareable. `None` on a page that has no filter bar.
+    pub filter: Option<&'a crate::census::StoreFilter>,
+    /// How many entries the store holds before this filter — the `of M` in
+    /// "showing N of M". Zero when nothing has been ingested.
+    pub held: usize,
+    /// Whether the page is listing what is HELD, or the full month product.
+    pub held_only: bool,
+}
+
+/// The filter bar: what to look at, in four narrowings.
+///
+/// # Why this exists
+///
+/// `/store` used to render `instruments × 36 months` and nothing else, so a
+/// store holding 194 entries opened on 36 consecutive blank rows of one index
+/// and the real data began on page 2. The question an operator actually has is
+/// never "show me the product" — it is "do I have NIFTY futures for July",
+/// which is four narrowings: kind, name, bar length, and a span of months.
+///
+/// A `method="get"` form, so every narrowing is in the URL: the result is
+/// bookmarkable, reloadable and sendable to someone else. That is the same
+/// reason `/instruments` search is a GET, and it is why no script is needed for
+/// any of it.
+fn store_filter_bar(filter: &crate::census::StoreFilter, held_only: bool) -> String {
+    let mut out = String::with_capacity(2048);
+    out.push_str(
+        "<section class=\"wrap\"><div class=\"panel filters\">\
+         <form method=\"get\" action=\"/store\" class=\"fbar\">",
+    );
+
+    // ---- KIND -----------------------------------------------------------
+    // Radio pills rather than a <select>: the whole set is four, and a control
+    // that shows its options without being opened is one fewer click.
+    out.push_str("<div class=\"fgroup\"><span class=\"flabel\">Kind</span><div class=\"pills\">");
+    for (value, label) in [
+        ("", "All"),
+        ("INDEX", "Indices"),
+        ("CASH", "Stocks"),
+        ("FNO", "Futures &amp; Options"),
+    ] {
+        let on = match filter.segment {
+            None => value.is_empty(),
+            Some(s) => s.as_str() == value,
+        };
+        let checked = if on { " checked" } else { "" };
+        let _ = write!(
+            out,
+            "<input type=\"radio\" name=\"kind\" id=\"k-{value}\" value=\"{value}\"{checked}>\
+             <label for=\"k-{value}\">{label}</label>"
+        );
+    }
+    out.push_str("</div></div>");
+
+    // ---- SYMBOL ---------------------------------------------------------
+    let symbol = filter.symbol.as_deref().unwrap_or("");
+    let _ = write!(
+        out,
+        "<div class=\"fgroup\"><span class=\"flabel\">Instrument</span>\
+         <input type=\"text\" name=\"symbol\" value=\"{}\" \
+         placeholder=\"NIFTY, RELIANCE, ABB…\" autocomplete=\"off\"></div>",
+        escape(symbol)
+    );
+
+    // ---- MONTHS ---------------------------------------------------------
+    // Typed as YYYY-MM. A month is not a date and the calendar picker would be
+    // the wrong control: it offers 31 days the store has no opinion about.
+    let month_value =
+        |m: Option<store::path::YearMonth>| m.map_or_else(String::new, |m| format!("{m}"));
+    let _ = write!(
+        out,
+        "<div class=\"fgroup\"><span class=\"flabel\">From month</span>\
+         <input type=\"text\" name=\"from\" value=\"{}\" placeholder=\"2025-07\" \
+         autocomplete=\"off\" size=\"9\"></div>\
+         <div class=\"fgroup\"><span class=\"flabel\">To month</span>\
+         <input type=\"text\" name=\"to\" value=\"{}\" placeholder=\"2026-08\" \
+         autocomplete=\"off\" size=\"9\"></div>",
+        escape(&month_value(filter.from)),
+        escape(&month_value(filter.to))
+    );
+
+    // ---- WHAT TO LIST ----------------------------------------------------
+    // The default is what is HELD. The full product is still one click away,
+    // because "what am I missing" is a real question — just not the first one.
+    let gaps = if held_only { "" } else { " checked" };
+    let _ = write!(
+        out,
+        "<div class=\"fgroup\"><span class=\"flabel\">Show</span><div class=\"pills\">\
+         <input type=\"radio\" name=\"show\" id=\"s-held\" value=\"\"{}>\
+         <label for=\"s-held\">What I have</label>\
+         <input type=\"radio\" name=\"show\" id=\"s-gaps\" value=\"gaps\"{gaps}>\
+         <label for=\"s-gaps\">Every month, incl. gaps</label>\
+         </div></div>",
+        if held_only { " checked" } else { "" }
+    );
+
+    out.push_str(
+        "<div class=\"fgroup fgo\"><button type=\"submit\">Show</button>\
+         <a class=\"clear\" href=\"/store\">clear</a></div>",
+    );
+    out.push_str("</form></div></section>");
+    out
 }
 
 /// The per-vendor counter cards. One field read each, never a walk.
@@ -1951,15 +2077,47 @@ pub fn store_page(view: &StoreView<'_>) -> String {
         }
     }
     body.push_str(&census_cards(view.censuses));
-    let _ = write!(
-        body,
-        "<p class=\"sub\">{} instrument-month(s) in the grid · showing {} · \
-         newest month is {}-{:02}, three years back</p>",
-        view.total,
-        view.rows.len(),
-        view.today.year(),
-        view.today.month(),
-    );
+    if let Some(filter) = view.filter {
+        body.push_str(&store_filter_bar(filter, view.held_only));
+    }
+    // THE SUMMARY SAYS WHICH QUESTION IS BEING ANSWERED. "4 of 7,056" and
+    // "194 held" are both true and mean opposite things, and a page that shows
+    // one number while the reader assumes the other is the shape D-0048 was
+    // written about.
+    if view.held_only {
+        let narrowed = view.filter.is_some_and(|f| !f.is_empty());
+        let _ = write!(
+            body,
+            "<p class=\"sub\"><b>{}</b> instrument-month(s) held{} · showing {} \
+             on this page{}</p>",
+            view.total,
+            if narrowed {
+                format!(" of {} in the store", view.held)
+            } else {
+                String::new()
+            },
+            view.rows.len(),
+            if view.total == 0 && view.held > 0 {
+                " — nothing matches this filter; the store is not empty"
+            } else if view.held == 0 {
+                " — nothing has been ingested yet"
+            } else {
+                ""
+            }
+        );
+    } else {
+        let _ = write!(
+            body,
+            "<p class=\"sub\">{} instrument-month(s) in the grid · showing {} · \
+             newest month is {}-{:02}, three years back · \
+             <b>{}</b> of them are held</p>",
+            view.total,
+            view.rows.len(),
+            view.today.year(),
+            view.today.month(),
+            view.held,
+        );
+    }
     body.push_str(&coverage_table(view));
     body.push_str(&pager("/store", view.page, view.last_page));
     body.push_str(&notes_block(view.notes));
@@ -3364,6 +3522,12 @@ mod tests {
             last_page: 0,
             total: 2,
             notes: &["store root: /tmp/x".to_owned()],
+            // This fixture is about the TABLE, not the filter bar, so it
+            // renders without one — `filter: None` is what a page with no bar
+            // looks like, and the assertions below stay about the rows.
+            filter: None,
+            held: 1,
+            held_only: false,
         });
         assert!(html.starts_with("<!doctype html>"));
         assert!(html.ends_with("</html>"));
