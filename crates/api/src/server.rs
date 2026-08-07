@@ -13,9 +13,11 @@
 //! shows every ISIN two vendors disagree about, because a disagreement nobody
 //! sees decides the run on its own.
 
-use crate::{master, merge, render};
-use brutex_core::universe::Universe;
+use crate::catalog::{Catalog, PAGE_ROWS, Selection};
+use crate::{census, ingest, master, merge, render};
+use brutex_core::instrument::InstrumentKey;
 use brutex_core::vendor::Vendor;
+use pull::session::Day;
 use std::fmt::Write as _;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -29,11 +31,23 @@ use std::path::{Path, PathBuf};
 pub const DEFAULT_ADDR: SocketAddr =
     SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 8080);
 
-/// The most rows one page renders.
+/// The longest request body either form may send.
 ///
-/// A page shows what a person can read; the rest cost nothing because they are
-/// never touched, which is what keeps rendering O(rows shown).
-const PAGE_ROWS: usize = 200;
+/// # Why the number is small and why it is stated
+///
+/// The two forms are five short fields between them: a target slug, a series
+/// slug, an underlying symbol of at most `brutex_core::symbol::SYMBOL_CAPACITY`
+/// bytes, and two ten-character dates. Percent-encoding is at worst 3× per
+/// byte. 8 KiB is roughly 80× the largest honest body and still small enough
+/// that a body over it is unambiguously not a form this server serves.
+///
+/// It is stated because a bound nobody wrote down is a bound nobody owns.
+/// `axum` applies a 2 MiB default, so a 2 MiB `to_uppercase()` of a field that
+/// `Symbol::new` then refuses for being over 24 bytes was reachable, and the
+/// only thing standing between this server and that allocation was a
+/// dependency's default value. A request past this answers `413` — the refusal
+/// is the framework's and it is loud, not a truncation.
+const MAX_FORM_BYTES: usize = 8 * 1024;
 
 /// The signal that stops the server.
 ///
@@ -110,6 +124,34 @@ fn masters_dir_from(value: Option<std::ffi::OsString>) -> PathBuf {
     value.map_or_else(default_masters_dir, PathBuf::from)
 }
 
+/// The directory the bar store and its manifests are read from.
+///
+/// `BRUTEX_STORE`, or `$HOME/.brutex/store`. Split exactly as
+/// [`masters_dir`] is, and for the same reason: the environment is consulted in
+/// one place and every function below takes the directory as an argument.
+#[must_use]
+pub fn store_dir() -> PathBuf {
+    store_dir_from(std::env::var_os("BRUTEX_STORE"), std::env::var_os("HOME"))
+}
+
+/// The store directory implied by values of `BRUTEX_STORE` and `HOME`.
+///
+/// Both outcomes have to be testable and a test cannot set either variable:
+/// `set_var` is `unsafe` under edition 2024, this crate forbids `unsafe`, and
+/// mutating process-wide state would race every other test in the binary.
+#[must_use]
+fn store_dir_from(value: Option<std::ffi::OsString>, home: Option<std::ffi::OsString>) -> PathBuf {
+    value.map_or_else(
+        || {
+            home.map_or_else(
+                || PathBuf::from("."),
+                |h| PathBuf::from(h).join(".brutex").join("store"),
+            )
+        },
+        PathBuf::from,
+    )
+}
+
 /// Where the masters live when `BRUTEX_MASTERS` says nothing.
 ///
 /// `$HOME/.brutex/masters`, not the working directory. The masters are ~50 MB
@@ -163,9 +205,45 @@ pub struct Read {
     /// gate. Counted here so it reaches the status and the exit code, because
     /// the reason string alone sat beside six routine ones and read like them.
     pub unrecognised: usize,
+
+    /// How many rows no decoder could read, across every vendor.
+    ///
+    /// Carried as a field because `is_clean` must consult it, and a count
+    /// folded into a note string is not consultable.
+    pub unreadable: usize,
+    /// Every ordering and every filter the pages offer, decided once.
+    ///
+    /// The reason it is here and not built per request is `docs/05-decisions.md`
+    /// D-0042: the masters are parsed once into an `Arc<Site>`, and that parse
+    /// is the only place a whole-universe pass may happen.
+    pub catalog: Catalog,
 }
 
 impl Read {
+    /// Builds a read, computing everything a request must not compute.
+    ///
+    /// Struct-literal construction is deliberately not the way in: the
+    /// precomputed [`Catalog`] is the whole of D-0042, and a caller that filled
+    /// the fields by hand would get a page that silently went back to scanning.
+    #[must_use]
+    pub fn new(
+        merged: merge::Merged,
+        notes: Vec<String>,
+        unavailable: bool,
+        unrecognised: usize,
+        unreadable: usize,
+    ) -> Self {
+        let catalog = Catalog::build(&merged);
+        Self {
+            merged,
+            notes,
+            unavailable,
+            unrecognised,
+            unreadable,
+            catalog,
+        }
+    }
+
     /// Whether this read is fit to be believed.
     ///
     /// A missing vendor counts. So does any disagreement. So does a listing
@@ -173,7 +251,25 @@ impl Read {
     /// bond and an alphabet moving under us.
     #[must_use]
     pub fn is_clean(&self) -> bool {
-        !self.unavailable
+        // `errors` is load-bearing here and was missing, which made this the
+        // worst shape of bug this repository hunts: a plausible wrong answer.
+        //
+        // A permutation audit traced the path. If BOTH master files fail to
+        // decode entirely, no row ever reaches the series gate, so
+        // `unrecognised` stays 0; nothing is kept, so there is nothing to
+        // disagree about and `merged.verdict()` is `Clean`; the files were
+        // found, so `unavailable` is false. Every term was true and
+        // `status()` answered "ok" over a universe of zero instruments.
+        //
+        // A monitor reading one word would have seen a healthy server. The
+        // decode failures were never hidden — `errors_by_reason` renders them
+        // on the page — but the machine-readable word did not consult them,
+        // which is `CLAUDE.md` §4's "fallback that hides a failure" arriving
+        // by omission rather than by design.
+        //
+        // `api::unit::a_total_decode_failure_is_not_clean` is what holds it up.
+        self.unreadable == 0
+            && !self.unavailable
             && self.unrecognised == 0
             && self.merged.verdict() == merge::Verdict::Clean
     }
@@ -198,6 +294,7 @@ pub fn universe(dir: &Path) -> Read {
     let mut sources = Vec::new();
     let mut unavailable = false;
     let mut unrecognised = 0;
+    let mut unreadable = 0;
     for (vendor, path) in master_paths(dir) {
         match master::load(&path, vendor) {
             Ok(l) => {
@@ -208,6 +305,7 @@ pub fn universe(dir: &Path) -> Read {
                     l.skipped_total(),
                     l.errors.len()
                 );
+                unreadable += l.errors.len();
                 for (reason, n) in l.skipped_by_reason() {
                     let _ = write!(note, " · {reason} {n}");
                 }
@@ -267,12 +365,7 @@ pub fn universe(dir: &Path) -> Read {
             alone.join(", ")
         ));
     }
-    Read {
-        merged,
-        notes,
-        unavailable,
-        unrecognised,
-    }
+    Read::new(merged, notes, unavailable, unrecognised, unreadable)
 }
 
 /// Liveness plus the decode tallies, so a machine can check what a human sees.
@@ -455,76 +548,16 @@ pub fn instruments_html_from(
     // 2,700 rows hides the 785 that matter — but a filter with no way past it
     // hides a bug instead, so the escape hatch is a link on the page, not a
     // recompile.
-    let tracked =
-        |u: Universe| all || u.contains(Universe::TOTAL_MARKET) || u.contains(Universe::INDEX);
-    // COUNTS OVER THE WHOLE TRACKED SET, never over the rendered page. A pill
-    // that counts the 200 rows on screen says 52 when the answer is 208, and
-    // looks authoritative doing it.
-    let counts = read
-        .merged
-        .by_key
-        .values()
-        .filter(|e| tracked(e.universe))
-        .fold(render::UniverseCounts::default(), |mut c, e| {
-            c.all += 1;
-            c.fno += usize::from(e.universe.contains(Universe::FNO));
-            c.ntm += usize::from(e.universe.contains(Universe::TOTAL_MARKET));
-            c.index += usize::from(e.universe.contains(Universe::INDEX));
-            c
-        });
-    let total = counts.all;
-
-    // The universe pill, applied HERE so it selects from the whole set rather
-    // than hiding rows the page happened to load. An unrecognised value selects
-    // everything: a stale bookmark should render the page, not an empty one.
-    let selected = |u: Universe| match universe_filter {
-        "fno" => u.contains(Universe::FNO),
-        "ntm" => u.contains(Universe::TOTAL_MARKET),
-        "idx" => u.contains(Universe::INDEX),
-        _ => true,
-    };
-
-    let mut keys: Vec<_> = read
-        .merged
-        .by_key
-        .iter()
-        .filter(|(_, e)| tracked(e.universe) && selected(e.universe))
-        .filter(|(k, _)| needle.is_empty() || k.to_string().to_uppercase().contains(&needle))
-        .map(|(k, e)| (*k, *e))
-        .collect();
-    let matched = keys.len();
-    // Swept instruments first, then a stable order. Sorting by the key itself
-    // rather than by insertion makes the page byte-identical between reloads,
-    // which a HashMap iteration order would not.
-    // SORT ORDER IS PART OF THE URL, so a sorted page is linkable and a reload
-    // shows the same thing. Swept instruments lead every order except when the
-    // operator asked for a specific column — an implicit pin would silently
-    // contradict the column they clicked.
     //
-    // Every arm ends in the key itself, so the order is TOTAL: two rows with
-    // equal ISINs still have one fixed order, and the page is byte-identical
-    // between reloads. A HashMap's iteration order is not, which is why this
-    // cannot be left to insertion.
-    // A leading `-` means descending. Sorting the key list ascending and then
-    // reversing keeps ONE ordering rule per column instead of two, so ascending
-    // and descending can never disagree about how ties break.
-    let (column, descending) = match sort.strip_prefix('-') {
-        Some(base) => (base, true),
-        None => (sort, false),
-    };
-    match column {
-        "symbol" => keys.sort_unstable_by_key(|(k, _)| (k.underlying, *k)),
-        "isin" => keys.sort_unstable_by_key(|(k, e)| (e.isin.map(|(_, i)| i), *k)),
-        "universe" => keys.sort_unstable_by_key(|(k, e)| (e.universe.bits(), *k)),
-        "kind" => keys.sort_unstable_by_key(|(k, _)| (k.kind, *k)),
-        "vendors" => keys.sort_unstable_by_key(|(k, e)| (e.vendors, *k)),
-        // "key", "" and anything unrecognised: the default order. An unknown
-        // column is NOT an error -- a stale bookmark should still render.
-        _ => keys.sort_unstable_by_key(|(k, _)| (!k.is_sweepable(), *k)),
-    }
-    if descending {
-        keys.reverse();
-    }
+    // EVERY ONE OF THOSE DECISIONS IS MADE AT LOAD TIME, not here. The scope,
+    // the pill and the ordering pick 1 of 48 lists that already exist; the pill
+    // COUNTS are four `usize` reads. What this function used to do -- fold the
+    // whole map, filter it into a fresh `Vec`, sort that vector and reverse it,
+    // on every request, to draw a fixed 200 rows -- is `docs/05-decisions.md`
+    // D-0042 and it is gone. `crates/api/benches/ratio.rs` asserts the shape.
+    let selection = Selection::new(all, universe_filter, sort);
+    let counts = read.catalog.counts(selection);
+    let total = counts.all;
 
     // PAGING, so nothing is unreachable.
     //
@@ -536,20 +569,16 @@ pub fn instruments_html_from(
     //
     // The offset is clamped to the last page rather than refused: `?page=999`
     // is a stale bookmark, not an attack, and it should land somewhere real.
-    let last_page = matched.saturating_sub(1) / PAGE_ROWS;
-    let page = page.min(last_page);
-    let rows: Vec<render::Row> = keys
-        .into_iter()
-        .skip(page * PAGE_ROWS)
-        .take(PAGE_ROWS)
-        .map(|(key, e)| render::Row {
-            key,
-            vendors: e.vendors,
-            isin: e.isin.map(|(_, i)| i),
-            conflict: e.conflict.map(|(_, i)| i),
-            universe: e.universe,
-        })
-        .collect();
+    //
+    // SEARCH IS THE ONE PATH THAT STILL LOOKS AT ROWS IT WILL NOT DRAW, and it
+    // says so: `Catalog::search` narrows by a trigram index and names the two
+    // cases that stay linear. `docs/06-limits.md` §24 carries the measurement.
+    let view = if needle.is_empty() {
+        read.catalog.page(selection, page)
+    } else {
+        read.catalog.search(selection, &needle, page)
+    };
+    let (rows, matched, page, last_page) = (view.rows, view.matched, view.page, view.last_page);
 
     // `total` is the whole universe; `matched` is what the filter selected.
     // Reporting the right one keeps the page honest about what it looked at.
@@ -585,41 +614,22 @@ pub fn instruments_html_from(
 /// costs the same whether the store holds two instruments or two hundred
 /// thousand — which is the whole point of `docs/04-invariants.md` C-01.
 async fn home(
-    axum::extract::State(read): axum::extract::State<Loaded>,
+    axum::extract::State(site): axum::extract::State<Loaded>,
 ) -> axum::response::Html<String> {
-    axum::response::Html(dashboard_html(&read))
+    axum::response::Html(dashboard_html(&site.read))
 }
 
 /// The dashboard, from a universe already loaded.
 #[must_use]
 pub fn dashboard_html(read: &Read) -> String {
-    let tracked = |u: Universe| u.contains(Universe::TOTAL_MARKET) || u.contains(Universe::INDEX);
-    let counts = read
-        .merged
-        .by_key
-        .values()
-        .filter(|e| tracked(e.universe))
-        .fold((0usize, 0usize, 0usize, 0usize), |(a, f, t, i), e| {
-            (
-                a + 1,
-                f + usize::from(e.universe.contains(Universe::FNO)),
-                t + usize::from(e.universe.contains(Universe::TOTAL_MARKET)),
-                i + usize::from(e.universe.contains(Universe::INDEX)),
-            )
-        });
-    let both = read
-        .merged
-        .by_key
-        .values()
-        .filter(|e| {
-            tracked(e.universe)
-                && e.vendors.contains(Vendor::Groww)
-                && e.vendors.contains(Vendor::Dhan)
-        })
-        .count();
+    // TWO WHOLE-MAP SCANS USED TO BE HERE, under a docstring that already
+    // claimed "nothing here scans". Measured before D-0042: 1,720 ns at 2
+    // instruments, 138,702 ns at 50,000 — an 80× curve under a comment saying
+    // it was flat. Both are now counters computed once at load.
+    let (counts, both) = read.catalog.dashboard_counts();
     let disputes = read.merged.conflicts.len() + read.merged.eligibility.len();
 
-    let (all, fno, ntm, idx) = counts;
+    let (all, fno, ntm, idx) = (counts.all, counts.fno, counts.ntm, counts.index);
     let n = |v: usize| v.to_string();
     let stats = [
         render::Stat {
@@ -664,7 +674,7 @@ pub fn dashboard_html(read: &Read) -> String {
 
 /// The instruments page.
 async fn page(
-    axum::extract::State(read): axum::extract::State<Loaded>,
+    axum::extract::State(site): axum::extract::State<Loaded>,
     uri: axum::http::Uri,
 ) -> axum::response::Html<String> {
     let raw = uri.query().unwrap_or("");
@@ -673,7 +683,9 @@ async fn page(
     let all = param(raw, "all") == "1";
     let u = param(raw, "u");
     let page = page_number(raw);
-    axum::response::Html(instruments_html_from(&read, &typed, &sort, all, &u, page))
+    axum::response::Html(instruments_html_from(
+        &site.read, &typed, &sort, all, &u, page,
+    ))
 }
 
 /// The health endpoint.
@@ -682,9 +694,9 @@ async fn page(
 /// monitor reads the status code and nothing else — this used to return 200
 /// with `ok` on the first line while a vendor had never been read.
 async fn health(
-    axum::extract::State(read): axum::extract::State<Loaded>,
+    axum::extract::State(site): axum::extract::State<Loaded>,
 ) -> (axum::http::StatusCode, String) {
-    let (body, clean) = report_from(&read);
+    let (body, clean) = report_from(&site.read);
     let code = if clean {
         axum::http::StatusCode::OK
     } else {
@@ -693,7 +705,25 @@ async fn health(
     (code, body)
 }
 
-/// The universe every request renders from, read once at startup.
+/// Why no vendor call can be made in this build.
+///
+/// `CLAUDE.md` §4 permits degrading loudly and naming the reason, or refusing.
+/// This is the reason, written once and rendered wherever a counter would
+/// otherwise have to invent a number. **It names the modules that are absent**,
+/// so an operator can check the claim rather than take it.
+///
+/// When `pull::fetch` and `pull::rate` land, this constant is what stops being
+/// passed to [`render::PullView::halt`] — one place, not a search.
+pub const CAPTURE_UNAVAILABLE: &str = "crates/pull exposes no vendor fetch and \
+     no rate governor in this build: there is no pull::fetch and no pull::rate, \
+     and docs/04-invariants.md P-01 through P-04 still stand at '—'. Every \
+     capture counter therefore reads '—' and not '0' — nothing has been \
+     measured, and a zero would be a claim that it had. A request is still \
+     parsed, validated and echoed back with the exact dates that would go on \
+     the wire, and is then REFUSED with 503. No vendor is contacted and nothing \
+     is written.";
+
+/// Everything every request renders from, read once at startup.
 ///
 /// `Arc` rather than a clone per request: [`Read`] owns a `HashMap` of every
 /// instrument, and cloning it per request would trade one O(rows) cost for
@@ -702,19 +732,356 @@ async fn health(
 ///
 /// Shared **immutably**, so there is no lock on the read path and no
 /// contention that grows with concurrent readers.
-pub type Loaded = std::sync::Arc<Read>;
+#[derive(Debug)]
+pub struct Site {
+    /// The instrument universe, merged from both masters.
+    pub read: Read,
+    /// One manifest census per vendor, in [`Vendor::ALL`] order.
+    pub censuses: Vec<census::VendorCensus>,
+    /// The instruments the coverage grid is built over, sorted.
+    pub indices: Vec<InstrumentKey>,
+    /// How many instruments each spot target covers, in
+    /// [`ingest::SpotTarget::ALL`] order.
+    ///
+    /// Counted once, here, rather than folded over the universe per request:
+    /// the form shows a real number and the page still costs O(rows shown).
+    pub targets: [usize; 3],
+    /// Where the manifests were read from, named on the page so an absence is
+    /// actionable rather than mysterious.
+    pub store_root: PathBuf,
+}
 
-/// Every route this server answers, serving from an already-loaded universe.
+impl Site {
+    /// Assembles the derived counts once, from parts a caller already holds.
+    #[must_use]
+    pub fn new(read: Read, censuses: Vec<census::VendorCensus>, store_root: PathBuf) -> Self {
+        let mut targets = [0usize; 3];
+        for (key, entry) in &read.merged.by_key {
+            for (slot, target) in ingest::SpotTarget::ALL.into_iter().enumerate() {
+                let counted = match target {
+                    ingest::SpotTarget::Swept => key.is_sweepable(),
+                    _ => entry.universe.contains(target.universe()),
+                };
+                if counted && let Some(n) = targets.get_mut(slot) {
+                    *n += 1;
+                }
+            }
+        }
+        // THE GRID FALLS BACK TO THE TWO SWEPT SERIES WHEN THERE IS NO
+        // UNIVERSE, and that is not a fallback that hides anything: a missing
+        // master is already `UNAVAILABLE` in `read.notes`, which the store page
+        // renders. Showing an empty grid instead would hide the two instruments
+        // whose coverage is the entire point of the page.
+        let mut indices = census::grid_instruments(read.merged.by_key.keys());
+        if indices.is_empty() {
+            indices = census::swept_instruments();
+        }
+        Self {
+            read,
+            censuses,
+            indices,
+            targets,
+            store_root,
+        }
+    }
+
+    /// The whole site, read off disk once.
+    #[must_use]
+    pub fn load(masters: &Path, store_root: &Path) -> Self {
+        Self::new(
+            universe(masters),
+            census::read_all(store_root),
+            store_root.to_path_buf(),
+        )
+    }
+}
+
+/// The shared, immutable site every handler renders from.
+pub type Loaded = std::sync::Arc<Site>;
+
+/// Answers with `f`'s page when the clock names a day, and with a named
+/// refusal when it does not.
 ///
-/// Takes the universe rather than a directory: a router holding a `PathBuf`
-/// can only re-read, and re-reading per request is the O(rows) cost this split
+/// # Why the day arrives as an argument
+///
+/// The same reason [`run_in`] takes a directory and [`masters_dir_from`] takes
+/// a value: a branch that only a broken machine clock could enter is a branch
+/// no test can hold, and an untestable arm inside three handlers is three arms
+/// nobody has checked. Every page that needs today goes through here, so the
+/// refusal is written once and both of its arms are reachable from a test.
+fn dated<F>(
+    today: Result<Day, ingest::Refusal>,
+    scope: &'static str,
+    f: F,
+) -> (axum::http::StatusCode, String)
+where
+    F: FnOnce(Day) -> (axum::http::StatusCode, String),
+{
+    match today {
+        Ok(day) => f(day),
+        Err(why) => (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            refusal_html(scope, &why),
+        ),
+    }
+}
+
+/// The ingest page.
+///
+/// GET, and GET does nothing but render. Starting a pull is a POST to
+/// `/pull/spot` or `/pull/fno`, so a crawler, a refresh or a back button
+/// cannot begin one.
+async fn pull_get(
+    axum::extract::State(site): axum::extract::State<Loaded>,
+) -> (axum::http::StatusCode, axum::response::Html<String>) {
+    let (code, body) = dated(ingest::today_ist(), "Ingest", |today| {
+        (axum::http::StatusCode::OK, pull_html(&site, today))
+    });
+    (code, axum::response::Html(body))
+}
+
+/// The ingest page, from a site already loaded.
+#[must_use]
+pub fn pull_html(site: &Site, today: Day) -> String {
+    let targets: Vec<(ingest::SpotTarget, usize)> = ingest::SpotTarget::ALL
+        .into_iter()
+        .enumerate()
+        .map(|(i, t)| (t, site.targets.get(i).copied().unwrap_or(0)))
+        .collect();
+    render::pull_page(&render::PullView {
+        today,
+        targets: &targets,
+        // NOT A FABRICATED PROGRESS BAR. There is nothing running, so there is
+        // nothing to report, and the page says so where the numbers would be.
+        capture: None,
+        halt: Some(CAPTURE_UNAVAILABLE),
+        notes: &site.read.notes,
+    })
+}
+
+/// The page a refused request answers with.
+#[must_use]
+pub fn refusal_html(scope: &str, why: &ingest::Refusal) -> String {
+    let facts = [(
+        "Outcome",
+        "nothing was requested, no vendor was contacted, and nothing was written".to_owned(),
+    )];
+    render::receipt_page(&render::Receipt {
+        scope,
+        verdict: "REFUSED",
+        reason: &why.to_string(),
+        facts: &facts,
+    })
+}
+
+/// The page a valid request answers with, given that nothing can run.
+fn accepted_html(scope: &str, mut facts: Vec<(&'static str, String)>) -> String {
+    facts.push(("Status", "NOT STARTED".to_owned()));
+    render::receipt_page(&render::Receipt {
+        scope,
+        verdict: "NOT STARTED",
+        reason: CAPTURE_UNAVAILABLE,
+        facts: &facts,
+    })
+}
+
+/// The window's facts, including the correction the operator never has to make.
+fn window_facts(window: pull::session::Window) -> Vec<(&'static str, String)> {
+    vec![
+        // `Window`'s own Display, which is `from..=to` — the inclusive
+        // notation. Writing the two ends out here instead would be a second
+        // definition of what the range means, and the two would drift.
+        ("Window", window.to_string()),
+        (
+            "From",
+            format!("{} — inclusive", window.from()),
+        ),
+        ("To", format!("{} — inclusive", window.to())),
+        ("Calendar days", window.days().to_string()),
+        (
+            "toDate on the wire",
+            window.wire_to().map_or_else(
+                |e| format!("REFUSED — {e}"),
+                |d| format!("{d} — the day AFTER your last day, because the vendor's toDate is not inclusive"),
+            ),
+        ),
+        ("Timeframe", "1 minute".to_owned()),
+    ]
+}
+
+/// What one spot request is answered with, given a day to check the window
+/// against.
+///
+/// Split from the handler for the same reason [`fno_answer`] is: the gate must
+/// be driven by a value, not by the machine's clock — `CLAUDE.md` §3 rule 5, and
+/// a gate that reads the clock inside cannot be tested at its own boundary
+/// without waiting for midnight.
+///
+/// **This split is the fix for a real defect.** The F&O side has had this shape
+/// since it was written; the spot side went straight to the parser with no
+/// `today` at all, so the only thing stopping a window that ends in the future
+/// was the `max` attribute the page renders. The panel one div over says *"an
+/// attribute is a courtesy, a parser is a rule"* — and spot had only the
+/// courtesy. An attribute is absent from a `curl`, from a replayed POST, and
+/// from any client that is not the browser the form was rendered for.
+fn spot_answer(body: &str, today: Day, site: &Site) -> (axum::http::StatusCode, String) {
+    match ingest::parse_spot(body, today) {
+        Err(why) => (
+            axum::http::StatusCode::BAD_REQUEST,
+            refusal_html("Spot pull", &why),
+        ),
+        Ok(asked) => {
+            let slot = ingest::SpotTarget::ALL
+                .into_iter()
+                .position(|t| t == asked.target)
+                .unwrap_or(0);
+            let mut facts = vec![
+                ("Target", asked.target.label().to_owned()),
+                (
+                    "Instruments covered",
+                    site.targets.get(slot).copied().unwrap_or(0).to_string(),
+                ),
+            ];
+            facts.extend(window_facts(asked.window));
+            (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                accepted_html("Spot pull", facts),
+            )
+        }
+    }
+}
+
+/// Starting a spot pull. **POST only.**
+async fn pull_spot(
+    axum::extract::State(site): axum::extract::State<Loaded>,
+    body: String,
+) -> (axum::http::StatusCode, axum::response::Html<String>) {
+    let (code, page) = dated(ingest::today_ist(), "Spot pull", |today| {
+        spot_answer(&body, today, &site)
+    });
+    (code, axum::response::Html(page))
+}
+
+/// What one expired-series request is answered with, given a day to check the
+/// expiry against.
+///
+/// Split from the handler so the expiry gate is driven by a value rather than
+/// by the machine's clock — `CLAUDE.md` §3 rule 5.
+fn fno_answer(body: &str, today: Day) -> (axum::http::StatusCode, String) {
+    match ingest::parse_fno(body, today) {
+        Err(why) => (
+            axum::http::StatusCode::BAD_REQUEST,
+            refusal_html("Expired F&O pull", &why),
+        ),
+        Ok(asked) => {
+            let mut facts = vec![
+                ("Underlying", asked.underlying.as_str().to_owned()),
+                ("Series", asked.series.label().to_owned()),
+                (
+                    "Expiry",
+                    format!("{} — expired, checked against {today}", asked.expiry),
+                ),
+            ];
+            facts.extend(window_facts(asked.window));
+            (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                accepted_html("Expired F&O pull", facts),
+            )
+        }
+    }
+}
+
+/// Starting an expired-series pull. **POST only.**
+async fn pull_fno(body: String) -> (axum::http::StatusCode, axum::response::Html<String>) {
+    let (code, page) = dated(ingest::today_ist(), "Expired F&O pull", |today| {
+        fno_answer(&body, today)
+    });
+    (code, axum::response::Html(page))
+}
+
+/// The store page.
+async fn store_get(
+    axum::extract::State(site): axum::extract::State<Loaded>,
+    uri: axum::http::Uri,
+) -> (axum::http::StatusCode, axum::response::Html<String>) {
+    let (code, body) = dated(ingest::today_ist(), "Store", |today| {
+        (
+            axum::http::StatusCode::OK,
+            store_html(&site, today, page_number(uri.query().unwrap_or(""))),
+        )
+    });
+    (code, axum::response::Html(body))
+}
+
+/// The store page, from a site already loaded.
+///
+/// An absent manifest renders; it never fails. Before the first ingest there is
+/// no file, and a page that 500s on a fresh install is a page that is broken
+/// exactly when an operator most needs to look at it.
+#[must_use]
+pub fn store_html(site: &Site, today: Day, page: usize) -> String {
+    // The grid is instruments × months and both factors are bounded, so the
+    // last page is a division rather than a walk, and `?page=999` clamps to
+    // somewhere real for the same reason `/instruments` does.
+    let total = census::grid_rows(site.indices.len());
+    let last_page = total.saturating_sub(1) / PAGE_ROWS;
+    let page = page.min(last_page);
+    let rows = census::coverage_page(
+        &site.indices,
+        &site.censuses,
+        today,
+        page.saturating_mul(PAGE_ROWS),
+        PAGE_ROWS,
+    );
+    let mut notes = vec![format!(
+        "store root: {} — every figure here is a field read of one manifest \
+         header, and every grid cell is one hash probe",
+        site.store_root.display()
+    )];
+    notes.extend(site.censuses.iter().map(census::VendorCensus::note));
+    // The master notes ride along, because an `UNAVAILABLE` master is why the
+    // grid may be down to the two swept series.
+    notes.extend(site.read.notes.iter().cloned());
+    render::store_page(&render::StoreView {
+        today,
+        censuses: &site.censuses,
+        rows: &rows,
+        page,
+        last_page,
+        total,
+        notes: &notes,
+    })
+}
+
+/// Every route this server answers, serving from an already-loaded site.
+///
+/// Takes the site rather than a directory: a router holding a `PathBuf` can
+/// only re-read, and re-reading per request is the O(rows) cost this split
 /// exists to remove.
-pub fn router(read: Loaded) -> axum::Router {
+///
+/// **`/pull/spot` and `/pull/fno` are `post` and nothing else.** A `get` on
+/// either answers 405 without touching a vendor, which is the whole point: a
+/// crawler follows links, a browser refetches on back, and either would
+/// otherwise start an ingest nobody asked for.
+///
+/// **The request body is bounded here, by a number this repository states.**
+/// `crates/api/src/ingest.rs` says every parser it holds works over "a form
+/// body whose length the server caps". That was true, and it was true by
+/// accident: the cap was `axum`'s own default and no line in this repository
+/// named it. A framework default is a bound somebody else may change, and
+/// `docs/07-o1-architecture.md` law 5 is bound every input **at the boundary**
+/// — which means the boundary says the number.
+pub fn router(site: Loaded) -> axum::Router {
     axum::Router::new()
         .route("/", axum::routing::get(home))
         .route("/instruments", axum::routing::get(page))
+        .route("/pull", axum::routing::get(pull_get))
+        .route("/pull/spot", axum::routing::post(pull_spot))
+        .route("/pull/fno", axum::routing::post(pull_fno))
+        .route("/store", axum::routing::get(store_get))
         .route("/health", axum::routing::get(health))
-        .with_state(read)
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_FORM_BYTES))
+        .with_state(site)
 }
 
 /// Serves on an already-bound listener until `shutdown` resolves.
@@ -798,6 +1165,15 @@ pub async fn run(args: &[String], shutdown: Shutdown) -> u8 {
     run_in(&masters_dir(), args, shutdown).await
 }
 
+/// The store root a served process reads its manifests from.
+///
+/// Read here rather than threaded through [`run_in`] for the same reason
+/// [`masters_dir`] is read in [`run`]: the environment is consulted once, at
+/// the edge, and everything below takes a path.
+fn served_store_root() -> PathBuf {
+    store_dir()
+}
+
 /// [`run`], over a directory the caller names.
 ///
 /// Split for the same reason [`masters_dir_from`] and [`reported`] are split,
@@ -819,8 +1195,12 @@ async fn run_in(dir: &Path, args: &[String], shutdown: Shutdown) -> u8 {
         Ok(Command::Report) => reported(dir),
         Ok(Command::Serve(addr)) => match tokio::net::TcpListener::bind(addr).await {
             Ok(listener) => {
+                let store_root = served_store_root();
                 println!("brutex api listening on http://{addr}/instruments");
-                stopped(serve(listener, router(Loaded::new(universe(dir))), shutdown).await)
+                println!("  masters: {}", dir.display());
+                println!("  store:   {}", store_root.display());
+                let site = Site::load(dir, &store_root);
+                stopped(serve(listener, router(Loaded::new(site)), shutdown).await)
             }
             Err(e) => {
                 eprintln!("cannot bind {addr}: {e}");
@@ -847,7 +1227,7 @@ mod tests {
 
     /// A directory holding one or both masters, named after the test.
     fn masters(name: &str, groww: Option<&str>, dhan: Option<&str>) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("brutex-server-{name}"));
+        let dir = crate::scratch::path(&format!("server-{name}"));
         std::fs::create_dir_all(&dir).expect("mkdir");
         for (file, body) in [("groww_instruments.csv", groww), ("dhan_scrip.csv", dhan)] {
             let path = dir.join(file);
@@ -862,6 +1242,27 @@ mod tests {
             }
         }
         dir
+    }
+
+    /// An empty store root, named after the test.
+    ///
+    /// Empty on purpose in most tests: an absent manifest is the ordinary
+    /// state before the first ingest, and it must render rather than fail.
+    fn store_root(name: &str) -> PathBuf {
+        let dir = crate::scratch::path(&format!("store-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("manifest")).expect("mkdir");
+        dir
+    }
+
+    /// A day this build can name, for the pages that take one.
+    fn day(y: u16, m: u8, d: u8) -> Day {
+        Day::new(y, m, d).expect("a real date")
+    }
+
+    /// A site over the given masters and an empty store.
+    fn site(name: &str, dir: &Path) -> Site {
+        Site::load(dir, &store_root(name))
     }
 
     const GROWW_HEAD: &str = "exchange,segment,underlying_symbol,trading_symbol,\
@@ -928,6 +1329,19 @@ mod tests {
         // and fail everywhere else. The default's own two arms are pinned to
         // literals below, where the input IS controlled.
         assert_eq!(masters_dir_from(None), default_masters_dir());
+        // And the default is exactly the pure function over the SAME
+        // environment. Compared against `default_masters_dir_from` rather than
+        // only against `masters_dir_from(None)`, which calls it: a function
+        // compared with its own caller cannot fail, and `cargo mutants` proved
+        // it by replacing `default_masters_dir` with an empty path and passing.
+        assert_eq!(
+            default_masters_dir(),
+            default_masters_dir_from(std::env::var_os("HOME"))
+        );
+        assert!(
+            !default_masters_dir().as_os_str().is_empty(),
+            "it always names somewhere; an empty path is not a directory"
+        );
         assert_eq!(
             masters_dir_from(Some("/somewhere/else".into())),
             PathBuf::from("/somewhere/else")
@@ -1485,7 +1899,7 @@ mod tests {
         let stop_addr = stopper.local_addr().expect("addr");
         let served = tokio::spawn(serve(
             listener,
-            router(Loaded::new(universe(&dir))),
+            router(Loaded::new(Site::load(&dir, &store_root("serve")))),
             Box::pin(async move { stopper.accept().await.map(|_| ()) }),
         ));
 
@@ -1515,11 +1929,60 @@ mod tests {
             !root.contains("<tbody>"),
             "the dashboard counts; it does not list rows"
         );
-        // And the nav shows what is NOT built, rather than hiding it — a nav
-        // listing only what exists says nothing about what is coming, and one
-        // linking to a page that cannot answer is worse.
-        assert!(root.contains("Ingest"), "unbuilt pages are shown, disabled");
-        assert!(root.contains("lnk off"), "and marked as unbuilt");
+        // THE NAV'S PREMISE CHANGED WITH D-0038, AND ONLY HALF OF IT.
+        //
+        // This assertion used to be `root.contains("lnk off")` with `Ingest`
+        // beside it, because /pull and /store were rendered disabled. They now
+        // answer, so `Ingest` and `Store` are real links — asserting they are
+        // still greyed out would be asserting the opposite of what shipped.
+        //
+        // The RULE the old assertion protected is unchanged and is still
+        // checked: a page that does not exist is shown disabled rather than
+        // hidden or linked. `/runs` is that page — there is no sweep yet — so
+        // `lnk off` must still be here, and it must be Runs that carries it.
+        assert!(
+            root.contains("<a class=\"lnk\" href=\"/pull\">Ingest</a>"),
+            "Ingest is a real link now: {root}"
+        );
+        assert!(
+            root.contains("<a class=\"lnk\" href=\"/store\">Store</a>"),
+            "Store is a real link now: {root}"
+        );
+        assert!(
+            root.contains("<span class=\"lnk off\" title=\"not built yet\">Runs</span>"),
+            "and Runs is still shown, disabled, because there is no sweep: {root}"
+        );
+        assert_eq!(
+            root.matches("lnk off").count(),
+            1,
+            "exactly one page is still unbuilt"
+        );
+
+        // Both new pages answer, and the store page answers even though the
+        // store root is empty — an absent manifest is the ordinary state
+        // before the first ingest and must never be a 500.
+        let ingest_page = get(addr, "/pull").await;
+        assert!(ingest_page.contains("200 OK"), "{ingest_page}");
+        assert!(ingest_page.contains("action=\"/pull/spot\""));
+        assert!(ingest_page.contains("action=\"/pull/fno\""));
+        let store_page = get(addr, "/store").await;
+        assert!(store_page.contains("200 OK"), "{store_page}");
+        assert!(!store_page.contains("500"), "{store_page}");
+        assert!(store_page.contains("UNAVAILABLE"), "{store_page}");
+
+        // A GET ON A POST ROUTE STARTS NOTHING. A crawler follows links and a
+        // browser refetches on back; either would otherwise begin an ingest.
+        for path in ["/pull/spot", "/pull/fno"] {
+            let crawled = get(addr, path).await;
+            assert!(
+                crawled.contains("405"),
+                "GET {path} must not be a route at all: {crawled}"
+            );
+            assert!(
+                !crawled.contains("NOT STARTED"),
+                "GET {path} must not even reach the parser: {crawled}"
+            );
+        }
 
         let missing = get(addr, "/nope").await;
         assert!(missing.contains("404"), "{missing}");
@@ -1537,6 +2000,793 @@ mod tests {
     /// One command line, owned.
     fn argv(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    /// Sends one form POST and reads the whole response.
+    async fn post(addr: SocketAddr, path: &str, form: &str) -> String {
+        let request = format!(
+            "POST {path} HTTP/1.1\r\nHost: t\r\n\
+             Content-Type: application/x-www-form-urlencoded\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{form}",
+            form.len()
+        );
+        tokio::task::spawn_blocking(move || {
+            use std::io::Read as _;
+            let mut s = std::net::TcpStream::connect(addr).expect("connect");
+            s.write_all(request.as_bytes()).expect("write");
+            let mut buf = String::new();
+            s.read_to_string(&mut buf).expect("read");
+            buf
+        })
+        .await
+        .expect("the client thread must not panic")
+    }
+
+    /// Runs `body` against a live server over the agreeing fixture.
+    async fn with_server<F, Fut>(name: &str, body: F)
+    where
+        F: FnOnce(SocketAddr) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        let dir = agreeing(name);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let stopper = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let stop_addr = stopper.local_addr().expect("addr");
+        let served = tokio::spawn(serve(
+            listener,
+            router(Loaded::new(site(name, &dir))),
+            Box::pin(async move { stopper.accept().await.map(|_| ()) }),
+        ));
+        body(addr).await;
+        let _ = tokio::net::TcpStream::connect(stop_addr).await;
+        served
+            .await
+            .expect("task")
+            .expect("a graceful shutdown is not a failure");
+    }
+
+    #[tokio::test]
+    async fn a_malformed_or_backwards_window_is_refused_with_the_reason_named() {
+        with_server("badwindow", |addr| async move {
+            // A date that is not a date. The refusal names the FIELD and what
+            // arrived, so an operator is not sent to guess which of four it
+            // meant.
+            let out = post(
+                addr,
+                "/pull/spot",
+                "target=swept&from=08/01/2022&to=2022-02-08",
+            )
+            .await;
+            assert!(out.contains("400 Bad Request"), "{out}");
+            assert!(out.contains("REFUSED"), "{out}");
+            assert!(out.contains("08/01/2022"), "it names what arrived: {out}");
+            assert!(out.contains("YYYY-MM-DD"), "and what it wanted: {out}");
+            assert!(
+                out.contains("nothing was written"),
+                "and that nothing happened: {out}"
+            );
+
+            // A day that does not exist reaches the calendar and is refused by
+            // it, not by a second opinion here.
+            let leap = post(
+                addr,
+                "/pull/spot",
+                "target=swept&from=2023-02-29&to=2023-03-01",
+            )
+            .await;
+            assert!(leap.contains("400 Bad Request"), "{leap}");
+            assert!(leap.contains("2023-02-29"), "{leap}");
+
+            // Backwards is refused, never silently swapped.
+            let back = post(
+                addr,
+                "/pull/spot",
+                "target=swept&from=2022-02-08&to=2022-01-08",
+            )
+            .await;
+            assert!(back.contains("400 Bad Request"), "{back}");
+            assert!(back.contains("runs backwards"), "{back}");
+            assert!(
+                back.contains("2022-02-08") && back.contains("2022-01-08"),
+                "both ends are named: {back}"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_valid_window_is_echoed_with_the_wire_date_and_still_starts_nothing() {
+        with_server("goodwindow", |addr| async move {
+            // A RANGE ACROSS A YEAR BOUNDARY. Four days, both ends included,
+            // and the wire `toDate` is the day after the last one.
+            let over = post(
+                addr,
+                "/pull/spot",
+                "target=indices&from=2021-12-30&to=2022-01-02",
+            )
+            .await;
+            assert!(
+                over.contains("503 Service Unavailable"),
+                "valid, and still not started: {over}"
+            );
+            assert!(over.contains("NOT STARTED"), "{over}");
+            assert!(over.contains("Reference indices"), "{over}");
+            assert!(
+                over.contains("2021-12-30..=2022-01-02"),
+                "the range is stated in Window's own inclusive notation: {over}"
+            );
+            assert!(
+                over.contains("<td>4</td>"),
+                "30, 31, 1, 2 — four days: {over}"
+            );
+            assert!(
+                over.contains("2022-01-03"),
+                "the non-inclusive toDate is the day AFTER, and is shown: {over}"
+            );
+            assert!(
+                over.contains("not inclusive"),
+                "and the correction is stated, not performed in silence: {over}"
+            );
+            assert!(
+                over.contains("no vendor was contacted") || over.contains("No vendor is contacted"),
+                "and it says nothing ran: {over}"
+            );
+
+            // A SINGLE-DAY RANGE, which is the commonest resume shape.
+            let one = post(
+                addr,
+                "/pull/spot",
+                "target=equities&from=2022-01-08&to=2022-01-08",
+            )
+            .await;
+            assert!(one.contains("503"), "{one}");
+            assert!(one.contains("<td>1</td>"), "one calendar day: {one}");
+            assert!(one.contains("2022-01-09"), "and the wire date: {one}");
+
+            // THE RECEIPT NAMES THE TARGET THAT WAS ASKED FOR, not whichever
+            // one the lookup happened to land on. Each of the three is posted
+            // and each comes back as itself; `cargo mutants` found that with
+            // only one target exercised, the `==` selecting its member count
+            // could be a `!=` and nothing would notice.
+            for (slug, label) in [
+                ("swept", "Swept indices"),
+                ("indices", "Reference indices"),
+                ("equities", "NIFTY Total Market equities"),
+            ] {
+                let form = format!("target={slug}&from=2022-01-08&to=2022-01-08");
+                let out = post(addr, "/pull/spot", &form).await;
+                assert!(out.contains(label), "{slug} must echo as {label}: {out}");
+            }
+            // The fixture has one index and one Total Market constituent, and
+            // the receipt states each target's own population — so the three
+            // answers are not interchangeable.
+            let swept = post(
+                addr,
+                "/pull/spot",
+                "target=swept&from=2022-01-08&to=2022-01-08",
+            )
+            .await;
+            assert!(
+                swept.contains("<th>Instruments covered</th><td>1</td>"),
+                "the swept count is the swept count: {swept}"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn the_fno_form_cannot_request_a_live_contract_over_http_either() {
+        with_server("livecontract", |addr| async move {
+            // 9998-12-31 is live under any clock this build can run on, and
+            // 2020-01-30 has expired under every one of them. Neither depends
+            // on when the test runs.
+            let live = post(
+                addr,
+                "/pull/fno",
+                "underlying=NIFTY&series=opt&expiry=9998-12-31&from=9998-12-01&to=9998-12-31",
+            )
+            .await;
+            assert!(live.contains("400 Bad Request"), "{live}");
+            assert!(
+                live.contains("LIVE CONTRACT IS NEVER STORED"),
+                "the rule is named, loudly: {live}"
+            );
+            assert!(live.contains("9998-12-31"), "{live}");
+
+            let expired = post(
+                addr,
+                "/pull/fno",
+                "underlying=nifty&series=fut&expiry=2020-01-30&from=2020-01-01&to=2020-01-30",
+            )
+            .await;
+            assert!(expired.contains("503"), "expired is acceptable: {expired}");
+            assert!(expired.contains("NIFTY"), "canonicalised: {expired}");
+            assert!(expired.contains("2020-01-31"), "the wire date: {expired}");
+
+            // A window past the expiry asks for bars that cannot exist.
+            let past = post(
+                addr,
+                "/pull/fno",
+                "underlying=NIFTY&series=fut&expiry=2020-01-30&from=2020-01-01&to=2020-02-05",
+            )
+            .await;
+            assert!(past.contains("400"), "{past}");
+            assert!(past.contains("no bars there"), "{past}");
+
+            // An underlying with no derivative on it.
+            let spot_only = post(
+                addr,
+                "/pull/fno",
+                "underlying=RAJESHEXPO&series=fut&expiry=2020-01-30&from=2020-01-01&to=2020-01-30",
+            )
+            .await;
+            assert!(spot_only.contains("400"), "{spot_only}");
+            assert!(spot_only.contains("no F&amp;O series"), "{spot_only}");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_body_larger_than_this_server_reads_is_refused_and_never_parsed() {
+        // `ingest.rs` says every parser it holds works over "a form body whose
+        // length the server caps". It was true, and it was true by accident:
+        // the cap was axum's 2 MiB default and no line here named it. A
+        // dependency's default is a bound this repository does not own, so the
+        // boundary now states the number and this is the test that proves the
+        // number is the one in force.
+        with_server("bodylimit", |addr| async move {
+            // Just inside: a legitimate body still answers on its own merits.
+            let ok = post(
+                addr,
+                "/pull/spot",
+                "target=swept&from=2024-01-01&to=2024-01-31",
+            )
+            .await;
+            assert!(
+                !ok.contains("413"),
+                "an ordinary form is nowhere near the bound: {ok}"
+            );
+
+            // Just outside: the field is padded past MAX_FORM_BYTES. It is
+            // refused for its SIZE, before any parser sees it -- so the reply
+            // carries neither the accepted page nor a named field refusal.
+            let huge = format!(
+                "target=swept&from=2024-01-01&to=2024-01-31&pad={}",
+                "x".repeat(MAX_FORM_BYTES + 1)
+            );
+            let refused = post(addr, "/pull/spot", &huge).await;
+            assert!(
+                refused.contains("413"),
+                "a body past the bound is refused loudly: {refused}"
+            );
+            assert!(
+                !refused.contains("REFUSED ·"),
+                "and it never reached the form parser: {refused}"
+            );
+        })
+        .await;
+    }
+
+    #[test]
+    fn the_ingest_page_counts_its_targets_and_never_draws_a_bar_over_nothing() {
+        let dir = agreeing("pullpage");
+        let site = site("pullpage", &dir);
+        let html = pull_html(&site, day(2026, 8, 7));
+
+        // Two forms, not one form with a dropdown.
+        assert_eq!(html.matches("<form class=\"pull\"").count(), 2);
+        assert!(html.contains("action=\"/pull/spot\">"));
+        assert!(html.contains("action=\"/pull/fno\""));
+        assert!(
+            html.contains("method=\"post\""),
+            "starting a pull is a POST"
+        );
+        assert!(!html.contains("method=\"get\""), "and never a GET: {html}");
+
+        // The date fields are `type=date`, which submits YYYY-MM-DD.
+        assert_eq!(
+            html.matches("type=\"date\"").count(),
+            5,
+            "two on the spot form, three on the F&O form"
+        );
+        assert!(html.contains("max=\"2026-08-07\""), "no future spot window");
+        assert!(
+            html.contains("max=\"2026-08-06\""),
+            "and the expiry stops a day earlier — a live contract is unofferable"
+        );
+
+        // The counts are the real ones from the loaded universe: the fixture
+        // has NIFTY (an index, and swept) and RELIANCE (Total Market).
+        assert!(html.contains("1 instrument(s)"), "{html}");
+        assert!(html.contains("Swept indices"), "{html}");
+        assert!(html.contains("NIFTY Total Market equities"), "{html}");
+
+        // NOT A FABRICATED PROGRESS BAR. Nothing is running, so every counter
+        // is a dash and the reason is named at the top of the page.
+        assert!(html.contains("CAPTURE UNAVAILABLE"), "{html}");
+        assert!(html.contains("pull::fetch"), "the missing module is named");
+        assert!(html.contains("pull::rate"), "and so is the governor");
+        assert!(
+            !html.contains("<div class=\"cv\">0</div>"),
+            "a zero would claim a measurement nobody took: {html}"
+        );
+        assert!(html.contains("<div class=\"cv\">—</div>"), "{html}");
+
+        // Every drop reason the filter counts is on the page, by its own label.
+        for reason in [
+            "before the session open",
+            "at or after the session close",
+            "before the requested window",
+            "after the requested window",
+        ] {
+            assert!(html.contains(reason), "{reason} must be shown: {html}");
+        }
+        // And the session bounds it filters on.
+        assert!(html.contains("09:15") && html.contains("15:30"), "{html}");
+        assert!(
+            html.contains("375"),
+            "375 bars in a regular session: {html}"
+        );
+    }
+
+    #[test]
+    fn the_store_page_renders_an_absent_manifest_rather_than_failing() {
+        // The ordinary state of a fresh install: no manifest file at all. The
+        // page must say what is missing and where it looked, and it must not
+        // be an error — this is the page you look at to find out why.
+        let dir = agreeing("storeabsent");
+        let site = site("storeabsent", &dir);
+        let html = store_html(&site, day(2026, 8, 7), 0);
+
+        assert!(html.starts_with("<!doctype html>"));
+        assert!(html.ends_with("</html>"));
+        assert!(html.contains("UNAVAILABLE"), "{html}");
+        assert!(html.contains("groww") && html.contains("dhan"), "{html}");
+        assert!(html.contains("no manifest at"), "{html}");
+        // The path that was looked at, named on the page. Asserted against the
+        // scratch directory's own name rather than a literal prefix, because
+        // `crate::scratch::path` owns the shape and a second spelling of it
+        // here would be a test pinned to a naming rule it does not own.
+        let looked_at = site
+            .censuses
+            .first()
+            .expect("groww")
+            .path
+            .display()
+            .to_string();
+        assert!(html.contains(&looked_at), "the path: {html}");
+        assert!(looked_at.contains("store-storeabsent"), "{looked_at}");
+        assert!(html.contains("DEGRADED"), "and the badge says so: {html}");
+        // Counters are dashes, never zeros: "nothing ingested" and "the counter
+        // says zero" are different claims.
+        assert!(html.contains("<div class=\"cv\">—</div>"), "{html}");
+        // The grid still shows the instruments, with every cell a miss.
+        assert!(html.contains("NSE-NIFTY"), "{html}");
+        assert!(html.contains("class=\"num miss\""), "{html}");
+    }
+
+    #[test]
+    fn the_store_page_reads_zero_as_zero_and_pages_past_the_end_by_clamping() {
+        // A genesis manifest for each vendor: the store exists and holds
+        // nothing. That is a real answer and a DIFFERENT one from an absence,
+        // so the counters read 0 and the page is not degraded.
+        let root = store_root("storezero");
+        for vendor in Vendor::ALL {
+            let header = pull::manifest::ManifestHeader::genesis(vendor);
+            let mut bytes = vec![0u8; 32_768];
+            bytes.splice(..64, header.image());
+            std::fs::write(pull::manifest::manifest_path(&root, vendor), &bytes).expect("write");
+        }
+        let dir = agreeing("storezero");
+        let site = Site::new(universe(&dir), census::read_all(&root), root);
+
+        let html = store_html(&site, day(2026, 8, 7), 0);
+        assert!(
+            html.contains("<div class=\"cv\">0</div>"),
+            "zero months: {html}"
+        );
+        assert!(html.contains("0 month(s), 0 row(s)"), "{html}");
+        assert!(
+            !html.contains("UNAVAILABLE"),
+            "an empty store is not absent"
+        );
+        assert!(
+            html.contains("badge good"),
+            "and it is not degraded: {html}"
+        );
+        // Still nothing held, so every grid cell is a miss rather than a zero.
+        assert!(html.contains("class=\"num miss\""), "{html}");
+
+        // PAGING PAST THE END CLAMPS. `?page=999` is a stale bookmark, not an
+        // attack, and it must land somewhere real.
+        let first = store_html(&site, day(2026, 8, 7), 0);
+        let past = store_html(&site, day(2026, 8, 7), 999);
+        assert_eq!(past, first, "an out-of-range page clamps to the last one");
+        assert!(past.contains("NSE-NIFTY"), "and still has rows: {past}");
+        // The fixture's one index × 36 months fits one page, so there is no
+        // pager at all — navigation that leads nowhere is worse than none.
+        assert!(!first.contains("class=\"pager\""), "{first}");
+    }
+
+    #[test]
+    fn the_store_grid_pages_when_it_is_larger_than_one_page() {
+        // 200 rows per page against 36 months means the pager appears at six
+        // instruments. Without a fixture that large the paging arms are code no
+        // test enters.
+        let dir = agreeing("storepager");
+        let mut site = site("storepager", &dir);
+        site.indices = (0..10)
+            .filter_map(|i| {
+                brutex_core::instrument::InstrumentKey::index(
+                    brutex_core::instrument::Exchange::Nse,
+                    &format!("IDX{i:02}"),
+                )
+                .ok()
+            })
+            .collect();
+        assert_eq!(census::grid_rows(site.indices.len()), 360);
+
+        let first = store_html(&site, day(2026, 8, 7), 0);
+        assert!(first.contains("page 1 of 2"), "{first}");
+        assert!(first.contains("next"), "{first}");
+        assert!(!first.contains("previous"), "no previous to nowhere");
+        assert!(first.contains("360 instrument-month(s)"), "{first}");
+        assert!(first.contains("showing 200"), "{first}");
+
+        let last = store_html(&site, day(2026, 8, 7), 1);
+        assert!(last.contains("page 2 of 2"), "{last}");
+        assert!(last.contains("previous"), "{last}");
+        assert!(!last.contains("next &rarr;"), "{last}");
+        assert!(last.contains("showing 160"), "the remainder: {last}");
+
+        // And past the end clamps onto that last page exactly.
+        assert_eq!(store_html(&site, day(2026, 8, 7), 99), last);
+    }
+
+    #[test]
+    fn the_store_root_comes_from_the_environment_or_defaults_under_home() {
+        assert_eq!(
+            store_dir_from(Some("/somewhere/else".into()), Some("/home/who".into())),
+            PathBuf::from("/somewhere/else"),
+            "an explicit value wins"
+        );
+        assert_eq!(
+            store_dir_from(None, Some("/home/who".into())),
+            PathBuf::from("/home/who/.brutex/store")
+        );
+        assert_eq!(
+            store_dir_from(None, None),
+            PathBuf::from("."),
+            "no HOME is a broken environment, not a supported one"
+        );
+        // And the environment is read in exactly one place, which is this one.
+        // Asserted against the pure function fed the SAME environment rather
+        // than against `served_store_root`, which calls `store_dir` itself:
+        // comparing a function with its own caller cannot fail, and
+        // `cargo mutants` proved it by replacing `store_dir` with an empty
+        // path and passing.
+        assert_eq!(
+            store_dir(),
+            store_dir_from(std::env::var_os("BRUTEX_STORE"), std::env::var_os("HOME")),
+            "store_dir is exactly store_dir_from over the environment"
+        );
+        assert!(
+            !store_dir().as_os_str().is_empty(),
+            "and it always names somewhere; an empty path is not a store root"
+        );
+        assert_eq!(served_store_root(), store_dir(), "one reader, one answer");
+    }
+
+    #[test]
+    fn a_clock_that_names_no_day_refuses_the_page_rather_than_guessing_one() {
+        // An expiry gate compared against an invented "today" is a gate that
+        // passes for the wrong reason, so there is no default. Both arms of the
+        // one place that reads the clock are driven here by VALUE, because a
+        // branch only a broken machine could enter is a branch no test can
+        // hold — the same split `run_in` and `masters_dir_from` already use.
+        let broken = ingest::ist_day(
+            std::time::SystemTime::UNIX_EPOCH - std::time::Duration::from_hours(24),
+        );
+        let why = broken.clone().expect_err("no such day");
+        let html = refusal_html("Ingest", &why);
+        assert!(html.contains("REFUSED"), "{html}");
+        assert!(html.contains("clock"), "{html}");
+        assert!(html.contains("nothing was written"), "{html}");
+
+        // ONE closure, driven through BOTH arms. A closure body that only the
+        // passing arm can reach is a body no test enters, so the same
+        // non-capturing renderer is handed to the refusing call and to the
+        // succeeding one -- and the refusing call proves it was never invoked
+        // by answering with the refusal page rather than with a date.
+        let render = |d: Day| (axum::http::StatusCode::OK, d.to_string());
+        let (code, page) = dated(broken, "Ingest", render);
+        assert_eq!(code, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(page.contains("clock"), "{page}");
+        assert!(
+            !page.contains("1970-01-01"),
+            "the closure must not have run: {page}"
+        );
+
+        // And the other arm hands the day straight through.
+        let (code, page) = dated(Ok(day(2026, 8, 7)), "Ingest", render);
+        assert_eq!(code, axum::http::StatusCode::OK);
+        assert_eq!(page, "2026-08-07");
+    }
+
+    #[tokio::test]
+    async fn each_spot_target_reports_its_own_population_and_not_a_neighbours() {
+        // Found by `cargo mutants` while D-0038 was measuring `server.rs`: the
+        // receipt looks the requested target up to state how many instruments
+        // it covers, and on a fixture where all three populations happen to be
+        // equal the `==` doing that lookup can be a `!=` with the suite green.
+        //
+        // INDIAVIX is an index and is NOT swept — `CLAUDE.md` §1 makes it
+        // reference-only — so this fixture has one swept series, TWO index
+        // series and one Total Market constituent, and the three answers are
+        // three different numbers.
+        let dir = masters(
+            "targetcounts",
+            Some(&format!(
+                "{GROWW_HEAD}\
+                 NSE,CASH,,NIFTY,IDX,,NIFTY,,\n\
+                 NSE,CASH,,INDIAVIX,IDX,,NIFTY,,\n\
+                 NSE,CASH,,RELIANCE,EQ,EQ,INE002A01018,,\n"
+            )),
+            Some(&format!(
+                "{DHAN_HEAD}\
+                 NSE,I,NA,INDEX,NIFTY,NIFTY,INDEX,NA,0001-01-01,,\n\
+                 NSE,I,NA,INDEX,INDIAVIX,INDIA VIX,INDEX,NA,0001-01-01,,\n\
+                 NSE,E,INE002A01018,EQUITY,RELIANCE,RELIANCE INDUSTRIES,ES,EQ,,,\n"
+            )),
+        );
+        let built = site("targetcounts", &dir);
+        assert_eq!(
+            built.targets,
+            [1, 2, 1],
+            "one swept, two index series, one Total Market constituent"
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let stopper = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let stop_addr = stopper.local_addr().expect("addr");
+        let served = tokio::spawn(serve(
+            listener,
+            router(Loaded::new(built)),
+            Box::pin(async move { stopper.accept().await.map(|_| ()) }),
+        ));
+
+        for (slug, label, covered) in [
+            ("swept", "Swept indices", 1),
+            ("indices", "Reference indices", 2),
+            ("equities", "NIFTY Total Market equities", 1),
+        ] {
+            let form = format!("target={slug}&from=2022-01-08&to=2022-01-08");
+            let out = post(addr, "/pull/spot", &form).await;
+            assert!(out.contains(label), "{slug} echoes as {label}: {out}");
+            assert!(
+                out.contains(&format!("<th>Instruments covered</th><td>{covered}</td>")),
+                "{slug} covers {covered}: {out}"
+            );
+        }
+
+        let _ = tokio::net::TcpStream::connect(stop_addr).await;
+        served
+            .await
+            .expect("task")
+            .expect("a graceful shutdown is not a failure");
+    }
+
+    #[test]
+    fn the_dashboard_counts_each_universe_and_shouts_only_when_something_disagrees() {
+        // Found by `cargo mutants` while D-0038 was measuring `server.rs`: the
+        // dashboard's fold and its `disputes > 0` flag were reachable but not
+        // distinguished, so `a + 1` could be `a * 1` and `> 0` could be `== 0`
+        // with the suite green. Each figure is now pinned to its own number.
+        //
+        // The fixture is NIFTY — an index, and an F&O underlying — plus
+        // RELIANCE, which is a Total Market constituent and an F&O underlying.
+        let clean = universe(&agreeing("dashclean"));
+        let html = dashboard_html(&clean);
+        for (label, value) in [
+            ("Tracked", "2"),
+            ("NIFTY Total Market", "1"),
+            ("F&amp;O underlyings", "2"),
+            ("Indices", "1"),
+            ("Confirmed by both feeds", "2"),
+            ("Disagreements", "0"),
+        ] {
+            let expected =
+                format!("<div class=\"ck\">{label}</div><div class=\"cv\">{value}</div>");
+            assert!(html.contains(&expected), "{label} must be {value}: {html}");
+        }
+        assert!(
+            !html.contains("card loud"),
+            "nothing disagreed, so nothing shouts: {html}"
+        );
+        assert!(html.contains("badge good"), "{html}");
+
+        // One disagreement, and the same figure is loud. Both sides of the
+        // comparison, driven by data rather than by a constructed `Stat`.
+        let disputed = universe(&masters(
+            "dashloud",
+            Some(&format!(
+                "{GROWW_HEAD}NSE,CASH,,CHOLAFIN,EQ,EQ,INE121A01024,,\n"
+            )),
+            Some(&format!(
+                "{DHAN_HEAD}NSE,E,INE121A08PJ0,EQUITY,CHOLAFIN,CHOLA,ES,EQ,,,\n"
+            )),
+        ));
+        let loud = dashboard_html(&disputed);
+        assert!(loud.contains("card loud"), "a disagreement shouts: {loud}");
+        assert!(
+            loud.contains("<div class=\"ck\">Disagreements</div><div class=\"cv\">1</div>"),
+            "{loud}"
+        );
+        assert!(loud.contains("badge bad"), "{loud}");
+
+        // THE FIGURE IS THE SUM OF BOTH KINDS OF DISAGREEMENT, and this is the
+        // fixture that says so: CHOLAFIN is one ISIN conflict and FISTIPD3GP is
+        // one eligibility conflict, so the answer is 2. With only one kind
+        // present the addition could be a subtraction — `cargo mutants` found
+        // exactly that.
+        let both = universe(&masters(
+            "dashboth",
+            Some(&format!(
+                "{GROWW_HEAD}\
+                 NSE,CASH,,CHOLAFIN,EQ,EQ,INE121A01024,,\n\
+                 NSE,CASH,,FISTIPD3GP,EQ,MF,INF090I01VS3,,\n"
+            )),
+            Some(&format!(
+                "{DHAN_HEAD}\
+                 NSE,E,INE121A08PJ0,EQUITY,CHOLAFIN,CHOLA,ES,EQ,,,\n\
+                 NSE,E,INF090I01VS3,EQUITY,FISTIPD3GP,FRANKLIN PLAN,ETF,EQ,,,\n"
+            )),
+        ));
+        let two = dashboard_html(&both);
+        assert!(
+            two.contains("<div class=\"ck\">Disagreements</div><div class=\"cv\">2</div>"),
+            "one identity conflict plus one eligibility conflict is two: {two}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_escape_hatch_is_read_off_the_query_string_and_not_off_its_presence() {
+        // Found by `cargo mutants` while D-0038 was measuring `server.rs`: the
+        // handler reads `all=1`, and with only one value ever requested over
+        // HTTP the `==` could be a `!=` — so `?all=0` would widen and `?all=1`
+        // would narrow, which is the page doing exactly the opposite of what
+        // the link says.
+        let dir = masters(
+            "hatchhttp",
+            Some(&format!(
+                "{GROWW_HEAD}NSE,CASH,,RAJESHEXPO,EQ,EQ,INE343B01030,,\n"
+            )),
+            Some(&format!(
+                "{DHAN_HEAD}NSE,E,INE343B01030,EQUITY,RAJESHEXPO,RAJESH EXPORTS,ES,EQ,,,\n"
+            )),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let stopper = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let stop_addr = stopper.local_addr().expect("addr");
+        let served = tokio::spawn(serve(
+            listener,
+            router(Loaded::new(Site::load(&dir, &store_root("hatchhttp")))),
+            Box::pin(async move { stopper.accept().await.map(|_| ()) }),
+        ));
+
+        // RAJESHEXPO is in neither tracked universe, so it is the only kind of
+        // row the filter actually removes.
+        let widened = get(addr, "/instruments?all=1").await;
+        assert!(widened.contains("NSE-RAJESHEXPO"), "{widened}");
+        for narrow in ["/instruments", "/instruments?all=0", "/instruments?all=yes"] {
+            let page = get(addr, narrow).await;
+            assert!(
+                !page.contains("NSE-RAJESHEXPO"),
+                "{narrow} must NOT widen: {page}"
+            );
+        }
+
+        let _ = tokio::net::TcpStream::connect(stop_addr).await;
+        served
+            .await
+            .expect("task")
+            .expect("a graceful shutdown is not a failure");
+    }
+
+    #[test]
+    fn a_site_with_no_universe_still_shows_the_two_instruments_that_matter() {
+        // The masters were never read, so the merge is empty and the coverage
+        // grid would otherwise have no rows at all — hiding exactly the two
+        // series the whole page exists for. It falls back to them, and the
+        // missing master is still `UNAVAILABLE` on the page, so nothing is
+        // hidden by the fall-back.
+        let empty = masters("nomasters", None, None);
+        let site = site("nomasters", &empty);
+        assert_eq!(site.indices.len(), 2, "the engine surface, exactly");
+        assert_eq!(site.targets, [0, 0, 0], "and no target has members");
+
+        let html = store_html(&site, day(2026, 8, 7), 0);
+        assert!(
+            html.contains("NSE-NIFTY") && html.contains("NSE-BANKNIFTY"),
+            "{html}"
+        );
+        assert!(
+            html.contains("groww: UNAVAILABLE") && html.contains("dhan: UNAVAILABLE"),
+            "the masters' own absence rides along: {html}"
+        );
+
+        // The ingest page then offers every target with a truthful zero.
+        let ingest_html = pull_html(&site, day(2026, 8, 7));
+        assert!(ingest_html.contains("0 instrument(s)"), "{ingest_html}");
+    }
+
+    #[test]
+    fn a_window_whose_wire_date_does_not_exist_says_so_rather_than_wrapping() {
+        // The vendor's `toDate` is the day after the operator's last day, and
+        // after 9999-12-31 there is no such day. Refused by name in the fact
+        // itself — a wrapped date would silently ask for a window ending in
+        // 1970.
+        let window =
+            pull::session::Window::new(day(9990, 1, 1), day(9999, 12, 31)).expect("forwards");
+        let facts = window_facts(window);
+        let wire = facts
+            .iter()
+            .find(|&&(k, _)| k == "toDate on the wire")
+            .map(|(_, v)| v.clone())
+            .expect("the fact is always present");
+        assert!(wire.starts_with("REFUSED — "), "{wire}");
+        assert!(wire.contains("9999-12-31"), "{wire}");
+
+        // An ordinary window states the day after, and says why it is that day.
+        let ordinary = window_facts(
+            pull::session::Window::new(day(2022, 1, 8), day(2022, 2, 8)).expect("forwards"),
+        );
+        let wire = ordinary
+            .iter()
+            .find(|&&(k, _)| k == "toDate on the wire")
+            .map(|(_, v)| v.clone())
+            .expect("present");
+        assert!(wire.starts_with("2022-02-09"), "{wire}");
+        assert!(wire.contains("not inclusive"), "{wire}");
+    }
+
+    #[test]
+    fn an_expiry_gate_driven_by_value_answers_both_ways_without_a_clock() {
+        // `fno_answer` is the half of the handler the expiry rule lives in, and
+        // it takes the day rather than reading one, so both outcomes are pinned
+        // rather than being properties of when the suite ran.
+        let (code, page) = fno_answer(
+            "underlying=NIFTY&series=fut&expiry=2026-07-30&from=2026-07-01&to=2026-07-30",
+            day(2026, 8, 7),
+        );
+        assert_eq!(code, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(page.contains("NOT STARTED"), "{page}");
+        assert!(
+            page.contains("expired, checked against 2026-08-07"),
+            "{page}"
+        );
+
+        let (code, page) = fno_answer(
+            "underlying=NIFTY&series=fut&expiry=2026-08-07&from=2026-08-01&to=2026-08-07",
+            day(2026, 8, 7),
+        );
+        assert_eq!(code, axum::http::StatusCode::BAD_REQUEST);
+        assert!(page.contains("LIVE CONTRACT IS NEVER STORED"), "{page}");
     }
 
     #[tokio::test]
@@ -1579,7 +2829,7 @@ mod tests {
         let stop_addr = stopper.local_addr().expect("addr");
         let served = tokio::spawn(serve(
             listener,
-            router(Loaded::new(universe(&dir))),
+            router(Loaded::new(Site::load(&dir, &store_root("health503")))),
             Box::pin(async move { stopper.accept().await.map(|_| ()) }),
         ));
 
