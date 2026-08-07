@@ -181,7 +181,22 @@ fn one(member: &Member, store_root: &Path, plan: Plan<'_>) -> Result<(usize, Dro
     let raw = fetch::RawWindow {
         rows: member.rows.clone(),
     };
-    let landed = fetch::land(&raw, request, encoding, scale).map_err(|why| why.to_string())?;
+    let mut landed = fetch::land(&raw, request, encoding, scale).map_err(|why| why.to_string())?;
+    if landed.bars.is_empty() {
+        return Ok((0, landed.census));
+    }
+
+    // THE FOLD. Without it a real run produced 354,675 rows and ZERO bars:
+    // both archive vendors ship one-second snapshots with two to four rows per
+    // second and no sub-second field, and the store correctly refuses two
+    // records claiming the same instant.
+    //
+    // The bucket width comes from the TIMEFRAME the caller is filing under, so
+    // a one-second feed, a one-minute feed and a daily feed all fold through
+    // this same line. Nothing here knows which vendor it came from.
+    let bucket = crate::fold::Bucket::of_secs(timeframe.secs())
+        .ok_or("a timeframe of zero seconds has no bucket to fold into")?;
+    landed.bars = crate::fold::fold(&landed.bars, bucket).map_err(|why| why.to_string())?;
     if landed.bars.is_empty() {
         return Ok((0, landed.census));
     }

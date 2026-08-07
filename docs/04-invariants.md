@@ -55,7 +55,7 @@ the crate where the gap matters, and `docs/06-limits.md` §18 records the rest.
 | S-17 | The image is little-endian and each of the seven fields owns its own eight bytes; all 56 (field, byte) placements are asserted against all 56 image bytes | `store::unit::the_image_is_little_endian_and_each_field_owns_its_own_offset` | ✓ |
 | S-18 | `decode(image(r)) == r` exactly, over every 64-bit boundary in every field — `i64::MIN`, `i64::MAX`, zero, negatives — and the encoder is injective across the sampled 4,276 records | `store::unit::decoding_the_image_returns_the_record_byte_for_byte` | ✓ |
 | S-19 | A buffer shorter than 56 bytes is refused by length and never completed with invented zeros | `store::unit::a_short_record_is_refused_and_never_completed_with_zeros` | ✓ |
-| S-20 | `BLOCK_LEN == RECORD_STRIDE × RECORDS_PER_BLOCK == 56 × 73 == 4088`, and the last record of a block ends exactly on the block boundary — so no record straddles | `const _: () = assert!(…)` in `store::format` — a compile error — and `store::geometry::no_record_straddles_a_block` | ✓ |
+| S-20 | `BLOCK_LEN == RECORD_STRIDE × RECORDS_PER_BLOCK == 56 × 73 == 4088`, and the last record of a block ends exactly on the block boundary — so no record straddles | `store::geometry::no_record_straddles_a_block` (5,000 indices), plus **three** compile-time pins in `store::format` that can actually fail: `BLOCK_LEN == 4088`, `RECORDS_PER_BLOCK == 73`, `BLOCK_LEN == 56 * 73`. **The closed-form assertion the source comment points at cannot fail and proves nothing** — see below | ✓ |
 | S-21 | Decoding a record reads exactly 56 bytes: a 1 MiB buffer of `0xFF` past the record gives the same answer as the bare 56 bytes. Behavioural, not a timing measurement | `store::unit::decoding_reads_exactly_fifty_six_bytes_however_long_the_buffer_is` | ✓ |
 
 ## Vocabulary and indicators
@@ -432,6 +432,33 @@ CI gate 10 walks rows→tests and never tests→rows, so nothing here noticed.
 date rather than a tick precisely so the next reader re-runs the command instead
 of believing this table. An earlier audit of the same gate measured 95.31%
 lines / 95.91% regions; the gate has been red across both.
+
+### S-20 names three assertions that cannot fail — D-0045
+
+`crates/store/src/format.rs` defines `BLOCK_LEN` as
+`RECORD_STRIDE * RECORDS_PER_BLOCK`. Three of the `const` assertions beside it
+are therefore **tautologies** — they restate that definition and hold for every
+possible value of the two factors:
+
+- `assert!(BLOCK_LEN.is_multiple_of(RECORD_STRIDE))`
+- `assert!(BLOCK_LEN / RECORD_STRIDE == RECORDS_PER_BLOCK)`
+- `assert!((RECORDS_PER_BLOCK - 1) * RECORD_STRIDE + RECORD_STRIDE == BLOCK_LEN)`
+  — which reduces to `n·s == n·s`
+
+**Measured, not reasoned:** a scratch crate carrying the identical definitions
+and exactly these three assertions compiles at **exit 0** with
+`RECORDS_PER_BLOCK = 72`, and again at **exit 0** with `RECORDS_PER_BLOCK = 1`.
+The mutant D-0039 reports killing — `BLOCK_LEN` 4088 → 4096 — is also
+unwritable, because `BLOCK_LEN` is not a literal to mutate.
+
+The third of these is the one the source comment introduces with *"a compile
+error rather than a walk"*, and `CLAUDE.md` §4 bans a test that asserts nothing.
+**The no-straddle property is still genuinely secured** — by `BLOCK_LEN == 4088`,
+`RECORDS_PER_BLOCK == 73` and `BLOCK_LEN == 56 * 73`, which are falsifiable and
+which D-0039 also added, plus the runtime walk. So this is a wrong *citation*,
+not a missing guarantee, and S-20 now names the assertions that carry it. The
+source comment is in `crates/store/src/format.rs` and is reported rather than
+edited — that file is not this change's to touch.
 
 ### The nine rows that name a tool this repository does not have — D-0045
 

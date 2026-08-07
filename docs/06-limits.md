@@ -1303,9 +1303,20 @@ is at most:
 | exchange transaction charge | 1 paisa per leg — 2 paisa |
 | SEBI turnover fee | 2 paisa |
 | investor protection fund | 2 paisa |
-| securities transaction tax | 1 rupee (99 paisa) |
-| stamp duty | 1 rupee |
-| GST | 1 rupee |
+| securities transaction tax | 1 rupee — 100 paisa |
+| stamp duty | 1 rupee — 100 paisa |
+| GST | 1 rupee — 100 paisa |
+
+**That tax row read "1 rupee (99 paisa)" and the table then did not sum to its
+own total: 2 + 2 + 2 + 99 + 100 + 100 = 305 = ₹3.05, against the ₹3.06 stated
+below it.** Corrected to 100 by D-0045. The ceiling for a statutory levy is
+**100 paisa, not 99**, and it is worth writing out because the wrong figure was
+plausible. `statutory_levy` is `ceil_to_rupee(floor_to_paisa(scaled(…)))`. Let
+the raw amount be `100k + r` paisa. For `r` in `1..=99` ours gives `100(k+1)`;
+half-up to the rupee gives `100k` when `r <= 49` and `100(k+1)` when `r >= 50`.
+So the gap is **100 paisa for `r` in `1..=49` and 0 otherwise** — never 99, and
+never anything between. Only the parenthetical was wrong; the ₹3.06 total and
+the direction were right.
 
 So at most **₹3.06 per round trip**, always in the same direction. On the ₹67.12
 of `COSTS_VERIFIED` §5 Example 1 that is up to 4.6% of the charge stack — small
@@ -1480,9 +1491,15 @@ component small enough to hide inside a rounding is invisible to every example
 that uses its real rate**, and that is a general fact about this cost stack, not
 a one-off.
 
-51 of the 163 mutants were **unviable** — they did not compile. That is the
+**57** of the 163 mutants were **unviable** — they did not compile. That is the
 compiler catching them, not the tests, and it is reported in its own column
 rather than folded into "caught".
+
+*This sentence said **51**, contradicting the table three lines above it.
+Corrected by D-0045 from the table's own cells: 44 + 7 + 6 = 57 unviable,
+57 + 39 + 10 = 106 caught, and 106 + 57 = 163, which is 101 + 46 + 16. The table
+is internally consistent and 57 is the figure the run produced; 51 matched
+nothing.*
 
 ### Gates NOT run
 
@@ -1492,3 +1509,168 @@ were **not** run to green. Other agents are mid-edit in `crates/api`,
 diffs that are not stage 3's. `cargo fmt -p costs --check`,
 `cargo clippy -p costs --all-targets -- -D warnings`, `cargo test -p costs` and
 the coverage command above all pass at exit 0.
+
+---
+
+## 28. Which CI gates are red today, and what three verification lenses could not confirm
+
+Added by D-0045, which reconciled the documents against the code rather than
+against the reports written about the code. **Every number in this section was
+produced by running the command named beside it**, on this tree, on 2026-08-07,
+on the operator's machine (Apple M4 Pro, cargo/rustc 1.97.1, cargo-llvm-cov
+0.8.4). Nothing here is quoted from an agent report; where a finding originated
+elsewhere and could not be reproduced from this seat, it says so in the third
+subsection and is not stated as fact.
+
+### Four CI gates exit non-zero on this tree
+
+None of this is new breakage. It is breakage that no document said out loud.
+
+| Gate | Status | What it reports |
+|---|---|---|
+| 9 — coverage | **exit 1** | TOTAL 97.41% regions / 96.93% lines against a 100% floor |
+| 10 — invariants name real tests | **exit 1** | 10 rows name a test that exists in no file |
+| 1d — declared segments | **exit 1** | 59 undeclared segment-shaped literals under `crates/pull` |
+| 14 — a claimed bound is re-measured | **exit 1** | `crates/api` and `crates/costs` claim bounds and have no row in the coverage table |
+
+**Gate 9.** `cargo llvm-cov --workspace --locked --fail-under-lines 100
+--fail-under-regions 100 --summary-only` → exit 1. 672 of 25,907 regions and 478
+of 15,557 lines uncovered. The six short files are tabulated under X-06 in
+`docs/04-invariants.md`. The dominant one is `crates/pull/src/vendor.rs` at
+**0.00%** — 445 regions, 69 functions, 366 lines, every one uncovered, in a
+tracked file with no `#[test]` in it. `archive.rs`, `fetch.rs` and `csv.rs` have
+none either. That is four modules committed ahead of their tests, and it is the
+same shape D-0029 recorded for `core/src/universe.rs`: gate 10 walks rows→tests
+and never tests→rows, so nothing notices a module that claims nothing.
+
+**Gate 10.** Reproduced with the gate's own matching logic: rows 291, checked
+284, pending 17, **missing 10** — S-02, S-05, S-10, P-01, P-02, P-03, P-04,
+X-01, X-02, X-13. The gate's `allow_pending` list is deliberately empty, so this
+gate is **red by design** and stays red until those ten tests are written or the
+invariants are formally abandoned in `docs/05-decisions.md`. D-0045 did not
+write them; it stopped the rows claiming to be proven. Note gate 10 **cannot see
+the module segment** — its own comment says `store::unit::x` and
+`store::fault::x` are the same question to it — which is why S-03 and S-08 sat
+green for their whole lives while naming `store::loom::` and `store::proptest::`,
+modules that do not exist.
+
+**Gate 1d.** Reproduced verbatim under `bash` (under `zsh` the allowlist
+word-splits differently and the count is wrong). 59 undeclared literals. They
+arrived with the vendor, fetch, archive and CSV work and are mostly timeframe
+and date tokens — `1min`, `5min`, `1day`, `2024-02-29`, `open_interest`,
+`timestamp`, `payload`. **Two are vendor-shaped and are exactly the question
+this gate exists to force: `gdfl` and `truedata`.** Both are already tracked and
+public in `docs/08-vendor-samples.md` and `docs/05-decisions.md`, so the gate is
+not leaking them for the first time. Whether either is *also* the operator's
+real `<vendor>` path segment is operator-side and unknowable from inside this
+repository — the same reasoning gate 1d's own comment applies to `groww` and
+`dhan`, recorded in §18. **Separately: neither vendor appears in
+`docs/00-charter.md`**, and `CLAUDE.md` §3 rule 1 makes that file the only
+source a vendor claim may rest on. That is a Golden Rule 1 gap, not a gate 1d
+gap, and it is recorded here because nothing else records it.
+
+**Gate 14.** Reproduced by running the gate's own discovery and layer 1: 51 cost
+claims across 2,134 doc blocks in 51 tracked source files →
+`REFUSED crates/api — 7 cost claim(s), no row in the table` and
+`REFUSED crates/costs — 21 cost claim(s), no row in the table`. Both crates
+track a bench that satisfies layers 2, 2b and 3; only the table row is missing.
+The exact rows to add are quoted in D-0045 and reported to the operator.
+`.github/workflows/ci.yml` is not this change's file.
+
+### Three claims that were checked and did not survive
+
+**The round-trip charge stack can be reached without a date, from outside the
+crate.** `costs::trip::price` resolves rates by day and refuses an unverified
+window — that part holds. But `costs::trip::charge_stack` is `pub` and takes
+`(fills, quantity, direction, &Rates)` with **no day at all**, and
+`costs::trip::Rates::new` is `pub const` and takes four rates with **no day
+either**. `BpsX100::new` is crate-private, but `regime::NSE_EXCHANGE_CHARGE` and
+`regime::BSE_EXCHANGE_CHARGE` are `pub const BpsX100`, `regime::stt_options_rate`
+is `pub` and returns `Ok` for every representable day, and `rate::ipft` is a
+`pub const fn`. So an external caller can assemble a `Rates` and price a trade
+dated inside the refusal window at the 2024-verified exchange rate, with nothing
+refusing. That is the runtime escape hatch the predecessor's
+`DEC-ETC-REGIME-HISTORY-001` §9 forbids. **The public signatures above were read
+from the source for this entry; the out-of-crate probe that produced a number
+(₹61.90 for a 2019 trip) was run by the verification lens and not reproduced
+here.** `charge_stack`'s own doc comment discloses that it "resolves no date and
+cannot refuse for a citation reason"; §27 did not, and now does.
+
+**"Rounding CGST and SGST separately overcharges by exactly ₹1, every trade" is
+false as a generalisation.** The assertion in the test is fine — at Example 1's
+GST base of 4,512 paisa the two answers really do differ by exactly 100 paisa.
+The *generalisation* into "systematic, every trade" is contradicted by the
+crate's own other worked examples, whose GST bases give a difference of **zero**.
+The implementation is correct — it rounds once — and only the prose in
+`trip.rs` and `rate.rs` overstates. Those are source files and are reported
+rather than edited.
+
+**The ₹3.06 over-charge decomposition did not sum to ₹3.06.** Fixed in §27
+above: the securities-transaction-tax ceiling is 100 paisa, not the 99 the table
+carried, and the derivation is written out there. The total and the direction
+were always right.
+
+### What is NOT verified, by anyone, including this entry
+
+Recorded so no reader mistakes an unexamined claim for an examined one.
+`CLAUDE.md` §3 rule 6.
+
+- **Every "before" figure in this repository is unverifiable without reverting
+  the fix.** That covers `store/format.rs` at 56.12% lines, `pull`'s 5,100,585 ps
+  append, and `api`'s 124.916 ms page and 80.640× dashboard. The **after**
+  figures reproduce and their shape is consistent with each before-figure, but
+  that is inference. The api before/after pair is additionally **debug against
+  release** and is not comparable in absolute terms — only the ratio is, which
+  is why the ratio is what C-14 … C-17 assert.
+- **`cargo-mutants` was not run for D-0045.** The `crates/costs` figures (163
+  mutants, 0 survivors) were reproduced by a verification lens and matched to the
+  unit; they are not this entry's measurement. `crates/core`, `crates/store` and
+  `crates/api` have **never** been mutation-tested at all, and `crates/store`'s
+  five hand-planted mutants are five points of a space the tool enumerates in
+  full (§22). **CI has no `cargo-mutants` step**, so `CLAUDE.md` §9's
+  "no surviving mutant" bullet is enforced by nobody.
+- **Branch coverage is not measured and cannot be**, on the pinned toolchain —
+  `llvm-cov` reports `-` in the branch column for all 47 files including TOTAL.
+  Every 100% figure anywhere in these documents is **line and region only**.
+  X-06b and §7.
+- **No figure in any of these documents comes from a CI runner.** Every ratio is
+  one machine, one process, one load. The 3.0× ceiling the harnesses assert is
+  the shared-CI number; whether a GitHub runner stays under it is **UNVERIFIED**
+  for every gate-8 row in the repository.
+- **Nothing in `crates/costs` has been checked against a broker contract note,
+  an exchange bill or a broker statement.** A lens proved the Rust reproduces the
+  predecessor's Python to the paisa over 37,668 swept cases. That proves the
+  *port*. It says nothing about whether the source was right, and neither does
+  any row in `docs/04-invariants.md`.
+- **The `crates/api` search figures are synthetic only.** Every measured needle
+  runs against names of the form `NSE-S` plus seven digits, engineered so nearly
+  every name carries nearly every trigram. That is an **upper bound** on search
+  cost, not a typical one. What a real symbol prefix costs against the real
+  masters is unmeasured.
+- **The `crates/api` catalog build has no asserted ceiling.** The bench prints it
+  (41 ms for all three universes) and gates nothing, so a build that turned
+  quadratic would fail no gate.
+- **`cargo deny check`, `cargo clippy --workspace --all-targets` and
+  `cargo test --workspace --locked` were not run by D-0045** beyond the workspace
+  test and format runs it reports. Per-crate gates are green.
+- **The memory figures are arithmetic, not measurement.** The 136-byte key/value
+  pair width *is* measured and printed by the pull bench. Everything built on it
+  — ~574 MB at `MAX_ENTRIES`, ~72 MB → ~144 MB at a 248,000-entry census — is
+  calculation over hashbrown's power-of-two bucket rounding. **No resident-set
+  size has been measured by anyone**, and an independent redoing of the same
+  arithmetic gives ~570 MB rather than ~574 MB, so even the calculation is not
+  agreed to three significant figures.
+
+### Two source-file defects found and reported, not fixed
+
+D-0045 owns `docs/**` only. Both of these are in `crates/**`:
+
+- `crates/store/src/format.rs:311` tells the reader that
+  `the_image_is_little_endian_and_each_field_owns_its_own_offset` *"walks all 448
+  (field, byte) placements"*. The test asserts `placements == 56`, its own
+  comment says `7 x 8 = 56`, and S-17 says 56. **448 corresponds to no quantity
+  in that test.**
+- `crates/api/src/catalog.rs:407` cites the flatness of `page()` as
+  *"`docs/04-invariants.md` C-11"*. C-11 is a `crates/pull` manifest invariant
+  (`pull::bench::census_beats_the_scan_it_replaces`). The correct id is **C-14**,
+  which is what `crates/api/benches/ratio.rs` itself prints.
