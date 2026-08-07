@@ -307,9 +307,15 @@ mod tests {
     #[test]
     fn a_long_fills_the_entry_high_and_the_exit_low_each_one_tick_adverse() {
         // The predecessor's pinned flat-bar family.
-        assert_eq!(triple(flat(10_000), flat(12_000), Direction::Long), (10_005, 11_995, 10));
+        assert_eq!(
+            triple(flat(10_000), flat(12_000), Direction::Long),
+            (10_005, 11_995, 10)
+        );
         // A zero-move trade still pays both ticks.
-        assert_eq!(triple(flat(10_000), flat(10_000), Direction::Long), (10_005, 9_995, 10));
+        assert_eq!(
+            triple(flat(10_000), flat(10_000), Direction::Long),
+            (10_005, 9_995, 10)
+        );
         // Ranged bars anchor the EXTREMES, not the midpoints: the buy takes the
         // entry high and the sell the exit low.
         assert_eq!(
@@ -327,7 +333,10 @@ mod tests {
         // The cover BUYS on the exit bar's high; the opening SELL is on the
         // entry bar's low. Both adverse — the reconciled rule, not the mirror
         // of the long one.
-        assert_eq!(triple(flat(10_000), flat(12_000), Direction::Short), (12_005, 9_995, 10));
+        assert_eq!(
+            triple(flat(10_000), flat(12_000), Direction::Short),
+            (12_005, 9_995, 10)
+        );
         assert_eq!(
             triple(bar(10_100, 9_900), bar(12_050, 11_950), Direction::Short),
             (12_055, 9_895, 10)
@@ -352,10 +361,16 @@ mod tests {
         assert_eq!(triple(flat(5), flat(5), Direction::Long), (10, 5, 5));
         // A sub-two-tick sell anchor: the fill floors to 5 and the leg moved
         // 2, so the realized slippage is 7 — a band, not a two-point set.
-        assert_eq!(triple(flat(10_000), bar(10_000, 7), Direction::Long), (10_005, 5, 7));
+        assert_eq!(
+            triple(flat(10_000), bar(10_000, 7), Direction::Long),
+            (10_005, 5, 7)
+        );
         // A sell anchor BELOW the floor: the fill is pushed up to one tick and
         // the recorded movement is the distance it was pushed.
-        assert_eq!(triple(flat(10_000), bar(10_000, -95), Direction::Long), (10_005, 5, 105));
+        assert_eq!(
+            triple(flat(10_000), bar(10_000, -95), Direction::Long),
+            (10_005, 5, 105)
+        );
         // A short's opening sell floors the same way, off the ENTRY low.
         assert_eq!(triple(flat(5), flat(100), Direction::Short), (105, 5, 5));
     }
@@ -499,8 +514,14 @@ mod tests {
         // than assumed: an anchor at the top of `i64` slips a tick and stays in
         // range, and an anchor at the very bottom — where the subtraction
         // itself would leave `i64` — lands on the floor.
-        assert_eq!(triple(flat(10), bar(i64::MAX, i64::MAX), Direction::Long).1, i64::MAX - 5);
-        assert_eq!(triple(flat(10), bar(10, i64::MIN + 20), Direction::Long).1, 5);
+        assert_eq!(
+            triple(flat(10), bar(i64::MAX, i64::MAX), Direction::Long).1,
+            i64::MAX - 5
+        );
+        assert_eq!(
+            triple(flat(10), bar(10, i64::MIN + 20), Direction::Long).1,
+            5
+        );
         // `i64::MIN` exactly: the `checked_sub` arm that has no answer, and the
         // floor stands in for it. The realized slippage is what leaves i64
         // there, not the fill.
@@ -539,10 +560,16 @@ mod tests {
         assert_eq!(one, bar(100, 90));
         assert_ne!(one, bar(100, 89));
         assert!(bar(100, 89) < bar(100, 90));
-        assert_eq!(format!("{:?}", flat(5)), "Bar { high: Paisa(5), low: Paisa(5) }");
+        assert_eq!(
+            format!("{:?}", flat(5)),
+            "Bar { high: Paisa(5), low: Paisa(5) }"
+        );
 
         let fills = worst_case_fills(one, flat(200), Direction::Long).expect("in range");
-        assert_eq!(fills, worst_case_fills(one, flat(200), Direction::Long).expect("in range"));
+        assert_eq!(
+            fills,
+            worst_case_fills(one, flat(200), Direction::Long).expect("in range")
+        );
         let mut set = HashSet::new();
         assert!(set.insert(fills));
         assert!(!set.insert(fills));

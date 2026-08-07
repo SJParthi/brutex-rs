@@ -81,7 +81,6 @@
 pub mod config;
 pub mod manifest;
 pub mod rate;
-pub mod regime;
 pub mod secret;
 pub mod session;
 

@@ -593,6 +593,21 @@ impl SessionRow {
         }
     }
 
+    /// A row for an era whose circular was never retrieved.
+    ///
+    /// Has no caller today: on 2026-08-07 the three outstanding rows were
+    /// filled from NSE/CMTR/74466 and NSE/FAOP/74467, so every shipped row
+    /// now carries a citation. It is kept because the NEXT gap is a matter of
+    /// when, not whether — a circular that cannot be retrieved must remain
+    /// expressible, or the pressure at that moment is to guess a number
+    /// instead. Deleting this constructor would remove the honest option and
+    /// leave only the dishonest one.
+    #[expect(
+        dead_code,
+        reason = "the refusal constructor is part of the contract, not a \
+                  leftover: every era whose source is unretrievable must stay \
+                  representable. See the doc comment above."
+    )]
     const fn unverified(start: Day, kind: SessionKind, source: &'static str) -> Self {
         Self {
             start,
@@ -950,6 +965,35 @@ const CHARTER_SESSION: &str = "docs/00-charter.md §3 — regular session 09:15 
 ///
 /// Written once and shared by all three rows because it is one event and one
 /// citation gap; a second copy is a second thing to update.
+const CAS_INDEX_CIRCULAR: &str = "NSE/CMTR/74466 §E, retrieved 2026-08-07: \"Unexecuted limit \
+     orders of the CTS (Continuous Trading Session till 03:15PM)\". The swept \
+     index closes EARLIEST of the three segments, which is counter-intuitive \
+     and indirect: CAS eligibility is \"stocks on which derivative contracts \
+     are available in any of the Exchanges\" (§A), every NIFTY 50 and NIFTY \
+     BANK constituent qualifies, so at 15:15 every share the index is \
+     computed from stops trading continuously and the index freezes with \
+     them. NSE FAQ v1.0 (May 2026) Q7 confirms the actual index then uses the \
+     LTP of CTS. UNVERIFIED and deliberately not encoded: whether a vendor \
+     puts the frozen actual index or the indicative auction index in a \
+     15:15-15:35 bar. Both are published; only measurement against \
+     post-2026-08-03 data can say which.";
+
+const CAS_CASH_CIRCULAR: &str = "NSE/CMTR/74466 §A, retrieved 2026-08-07. A share with NO derivative \
+     contract is not CAS eligible and keeps its 15:30 continuous close, so \
+     this row restates the anchor rather than moving it. Written as a row \
+     rather than omitted because \"unchanged\" is a finding that needs a \
+     citation exactly as much as a change does.";
+
+const FNO_EXTENSION_CIRCULAR: &str = "NSE/FAOP/74467, retrieved 2026-08-07: equity derivatives extended ten \
+     minutes to 15:40, so positions can be adjusted against the closing \
+     prices discovered in the cash auction. Applies to index futures, index \
+     options, stock futures and stock options, including expiry days.";
+
+#[expect(
+    dead_code,
+    reason = "the gap this replaced is kept as the record of \
+     what was unknown before the circulars were retrieved on 2026-08-07"
+)]
 const AUG_2026_GAP: &str = "an extension of NSE equity-derivatives trading by ten minutes with \
      effect from 2026-08-03, and a change of the cash market's close into a Closing Auction \
      Session, were reported by five brokers (Angel One, Groww, JM Financial, Anand Rathi, \
@@ -973,10 +1017,12 @@ const NSE_INDEX_SESSIONS: SessionTable = SessionTable {
         // The index is computed from the cash market, so it is NOT safe to
         // assume the index window survived a change to the cash close. This
         // row refuses rather than guessing in either direction.
-        Some(SessionRow::unverified(
+        Some(SessionRow::verified(
             AUG_3_2026,
+            SESSION_OPEN_MINUTE,
+            15 * 60 + 15,
             SessionKind::Continuous,
-            AUG_2026_GAP,
+            CAS_INDEX_CIRCULAR,
         )),
         None,
     ],
@@ -992,10 +1038,12 @@ const NSE_CASH_SESSIONS: SessionTable = SessionTable {
         CHARTER_SESSION,
     ),
     later: [
-        Some(SessionRow::unverified(
+        Some(SessionRow::verified(
             AUG_3_2026,
+            SESSION_OPEN_MINUTE,
+            SESSION_CLOSE_MINUTE,
             SessionKind::Continuous,
-            AUG_2026_GAP,
+            CAS_CASH_CIRCULAR,
         )),
         None,
     ],
@@ -1011,12 +1059,12 @@ const NSE_DERIVATIVES_SESSIONS: SessionTable = SessionTable {
         CHARTER_SESSION,
     ),
     later: [
-        // 15:40 is REPORTED, not verified. It lives in the source string as
-        // prose, where it can be read and never used as a filter bound.
-        Some(SessionRow::unverified(
+        Some(SessionRow::verified(
             AUG_3_2026,
+            SESSION_OPEN_MINUTE,
+            15 * 60 + 40,
             SessionKind::Continuous,
-            AUG_2026_GAP,
+            FNO_EXTENSION_CIRCULAR,
         )),
         None,
     ],

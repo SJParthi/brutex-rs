@@ -335,7 +335,10 @@ mod tests {
         let mut checked = 0_u32;
         let mut check = |product: i128| {
             let r = i128::from(raw(ceil_to_paisa(product)));
-            assert!(r * RATE_SCALE_WIDE >= product, "{product}: not an upper bound");
+            assert!(
+                r * RATE_SCALE_WIDE >= product,
+                "{product}: not an upper bound"
+            );
             assert!(
                 (r - 1) * RATE_SCALE_WIDE < product,
                 "{product}: not the LEAST upper bound"
@@ -403,7 +406,10 @@ mod tests {
         );
         // One rupee below the edge still computes, so the refusal is the
         // edge itself and not a blanket rejection of large amounts.
-        assert_eq!(raw(ceil_to_rupee(Paisa::from_raw(i64::MAX - 807))), i64::MAX - 807);
+        assert_eq!(
+            raw(ceil_to_rupee(Paisa::from_raw(i64::MAX - 807))),
+            i64::MAX - 807
+        );
         // i64::MIN ceils toward +infinity to ...800, which is in range.
         assert_eq!(raw(ceil_to_rupee(Paisa::from_raw(i64::MIN))), i64::MIN + 8);
     }
