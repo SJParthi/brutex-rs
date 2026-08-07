@@ -14,7 +14,7 @@
 //! sees decides the run on its own.
 
 use crate::catalog::{Catalog, PAGE_ROWS, Selection};
-use crate::{audit, census, ingest, master, merge, render};
+use crate::{audit, bars, census, ingest, master, merge, render};
 use brutex_core::vendor::Vendor;
 use pull::session::{Day, IstMoment};
 use std::fmt::Write as _;
@@ -1827,6 +1827,130 @@ fn store_filter(query: &str) -> census::StoreFilter {
     }
 }
 
+/// The prices themselves — one month of one instrument, read by index.
+///
+/// **The page every other page was describing.** `/store` counted rows and drew
+/// swatches; nothing in this server ever showed a price. This opens the bar file
+/// the ingest path wrote and renders what is in it.
+async fn bars_get(
+    axum::extract::State(site): axum::extract::State<Loaded>,
+    uri: axum::http::Uri,
+) -> (axum::http::StatusCode, axum::response::Html<String>) {
+    let query = uri.query().unwrap_or("").to_owned();
+    let (code, body) = dated(ingest::today_ist(), "Bars", |_today| {
+        bars_html(&site, &query)
+    });
+    (code, axum::response::Html(body))
+}
+
+/// One month of bars, or a named refusal.
+///
+/// Every failure arm here names what it looked for: an unreadable month must
+/// say *which path*, because "no data" and "the wrong path" send an operator to
+/// opposite places — the same distinction `census::Census` draws between absent
+/// and unreadable.
+#[must_use]
+pub fn bars_html(site: &Site, query: &str) -> (axum::http::StatusCode, String) {
+    let symbol = param(query, "symbol");
+    let segment = {
+        let raw = param(query, "segment");
+        if raw.is_empty() {
+            "INDEX".to_owned()
+        } else {
+            raw
+        }
+    };
+    let exchange = {
+        let raw = param(query, "exchange");
+        if raw.is_empty() {
+            "NSE".to_owned()
+        } else {
+            raw
+        }
+    };
+    let vendor = brutex_core::vendor::Vendor::ALL
+        .into_iter()
+        .find(|v| v.as_str() == param(query, "vendor"))
+        .unwrap_or(brutex_core::vendor::Vendor::Dhan);
+    let page = page_number(query);
+
+    let month = {
+        let raw = param(query, "month");
+        raw.split_once('-')
+            .and_then(|(y, m)| store::path::YearMonth::new(y.parse().ok()?, m.parse().ok()?).ok())
+    };
+
+    let Some(month) = month else {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            render::bars_page(&render::BarsView {
+                symbol: &symbol,
+                segment: &segment,
+                vendor: vendor.as_str(),
+                month: "—",
+                rows: &[],
+                total: 0,
+                page: 0,
+                last_page: 0,
+                trouble: Some(
+                    "no month was named. A bar file is addressed by                      (vendor, exchange, segment, symbol, timeframe, month) and                      the month is the one part that cannot be defaulted —                      ?month=2025-07",
+                ),
+                store_root: &site.store_root.display().to_string(),
+            }),
+        );
+    };
+
+    match bars::open(
+        &site.store_root,
+        vendor,
+        &exchange,
+        &segment,
+        &symbol,
+        month,
+    ) {
+        Err(why) => (
+            axum::http::StatusCode::NOT_FOUND,
+            render::bars_page(&render::BarsView {
+                symbol: &symbol,
+                segment: &segment,
+                vendor: vendor.as_str(),
+                month: &month.to_string(),
+                rows: &[],
+                total: 0,
+                page: 0,
+                last_page: 0,
+                trouble: Some(&why),
+                store_root: &site.store_root.display().to_string(),
+            }),
+        ),
+        Ok(file) => {
+            // `n_valid` is a header field, so the page count is a division and
+            // not a walk — the same arithmetic every paged surface here uses.
+            let total = usize::try_from(file.header().n_valid).unwrap_or(usize::MAX);
+            let last_page = total.saturating_sub(1) / bars::PAGE_BARS;
+            let page = page.min(last_page);
+            let (rows, faults) =
+                bars::page(&file, page.saturating_mul(bars::PAGE_BARS), bars::PAGE_BARS);
+            let trouble = (!faults.is_empty()).then(|| faults.join(" · "));
+            (
+                axum::http::StatusCode::OK,
+                render::bars_page(&render::BarsView {
+                    symbol: &symbol,
+                    segment: &segment,
+                    vendor: vendor.as_str(),
+                    month: &month.to_string(),
+                    rows: &rows,
+                    total,
+                    page,
+                    last_page,
+                    trouble: trouble.as_deref(),
+                    store_root: &site.store_root.display().to_string(),
+                }),
+            )
+        }
+    }
+}
+
 /// Every route this server answers, serving from an already-loaded site.
 ///
 /// Takes the site rather than a directory: a router holding a `PathBuf` can
@@ -1854,6 +1978,7 @@ pub fn router(site: Loaded) -> axum::Router {
         .route("/pull/fno", axum::routing::post(pull_fno))
         .route("/audit", axum::routing::get(audit_get))
         .route("/store", axum::routing::get(store_get))
+        .route("/bars", axum::routing::get(bars_get))
         .route("/health", axum::routing::get(health))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_FORM_BYTES))
         .with_state(site)

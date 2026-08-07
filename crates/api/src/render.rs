@@ -2125,6 +2125,104 @@ pub fn store_page(view: &StoreView<'_>) -> String {
     body
 }
 
+/// Everything one page of prices needs.
+#[derive(Debug)]
+pub struct BarsView<'a> {
+    /// Which instrument, as the store names it.
+    pub symbol: &'a str,
+    /// Its segment — the store path's, not a label.
+    pub segment: &'a str,
+    /// Whose bars these are.
+    pub vendor: &'a str,
+    /// The month, already rendered.
+    pub month: &'a str,
+    /// The bars on this page, already read by index.
+    pub rows: &'a [store::format::Bar],
+    /// How many bars the month holds, off the header.
+    pub total: usize,
+    /// Which page, zero-based.
+    pub page: usize,
+    /// The last page with rows on it.
+    pub last_page: usize,
+    /// What went wrong, when something did.
+    pub trouble: Option<&'a str>,
+    /// Where the file was looked for, so an absence is actionable.
+    pub store_root: &'a str,
+}
+
+/// The prices page.
+///
+/// **The first surface in this repository that shows a price.** Everything else
+/// counts rows, draws swatches or reports coverage; this renders what is
+/// actually on the disk, and it is what makes every other number checkable.
+#[must_use]
+pub fn bars_page(view: &BarsView<'_>) -> String {
+    let mut body = open_with(
+        &format!("brutex · {} · {}", view.symbol, view.month),
+        "/store",
+        crate::bars::BARS_STYLE,
+    );
+    let ok = view.trouble.is_none() && !view.rows.is_empty();
+    body.push_str(&hero(
+        &format!(
+            "{} · {} · {} · 1 MINUTE",
+            escape(view.vendor).to_uppercase(),
+            escape(view.segment),
+            escape(view.month)
+        ),
+        &format!("{}<br>as it is stored.", escape(view.symbol)),
+        "Every row below is a record read out of the bar file by index — one          seek and one fixed-length read each, so the last page costs what the          first does. Prices are paisa integers all the way here and are split          into rupees rather than divided, because a float has no business          anywhere near a price.",
+        ok,
+        if ok { "held" } else { "nothing to show" },
+    ));
+
+    if let Some(why) = view.trouble {
+        body.push_str(&halt_block("this month", why));
+    }
+
+    let _ = write!(
+        body,
+        "<p class=\"sub\"><b>{}</b> bar(s) in {} · showing {} · page {} of {} · \
+         store root {}</p>",
+        view.total,
+        escape(view.month),
+        view.rows.len(),
+        view.page + 1,
+        view.last_page + 1,
+        escape(view.store_root)
+    );
+
+    if view.rows.is_empty() && view.trouble.is_none() {
+        body.push_str(&halt_block(
+            "empty month",
+            "the file opened and holds no committed record. That is a real \
+             answer and a different one from a file that is missing — nothing \
+             was ever appended to this month.",
+        ));
+    }
+
+    body.push_str("<section class=\"wrap\"><div class=\"panel\">");
+    body.push_str(&crate::bars::table(view.rows));
+    body.push_str("</div></section>");
+
+    // The pager keeps every narrowing in the URL, so a page of prices is
+    // linkable — the same property `/store` and `/instruments` have.
+    let base = format!(
+        "/bars?symbol={}&segment={}&vendor={}&month={}",
+        escape(view.symbol),
+        escape(view.segment),
+        escape(view.vendor),
+        escape(view.month)
+    );
+    body.push_str(&pager(&base, view.page, view.last_page));
+    body.push_str(
+        "<section class=\"wrap\"><p class=\"fine\">\
+         <a href=\"/store\">← back to what is held</a></p></section>",
+    );
+    body.push_str(FOOT);
+    body
+}
+
 /// The previous/next control, shared by every paged surface.
 ///
 /// One function rather than one per page, for the reason
