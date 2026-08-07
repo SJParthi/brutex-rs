@@ -6,7 +6,18 @@ fails if a row's test does not exist.
 
 Status: `✓` proven · `◐` proven where it has been run, and where that is is
 named · `○` test written, awaiting the crate · `—` not yet reachable (the crate
-does not exist).
+does not exist) · `✗` **the named test does not exist in any file, and the crate
+it names is tracked today** — the row is a gap, not a proof.
+
+**`✗` was added by D-0045 and it is the point of that entry.** Seven rows wore
+`—` while naming a test that exists in zero files, in three crates that are
+tracked and compiled today. `—` means "the crate does not exist", so those rows
+read as *not yet reachable* when the truth was *nobody wrote it*. A row pointing
+at a phantom test is worse than an empty row, because it looks proven. Every
+such row now carries `✗`, keeps the test name it would need, and says in its own
+cell that the name is a plan rather than a proof. The names are deliberately
+**left in the backticks** so CI gate 10 goes on reporting them by name every
+run; removing the token would make the gate green by blinding it.
 
 **X-07 and X-08 were narrowed by D-0036, not weakened.** X-07 sat at `—`, which
 this legend defines as "the crate does not exist" — untrue once `crates/pull`
@@ -26,15 +37,15 @@ the crate where the gap matters, and `docs/06-limits.md` §18 records the rest.
 | # | Must hold | Proven by | |
 |---|---|---|---|
 | S-01 | `size_of::<Bar>() == 56` and `align_of::<Bar>() == 8` | `const _: () = assert!(…)` — a compile error, not a test | — |
-| S-02 | `read(i)` returns the bytes `write(i, b)` wrote, for every *i* | `store::proptest::roundtrip` | — |
-| S-03 | A reader never observes a record beyond `n_valid` | `store::loom::commit_counter_publishes_last` | — |
+| S-02 | `read(i)` returns the bytes `write(i, b)` wrote, for every *i* | **NOT PROVEN.** `store::proptest::roundtrip` exists in no file, and no `proptest` dependency exists in this workspace. What *is* proven is the record codec, not the file: S-18 asserts `decode(image(r)) == r` over 4,276 records. The gap is the disk round trip | ✗ |
+| S-03 | A reader never observes a record beyond `n_valid` | `store::fault::commit_counter_publishes_last` — the module was written `store::loom::`, and there is **no `loom` module and no `loom` dependency**; the test is a plain `#[test]` walking all 65 commit prefixes | ✓ |
 | S-04 | A crash between data write and counter publish loses the tail and corrupts nothing | `store::fault::kill_between_write_and_commit` | — |
-| S-05 | A full disk during append returns `Err`, never a signal | `store::fault::enospc_returns_error` | — |
+| S-05 | A full disk during append returns `Err`, never a signal | **NOT PROVEN.** `store::fault::enospc_returns_error` exists in no file. `crates/store/tests/fault.rs` is tracked and holds 18 tests; this is not one of them. No test in this repository fills a filesystem | ✗ |
 | S-06 | A flipped bit in any block is detected on the next read of that block | `store::fault::bitflip_detected` | — |
 | S-07 | A file whose length does not divide by the stride truncates to the last whole record and logs | `store::fault::ragged_tail_truncates_loudly` | — |
-| S-08 | `i64::MIN` in `open_interest` round-trips as null and is never confused with `0` | `store::proptest::oi_sentinel_distinct` | — |
+| S-08 | `i64::MIN` in `open_interest` is never confused with `0`, and round-trips as null through the record image | `store::unit::oi_sentinel_distinct` — the module was written `store::proptest::`, and **no `proptest` dependency exists**; it is a plain `#[test]`, and it proves the *distinctness* half only. The *round-trip* half is `store::unit::decoding_the_image_returns_the_record_byte_for_byte` (S-18), which walks `i64::MIN` in every field | ✓ |
 | S-09 | Opening a file with an unknown `format_version` refuses; it never guesses | `store::unit::unknown_version_refuses` | — |
-| S-10 | Two concurrent writers on one file are refused by the advisory lock | `store::integration::second_writer_refused` | — |
+| S-10 | Two concurrent writers on one file are refused by the advisory lock | **NOT PROVEN.** `store::integration::second_writer_refused` exists in no file, and `crates/store/tests/integration.rs` does not exist either. No advisory lock is exercised anywhere in this repository | ✗ |
 | S-11 | The checksum reproduces a hardcoded value at every length a wide kernel can break on — 0, 1, 8, 15, 16, 56, 60, 64, 4087, 4088, 4089 bytes, and the all-zero and all-ones block | `store::unit::the_crc_reproduces_a_hardcoded_value_at_every_length_that_can_break` | ✓ |
 | S-12 | The shipped checksum kernel agrees with an independent bit-by-bit reference at every length across a stride boundary, on every target | `store::unit::the_fast_kernel_agrees_with_a_bit_by_bit_reference_on_every_length` | ✓ |
 | S-13 | The header slot's covered domain is exactly bytes `0..56 ‖ 60..64`; filling the four-byte hole is a different number and is refused as such | `store::unit::the_covered_domain_is_the_slot_minus_its_checksum` | ✓ |
@@ -151,7 +162,7 @@ directory, found none, and exited zero — see `docs/06-limits.md` §7b and §7c
 
 | # | Must hold | Proven by | |
 |---|---|---|---|
-| P-01 | A rate governor never issues above the configured ceiling, under any concurrency | `pull::loom::governor_ceiling` | — |
+| P-01 | A rate governor never issues above the configured ceiling, under any concurrency | **NOT PROVEN.** `pull::loom::governor_ceiling` exists in no file, and **`loom` appears in no `Cargo.toml` in this repository** — there is no concurrency checker here to run it. The single-caller arithmetic *is* proven, by P-20 through P-35. The words that stay unproven are *under any concurrency* | ✗ |
 | P-02 | A bar outside the requested window is never stored | `pull::unit::window_boundary` | — |
 | P-03 | A bar on a non-trading date is dropped and counted | `pull::unit::calendar_filter` | — |
 | P-04 | Re-running an ingest stores nothing new and reports zero net-new | `pull::integration::idempotent_repull` | — |
@@ -282,13 +293,20 @@ Added by D-0024. Every row here is proven by a test that runs today.
 | I-13 | A trailing dash that is not the row's own series is never stripped, so `BAJAJ-AUTO` survives | `core::vendor::a_dash_that_is_not_the_rows_own_series_is_never_stripped` | ✓ |
 | I-14 | Every column a vendor's reader needs is required by name, and a missing one is refused and named | `api::master::every_column_a_vendor_needs_is_required_and_named_when_absent` | ✓ |
 | I-15 | The binary's entry point is measured by running it, not exempted from the coverage gate | `api::binary::the_binary_reports_what_it_read_and_exits_zero` | ✓ |
-| I-16 | A vendor field wider than `MAX_FIELD_BYTES` is refused **before** anything reads it, whichever of the ten fields it is | `core::vendor::an_over_wide_field_is_refused_whichever_field_it_is` | ✓ |
-| I-17 | The width bound is the first byte that is too many and not one before, and it never substitutes for the parsers below it | `core::vendor::the_bound_is_the_first_byte_that_is_too_many_and_not_one_before` | ✓ |
-| I-18 | The widest value measured in either real master still passes the width gate untouched | `core::vendor::a_row_of_ordinary_width_passes_the_gate_untouched` | ✓ |
-| I-19 | The width gate runs before the test-marker scan and does not shadow it | `core::vendor::the_test_marker_scan_still_declines_a_real_test_listing` | ✓ |
-| I-20 | A master larger than the reader holds is refused from its size, before it is read into memory | `api::master::a_master_larger_than_this_reader_holds_is_refused_before_it_is_read` | ✓ |
-| I-21 | A row longer than the reader splits is named at its line number and never split | `api::master::a_row_longer_than_this_reader_splits_is_named_and_never_split` | ✓ |
-| I-22 | An over-wide field makes the row an error that names the field; it is never a silent keep | `api::master::a_field_wider_than_core_will_read_is_an_error_and_not_a_silent_keep` | ✓ |
+**The seven rows below were appended as I-16 … I-22, and those seven ids were
+already taken** by the equity-gate section that follows. **Renumbered to I-31 …
+I-37 by D-0045**, taking the next free ids after I-30. No file outside this one
+cited either block — checked before the renumber — so nothing else moves.
+
+| # | Must hold | Proven by | |
+|---|---|---|---|
+| I-31 | A vendor field wider than `MAX_FIELD_BYTES` is refused **before** anything reads it, whichever of the ten fields it is | `core::vendor::an_over_wide_field_is_refused_whichever_field_it_is` | ✓ |
+| I-32 | The width bound is the first byte that is too many and not one before, and it never substitutes for the parsers below it | `core::vendor::the_bound_is_the_first_byte_that_is_too_many_and_not_one_before` | ✓ |
+| I-33 | The widest value measured in either real master still passes the width gate untouched | `core::vendor::a_row_of_ordinary_width_passes_the_gate_untouched` | ✓ |
+| I-34 | The width gate runs before the test-marker scan and does not shadow it | `core::vendor::the_test_marker_scan_still_declines_a_real_test_listing` | ✓ |
+| I-35 | A master larger than the reader holds is refused from its size, before it is read into memory | `api::master::a_master_larger_than_this_reader_holds_is_refused_before_it_is_read` | ✓ |
+| I-36 | A row longer than the reader splits is named at its line number and never split | `api::master::a_row_longer_than_this_reader_splits_is_named_and_never_split` | ✓ |
+| I-37 | An over-wide field makes the row an error that names the field; it is never a silent keep | `api::master::a_field_wider_than_core_will_read_is_an_error_and_not_a_silent_keep` | ✓ |
 
 ## The equity gate after D-0025, and the refusal after D-0026
 
@@ -353,21 +371,82 @@ Added by D-0038. Every row here is proven by a test that runs today.
 
 | # | Must hold | Proven by | |
 |---|---|---|---|
-| X-01 | Run identity changes if any loaded bar differs by one field | `core::proptest::identity_sensitivity` | — |
-| X-02 | Prices never touch a float on any path from wire to store to result | `core::lint::no_float_in_price` (a clippy deny plus a source check) | — |
+| X-01 | Run identity changes if any loaded bar differs by one field | **NOT PROVEN.** `core::proptest::identity_sensitivity` exists in no file; no `proptest` dependency exists. There is also no run-identity function yet — `blake3` appears in no manifest — so this row has neither the test nor the code | ✗ |
+| X-02 | Prices never touch a float on any path from wire to store to result | **PARTLY PROVEN, and the row overstated both halves.** `core::lint::no_float_in_price` exists in no file, so the *source check* does not exist. The *lint* is `float_arithmetic`, and in `Cargo.toml` it is `"warn"`, **not** `"deny"` — it fails a build only because CI passes `-D warnings`, and it fires on float *arithmetic*, never on a float *type* held in a price. What is genuinely proven is X-11: `Price` has a private field, so the one checked conversion is the only constructor | ✗ |
 | X-03 | Every tracked file has an allowed extension | CI gate 1 | ✓ |
 | X-04 | No build script invokes an external process | CI gate 2 | ✓ |
 | X-05 | `web` depends on `core` alone | CI gate 7 | ✓ |
-| X-06 | **Line and region** coverage is 100% on every crate, with no omit list | CI coverage job (`--fail-under-lines 100 --fail-under-regions 100`) | ✓ |
+| X-06 | **Line and region** coverage is 100% on every crate, with no omit list | **THE GATE EXITS 1 ON THIS TREE.** Measured by running the CI command itself — `cargo llvm-cov --workspace --locked --fail-under-lines 100 --fail-under-regions 100 --summary-only`, cargo-llvm-cov 0.8.4, 2026-08-07: **exit 1**, TOTAL **97.41% regions** (672 of 25,907 missed), **96.93% lines** (478 of 15,557), 94.72% functions (80 of 1,515). Six files are short, and the table below names every one | ✗ |
 | X-06b | ~~Branch coverage is 100% on every crate~~ | **NOT MEASURED.** `llvm-cov` instruments zero branches on the pinned stable toolchain and `--branch` cannot run there at all. Narrowed by D-0030; recorded in `docs/06-limits.md` §7. | — |
 | X-07 | No mutant survives on a touched module | `cargo-mutants`, run per change. `crates/pull`, D-0036: **263 mutants, 227 caught, 36 unviable, 0 survivors** | ◐ |
 | X-08 | No tracked file contains a **slash-joined** credential path whose environment segment is a well-known one | CI gate 1c | ✓ |
 | X-08b | No literal under `crates/pull` that could be a path segment is undeclared | CI gate 1d | ✓ |
 | X-09 | `core` declares no dependency at all | CI gate 9 | ✓ |
 | X-10 | Every reachable row in this file names a test that exists | CI gate 10 | ✓ |
-| X-12 | Each vendor writes only under its own path prefix; no vendor can overwrite another | `store::unit::vendor_prefix_isolated` | — |
-| X-13 | A bar-for-bar mismatch between two vendors refuses the window and names the timestamp | `store::unit::vendor_disagreement_refuses` | — |
+| X-12 | Each vendor writes only under its own path prefix; no vendor can overwrite another | `store::unit::vendor_prefix_isolated` — the test **exists and passes**, and this row wore `—` anyway. It proves the claim *lexically*: the first segment is a `Vendor` rather than a string, and no segment can hold a separator. It does not touch a filesystem | ✓ |
+| X-13 | A bar-for-bar mismatch between two vendors refuses the window and names the timestamp | **NOT PROVEN.** `store::unit::vendor_disagreement_refuses` exists in no file. Nothing in this repository compares two vendors' bars against each other; `crates/store` has no bar reader yet (see C-01), so there is nothing to compare | ✗ |
 | X-11 | A price is constructible from a float only through the one checked conversion | `core::price::refuses_an_out_of_range_price_instead_of_saturating` (private field; no other path exists) | ✓ |
+
+### X-06, measured rather than asserted — D-0045
+
+The row above carried a tick. The gate it names exits 1, and had been exiting 1
+for some time. These are the six files short of 100%, from the run described in
+the row:
+
+| File | Regions | Missed | | Lines | Missed | |
+|---|---|---|---|---|---|---|
+| `pull/src/vendor.rs` | 445 | 445 | **0.00%** | 366 | 366 | **0.00%** |
+| `pull/src/archive.rs` | 142 | 50 | 64.79% | 93 | 34 | 63.44% |
+| `pull/src/fetch.rs` | 210 | 60 | 71.43% | 148 | 47 | 68.24% |
+| `pull/src/csv.rs` | 373 | 99 | 73.46% | 160 | 30 | 81.25% |
+| `store/src/file.rs` | 813 | 17 | 97.91% | 510 | 0 | 100.00% |
+| `api/src/ingest.rs` | 730 | 1 | 99.86% | 546 | 1 | 99.82% |
+
+`pull/src/vendor.rs` is two thirds of the whole workspace shortfall by itself:
+445 regions, 69 functions and 366 lines, **every one of them uncovered**, in a
+tracked file that contains no `#[test]` at all. `archive.rs`, `fetch.rs` and
+`csv.rs` carry none either. That is a module committed ahead of its tests, and
+it is the same shape as the defect D-0029 recorded for `core/src/universe.rs`:
+CI gate 10 walks rows→tests and never tests→rows, so nothing here noticed.
+
+**This figure is a snapshot and will move.** It is recorded as a number and a
+date rather than a tick precisely so the next reader re-runs the command instead
+of believing this table. An earlier audit of the same gate measured 95.31%
+lines / 95.91% regions; the gate has been red across both.
+
+### The nine rows that name a tool this repository does not have — D-0045
+
+`loom` and `proptest` appear in **no `Cargo.toml` in this workspace**. Verified
+by `grep -rn 'loom\|proptest' --include=Cargo.toml .`, which returns nothing.
+Nine rows name a module of one of those two names:
+
+| Row | Named | What is true |
+|---|---|---|
+| S-02 | `store::proptest::roundtrip` | ✗ no such function |
+| S-03 | `store::loom::commit_counter_publishes_last` | ✓ **exists** as `store::fault::…`, a plain `#[test]` — path corrected above |
+| S-08 | `store::proptest::oi_sentinel_distinct` | ✓ **exists** as `store::unit::…`, a plain `#[test]` — path corrected above |
+| V-03 | `indicators::proptest::suffix_independence` | `—` `crates/indicators` does not exist |
+| V-05 | `indicators::proptest::differential_vs_naive` | `—` `crates/indicators` does not exist |
+| E-01 | `engine::proptest::antimonotone` | `—` `crates/engine` does not exist |
+| E-02 | `engine::proptest::apriori_equals_bruteforce` | `—` `crates/engine` does not exist |
+| P-01 | `pull::loom::governor_ceiling` | ✗ no such function, `crates/pull` is tracked |
+| X-01 | `core::proptest::identity_sensitivity` | ✗ no such function, `crates/core` is tracked |
+
+The four `—` rows are legitimately unreachable: their crates do not exist, which
+is what `—` means. But **the module name is a promise about a dependency**, and
+adding either tool is a workspace-manifest change nobody has made or decided on.
+Those four rows are naming an implementation that would have to be chosen first.
+No row here now claims a property-based or a concurrency proof that has ever run.
+
+### Why gate 10 could not see any of this — D-0045
+
+Gate 10's own comment says it: *"The module segment. `store::unit::x` and
+`store::fault::x` are the same question to this gate."* It matches on
+`(crate, fn)`. So S-03 and S-08 passed it for their whole lives while pointing
+at modules that do not exist, and the ten genuinely-absent tests were caught
+only when the gate stopped honouring the `—` glyph as a skip. A row can still
+name the wrong module and stay green. That gap is now recorded rather than
+rediscovered.
 
 ---
 
@@ -409,17 +488,18 @@ time. Every row is proven by a test that runs today.
 
 ### Complexity rows for the same crate
 
-These belong with C-01 through C-13 above and are recorded here for the same
-concurrency reason. They are enforced by gate 8, which runs
-`crates/costs/benches/ratio.rs`, and they are held to the same **3.0× shared-CI
-ceiling**.
+These were appended as **C-14 through C-17** and those four ids were already
+taken, by the `crates/api` rendering rows above. **Renumbered to `C-K-01`
+through `C-K-04` by D-0045** — the ids `crates/costs/benches/ratio.rs` has been
+printing all along. Enforced by gate 8, which runs that bench, and held to the
+same **3.0× shared-CI ceiling**.
 
 | # | Must hold | Proven by | |
 |---|---|---|---|
-| C-14 | A regime lookup costs the same whichever row it selects — the anchor row and the last row of the same table | `costs::bench::the_selected_row_does_not_change_the_cost` | ✓ |
-| C-15 | A regime lookup costs the same on a two-row table as on a three-row one, so the trip count is not being paid for at runtime | `costs::bench::the_row_count_does_not_change_the_cost` | ✓ |
-| C-16 | Refusing costs what pricing costs — a refusal is not a slow path callers learn to avoid asking for | `costs::bench::a_refusal_costs_what_a_rate_costs` | ✓ |
-| C-17 | The pre-boundary window is **refused**, not merely refused quickly — speed is half the claim and a lookup that got fast by returning the current rate would pass every ratio above | `costs::bench::the_pre_boundary_window_still_refuses` | ✓ |
+| C-K-01 | A regime lookup costs the same whichever row it selects — the anchor row and the last row of the same table | `costs::bench::the_selected_row_does_not_change_the_cost` | ✓ |
+| C-K-02 | A regime lookup costs the same on a two-row table as on a three-row one, so the trip count is not being paid for at runtime | `costs::bench::the_row_count_does_not_change_the_cost` | ✓ |
+| C-K-03 | Refusing costs what pricing costs — a refusal is not a slow path callers learn to avoid asking for | `costs::bench::a_refusal_costs_what_a_rate_costs` | ✓ |
+| C-K-04 | The pre-boundary window is **refused**, not merely refused quickly — speed is half the claim and a lookup that got fast by returning the current rate would pass every ratio above | `costs::bench::the_pre_boundary_window_still_refuses` | ✓ |
 
 Measured on the operator's machine, 2026-08-07, over **three** runs: 1.7–4.3 ns
 per lookup, worst ratio **1.552×** — and that worst figure came from the run
@@ -461,15 +541,16 @@ that runs today.
 ### Complexity rows for the option arithmetic
 
 Enforced by gate 8, `crates/costs/benches/ratio.rs`, against the same **3.0×
-shared-CI ceiling**.
+shared-CI ceiling**. Renumbered from **C-18 … C-22** by D-0045, onto the ids the
+bench prints.
 
 | # | Must hold | Proven by | |
 |---|---|---|---|
-| C-18 | The at-the-money rung costs the same wherever the spot is — a 50-rupee spot and a spot near `i64::MAX` | `costs::bench::the_spot_magnitude_does_not_change_the_rung_cost` | ✓ |
-| C-19 | The resolved strike costs the same however deep the moneyness — `ATM`, the chain edge, and a million steps out — and reading a moneyness off a far strike costs what reading it off a near one does | `costs::bench::the_moneyness_depth_does_not_change_the_strike_cost` | ✓ |
-| C-20 | The quantity costs the same for one lot and for a million, so the multiplication has not become an accumulation | `costs::bench::the_lot_count_does_not_change_the_quantity_cost` | ✓ |
-| C-21 | The expiry costs the same wherever in the calendar it is asked: the in-month arm against the rollover arm, January against a December that rolls the year, and zero days ahead against six | `costs::bench::the_calendar_position_does_not_change_the_expiry_cost` | ✓ |
-| C-22 | The stage-2 pre-history windows are **refused**, not merely refused quickly — a lot-size lookup that got fast by handing back the first recorded lot for a 2019 trade would pass every ratio above | `costs::bench::the_stage_two_pre_history_windows_still_refuse` | ✓ |
+| C-K-05 | The at-the-money rung costs the same wherever the spot is — a 50-rupee spot and a spot near `i64::MAX` | `costs::bench::the_spot_magnitude_does_not_change_the_rung_cost` | ✓ |
+| C-K-06 | The resolved strike costs the same however deep the moneyness — `ATM`, the chain edge, and a million steps out — and reading a moneyness off a far strike costs what reading it off a near one does | `costs::bench::the_moneyness_depth_does_not_change_the_strike_cost` | ✓ |
+| C-K-07 | The quantity costs the same for one lot and for a million, so the multiplication has not become an accumulation | `costs::bench::the_lot_count_does_not_change_the_quantity_cost` | ✓ |
+| C-K-08 | The expiry costs the same wherever in the calendar it is asked: the in-month arm against the rollover arm, January against a December that rolls the year, and zero days ahead against six | `costs::bench::the_calendar_position_does_not_change_the_expiry_cost` | ✓ |
+| C-K-09 | The stage-2 pre-history windows are **refused**, not merely refused quickly — a lot-size lookup that got fast by handing back the first recorded lot for a 2019 trade would pass every ratio above | `costs::bench::the_stage_two_pre_history_windows_still_refuse` | ✓ |
 
 Measured on the operator's machine, 2026-08-07, over four runs. Per-call cost
 0.62–15.7 ns. Every ratio held under 3.0×; the largest was **2.300×**, the
@@ -510,11 +591,13 @@ and `docs/06-limits.md` §27.
 Enforced by gate 8, `crates/costs/benches/ratio.rs`, against the same **3.0×
 shared-CI ceiling**.
 
+Renumbered from **C-23 … C-25** by D-0045, onto the ids the bench prints.
+
 | # | Must hold | Proven by | |
 |---|---|---|---|
-| C-23 | The charge stack costs the same however big the trade is: one lot against a million, a five-paisa premium against a lakh-rupee one, and a winning trip against a losing one | `costs::bench::the_trade_size_does_not_change_the_charge_stack_cost` | ✓ |
-| C-24 | The whole entry point costs the same whatever it is asked: the trade's size, its date and its underlying do not move it, and a signal-only trip never costs **more** than a cost-bearing one | `costs::bench::the_entry_point_costs_the_same_whatever_it_is_asked` | ✓ |
-| C-25 | The unverified window **refuses the whole round trip** — not merely refuses it quickly — while the day after prices and a signal-only trip in the same window prices at zero | `costs::bench::the_stage_three_refusals_are_still_refusals` | ✓ |
+| C-K-10 | The charge stack costs the same however big the trade is: one lot against a million, a five-paisa premium against a lakh-rupee one, and a winning trip against a losing one | `costs::bench::the_trade_size_does_not_change_the_charge_stack_cost` | ✓ |
+| C-K-11 | The whole entry point costs the same whatever it is asked: the trade's size, its date and its underlying do not move it, and a signal-only trip never costs **more** than a cost-bearing one | `costs::bench::the_entry_point_costs_the_same_whatever_it_is_asked` | ✓ |
+| C-K-12 | The unverified window **refuses the whole round trip** — not merely refuses it quickly — while the day after prices and a signal-only trip in the same window prices at zero | `costs::bench::the_stage_three_refusals_are_still_refusals` | ✓ |
 
 Measured on the operator's machine, 2026-08-07, over four runs. Per-call cost
 32.9–37.6 ns for `charge_stack` and 37.3–41.2 ns for `price`. Every ratio held:
