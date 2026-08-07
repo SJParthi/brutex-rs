@@ -6041,3 +6041,61 @@ fn a_second_census_install_is_refused_while_the_first_holds_the_lock() {
 
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// **A census must be readable, not only probeable.**
+///
+/// `Manifest::entry` answers *is this key held*, which only helps a caller that
+/// already knows which key to ask about. `crates/api`'s coverage grid did not:
+/// it built keys out of the instrument master and probed those, every probe
+/// missed, and the page reported `0 of 200 held` beside `62,978 rows`. See
+/// D-0048. `held_keys` is how a caller asks *what is here* instead.
+///
+/// The order is a `HashMap`'s and is deliberately not asserted — it is not
+/// stable between runs, and `api::census::held_series` sorts for exactly that
+/// reason. What is asserted is the set.
+#[test]
+fn a_manifest_reports_every_key_it_holds_and_not_one_it_does_not() {
+    let mut manifest = Manifest::open(Vendor::Dhan, &[], &[]).expect("a genesis manifest");
+    assert_eq!(
+        manifest.held_keys().count(),
+        0,
+        "an empty census holds nothing, and says so rather than being unaskable"
+    );
+
+    let one = entry("NIFTY", 2026, 7, 8_250, 1, 2);
+    let two = entry("BANKNIFTY", 2026, 7, 7_100, 1, 2);
+    let three = entry("NIFTY", 2026, 8, 6_000, 1, 2);
+    for e in [one, two, three] {
+        manifest.record(e).expect("records");
+    }
+
+    let held: std::collections::HashSet<EntryKey> = manifest.held_keys().copied().collect();
+    assert_eq!(held.len(), 3, "three distinct keys: {held:?}");
+    for e in [one, two, three] {
+        assert!(
+            held.contains(&e.key),
+            "{:?} was recorded and is not reported",
+            e.key
+        );
+    }
+    // A month that was never recorded is absent from the report, exactly as it
+    // is absent from a probe.
+    let absent = entry("NIFTY", 2026, 6, 1, 1, 2).key;
+    assert!(!held.contains(&absent));
+    assert_eq!(manifest.entry(&absent), None, "and the probe agrees");
+
+    // RE-RECORDING A KEY DOES NOT DUPLICATE IT. The entry region is an
+    // append-only log and the index keeps the newest per key, so a second
+    // month-two write is one key with a new row count, not two keys.
+    manifest
+        .record(entry("NIFTY", 2026, 7, 9_000, 1, 3))
+        .expect("records the update");
+    assert_eq!(
+        manifest.held_keys().count(),
+        3,
+        "an update is a new entry and the same key"
+    );
+    assert_eq!(manifest.entry(&one.key).expect("held").rows, 9_000);
+    assert_eq!(manifest.entries(), 4, "four entries in the log");
+    assert_eq!(manifest.keys(), 3, "three keys in the index");
+}

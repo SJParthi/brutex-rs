@@ -2167,3 +2167,66 @@ operator's disk today the sort is immeasurable; at the ~248,000 entries
 `docs/07-o1-architecture.md` uses as its scale figure it would be a startup cost
 of the same order as the manifest load itself, which is already accepted there.
 **That has not been measured**, and this file does not claim it has.
+
+## 33. What mutation testing left behind on these four fixes, and what it removed instead
+
+`cargo mutants` over the touched modules, run and re-run rather than assumed.
+
+**Final: 56/56 caught in `crates/api/src/calendar.rs`, 212/212 in
+`crates/pull/src/{http,manifest}.rs`, and none surviving in
+`crates/api/src/census.rs`.** The first run was not that, and what it took to
+get there is the part worth recording.
+
+### Two boundaries were deleted rather than tested
+
+`month_length` counted down with `while probe > 28`, and `>=` there is
+**indistinguishable**: the loop's last iteration asks `Day::new(year, month, 28)`,
+true for every month, so both spellings return 28. `first_year` clamped with
+`if offered < MIN_YEAR`, and `<=` returns the same 1970 at the boundary.
+
+Both are mutants no test could kill, which by `CLAUDE.md` §4 is a test that
+asserts nothing dressed as a passing gate. So the boundaries are gone: the first
+is four questions in descending order, the second is
+`MIN_YEAR + offered.saturating_sub(MIN_YEAR)`, which is a clamp with no branch
+and whose every operator a test can falsify. Same move `crates/greeks`'
+`normal.rs` made for its two, recorded in §29.
+
+### A `contains` cannot falsify a range
+
+Every boundary in `dynamic_css` survived the first run — `length < 31` as `<=`,
+`length + 1` as `length - 1`, `n > 0` as `n >= 0`, `cap.day() + 1` as
+`cap.day() - 1`. All of them produce CSS that is a **superset** of the correct
+text, so `assert!(css.contains(".c29"))` passes against a rule that greys
+27 through 31 as readily as against one that greys 29 through 31.
+
+The tests now assert whole rules, built in the test from what the rule must mean,
+plus three shapes that must never appear at all: a selector list starting with a
+comma (`:checked) ,`), a rule with an empty selector list (`:checked) {`), and a
+trailing comma (`,{`). The last two need a **December** cap and a **31st** cap in
+the fixture — for any earlier month `month < 12` and `month <= 12` are both true,
+and the mutant is invisible.
+
+### A bound nobody can allocate is a bound nobody tested
+
+`text.len() > MAX_RESPONSE_BYTES` was a comparison whose `>=` and `==` mutants
+could only be killed by a test that allocates 64 MiB. It is now `too_large(len)`,
+a `const fn`, and the boundary is three assertions and no allocation.
+`MAX_RESPONSE_BYTES` itself had no test at all — `64 * 1024 * 1024` mutated to
+`64 + 1024 + 1024` is a 2,112-byte ceiling that would refuse every real answer,
+and nothing looked at the value.
+
+### What is still not covered, and why
+
+`crates/pull/src/http.rs` sits at **96.6% line, 95.5% region**, not 100. The
+uncovered arms are three, all needing fault injection this build has no seam for:
+
+1. `HttpSource::new` failing because the TLS backend is unavailable — a
+   deployment fault, not reachable from a test.
+2. `answer.text()` failing **mid-read**, after headers arrived and before the
+   body finished.
+3. The 64 MiB size refusal firing over a real body. The *decision* is now tested
+   at its boundary through `too_large`; the branch that formats the refusal is
+   not.
+
+`crates/api/src/census.rs` sits at 99.59%. These are stated rather than rounded
+up to a claim of 100%.

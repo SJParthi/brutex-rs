@@ -200,14 +200,23 @@ pub const fn first_column(year: u16, month: u8) -> u32 {
 /// Derived by asking [`Day`] rather than by carrying a table: the 29th of
 /// February exists exactly when `Day::new` says it does, so there is one
 /// definition of a leap year in this workspace and it is not here.
+/// Written as four questions rather than a countdown loop, and that is a
+/// mutation-testing result rather than a style preference. `while probe > 28`
+/// carries a boundary, and `>=` there is **indistinguishable**: the loop's last
+/// iteration asks `Day::new(year, month, 28)`, which is true for every month, so
+/// both spellings return 28. A surviving mutant on an unreachable boundary is a
+/// test that cannot be written, so the boundary is gone instead — the same move
+/// `crates/greeks`' `normal.rs` made for its two.
 #[must_use]
 pub const fn month_length(year: u16, month: u8) -> u8 {
-    let mut probe = 31;
-    while probe > 28 {
-        if Day::new(year, month, probe).is_ok() {
-            return probe;
-        }
-        probe -= 1;
+    if Day::new(year, month, 31).is_ok() {
+        return 31;
+    }
+    if Day::new(year, month, 30).is_ok() {
+        return 30;
+    }
+    if Day::new(year, month, 29).is_ok() {
+        return 29;
     }
     28
 }
@@ -219,14 +228,18 @@ pub const fn month_length(year: u16, month: u8) -> u8 {
 /// which no [`Day`] can hold, so picking one produced a date `Day::new` refuses.
 /// Unreachable from this page, whose ceilings are today and yesterday, and wrong
 /// anyway: the floor belongs to `Day` and is imported rather than restated.
+/// The floor is arithmetic, not a comparison, for the reason [`month_length`]
+/// gives: `offered < MIN_YEAR` and `offered <= MIN_YEAR` both answer 1970 at the
+/// boundary, so any comparison written here is a mutant no test could kill.
+///
+/// `MIN_YEAR + offered.saturating_sub(MIN_YEAR)` is `max(offered, MIN_YEAR)`
+/// with no branch: at or above the floor the subtraction and the addition
+/// cancel, and below it the subtraction saturates to zero and the floor is what
+/// is left. Every operator in it is one a test can falsify.
 #[must_use]
 pub const fn first_year(max: Day) -> u16 {
     let offered = max.year().saturating_sub(YEARS_OFFERED - 1);
-    if offered < MIN_YEAR_U16 {
-        MIN_YEAR_U16
-    } else {
-        offered
-    }
+    MIN_YEAR_U16 + offered.saturating_sub(MIN_YEAR_U16)
 }
 
 /// The one control that closes whichever picker is open, for one form.
@@ -904,24 +917,195 @@ mod tests {
         let css = dynamic_css(&[day(2026, 8, 7)]);
         // 2026-08-01 is a Saturday: column 6, Monday first.
         assert!(css.contains(".pick:has(.y2026:checked):has(.m8:checked) .pad{--s:6}"));
-        // February 2026 has 28 days, so the 29th, 30th and 31st are struck out.
+
+        // ── EVERY RULE BELOW IS ASSERTED WHOLE, AND THAT IS THE POINT ───────
+        //
+        // These were `contains(".c29")` and friends, which pass whether the
+        // rule greys 29..31, 27..31, or 29 alone. **Every boundary in
+        // `dynamic_css` survived mutation testing** against that: `length < 31`
+        // as `<=`, `length + 1` as `length - 1`, `n > 0` as `n >= 0`. A
+        // substring cannot falsify a range. The expected text is built here
+        // from what the rule must MEAN, so it does not move when the emitter
+        // does.
+        let struck = "{opacity:.16;pointer-events:none;text-decoration:line-through}";
+        let month_rule = |year: u16, month: u8, days: std::ops::RangeInclusive<u8>| {
+            days.map(|d| format!(".pick:has(.y{year}:checked):has(.m{month}:checked) .c{d}"))
+                .collect::<Vec<_>>()
+                .join(",")
+                + struck
+        };
+        // February 2026 has 28 days: exactly 29, 30 and 31 are struck out.
+        assert!(css.contains(&month_rule(2026, 2, 29..=31)), "Feb: {css}");
+        // April has 30: exactly the 31st.
+        assert!(css.contains(&month_rule(2026, 4, 31..=31)), "Apr: {css}");
+        // A 31-DAY MONTH GETS NO RULE AT ALL. Without this, `length < 31` as
+        // `<=` emits January a rule whose selector list is empty.
         assert!(
-            css.contains(".c29"),
-            "the 29th of a 28-day February is greyed"
+            !css.contains(".pick:has(.y2026:checked):has(.m1:checked) .c"),
+            "January has 31 days and nothing to grey: {css}"
         );
+
         // THE CEILING ON MONTHS — the half that did not exist before. All twelve
         // months are always emitted, so in the cap's own year the ones after it
         // were clickable and led to a grid whose every day the server refused.
+        // Exactly September through December, and August itself untouched.
+        let months = (9u8..=12)
+            .map(|m| format!(".pick.cap20260807:has(.y2026:checked) .k{m}"))
+            .collect::<Vec<_>>()
+            .join(",")
+            + struck;
         assert!(
-            css.contains(".pick.cap20260807:has(.y2026:checked) .k9"),
-            "September 2026 is past a cap of 2026-08-07 and must grey: {css}"
+            css.contains(&months),
+            "exactly Sep..Dec are past the cap: {css}"
         );
         assert!(
-            !css.contains(".pick.cap20260807:has(.y2026:checked) .k8,"),
-            "August itself is reachable — it is the cap's own month"
+            !css.contains(".pick.cap20260807:has(.y2026:checked) .k8"),
+            "August is the cap's own month and stays reachable: {css}"
         );
-        // And the ceiling within that month.
+
+        // THE CEILING WITHIN THAT MONTH — exactly the 8th through the 31st, so
+        // the 7th itself stays reachable.
+        let days = (8u8..=31)
+            .map(|d| format!(".pick.cap20260807:has(.y2026:checked):has(.m8:checked) .c{d}"))
+            .collect::<Vec<_>>()
+            .join(",")
+            + "{opacity:.16;pointer-events:none}";
+        assert!(css.contains(&days), "exactly 8..31 are past the cap: {css}");
+    }
+
+    /// **Every rule this emits is well-formed, and the cap's own day survives.**
+    ///
+    /// Three mutation-testing results in one test, all of the same kind: an
+    /// off-by-one in `dynamic_css` produces CSS that is still a *superset* of
+    /// the correct text, so no `contains` of the right rule can falsify it. What
+    /// falsifies it is asserting the shapes that must never appear.
+    ///
+    /// * `n > 0` as `n >= 0` writes the joining comma before the **first**
+    ///   selector too, giving `…:checked) ,…`. A selector list may not start
+    ///   with a comma, and nothing correct emits one.
+    /// * `length < 31` as `<=`, and `month < 12` as `<=`, emit a rule whose
+    ///   selector list is **empty** — `…:checked) {opacity…` — for a month with
+    ///   nothing to grey. Every real rule has a class between the `)` and the
+    ///   `{`.
+    /// * `cap.day() + 1` as `- 1` or `* 1` starts the greyed range **at or
+    ///   below the ceiling itself**, so the last day an operator is allowed to
+    ///   ask for stops being clickable.
+    #[test]
+    fn no_generated_rule_is_malformed_and_the_ceiling_day_stays_clickable() {
+        // Several caps and a leap year, so every branch of the emitter runs —
+        // including a **December** cap and a **31st** cap, which are the two
+        // that skip a rule entirely and so are the two that can emit an empty
+        // one. Without them `month < 12` as `<=` is a mutant nothing here sees:
+        // for any earlier month both spellings are true.
+        let css = dynamic_css(&[
+            day(2026, 8, 7),
+            day(2026, 8, 6),
+            day(2024, 2, 29),
+            day(2026, 12, 31),
+            day(2025, 12, 1),
+        ]);
+
+        assert!(
+            !css.contains(":checked) ,"),
+            "a selector list starts with a comma — the join wrote one before \
+             the first selector: {css}"
+        );
+        assert!(
+            !css.contains(":checked) {"),
+            "a rule has an empty selector list — a month with nothing to grey \
+             still emitted one: {css}"
+        );
+        assert!(
+            !css.contains(",{"),
+            "a selector list ends with a trailing comma: {css}"
+        );
+
+        // THE CEILING'S OWN DAY IS REACHABLE. It is the latest date the field
+        // exists to let an operator pick.
+        assert!(
+            !css.contains(".pick.cap20260807:has(.y2026:checked):has(.m8:checked) .c7"),
+            "the 7th IS the cap of 2026-08-07 and must stay clickable: {css}"
+        );
+        assert!(
+            !css.contains(".pick.cap20260806:has(.y2026:checked):has(.m8:checked) .c6"),
+            "and the 6th is the cap of 2026-08-06: {css}"
+        );
+        // The day after each cap is greyed, so the boundary is tight on both
+        // sides rather than merely absent.
         assert!(css.contains(".pick.cap20260807:has(.y2026:checked):has(.m8:checked) .c8"));
+        assert!(css.contains(".pick.cap20260806:has(.y2026:checked):has(.m8:checked) .c7"));
+
+        // And the cap's own MONTH is reachable while the next one is not.
+        assert!(!css.contains(".pick.cap20240229:has(.y2024:checked) .k2"));
+        assert!(css.contains(".pick.cap20240229:has(.y2024:checked) .k3"));
+    }
+
+    /// A leap February greys 30 and 31 and leaves the 29th alone.
+    ///
+    /// The only case where the impossible-day rule depends on the *year*, so
+    /// it is the one that proves the rule is computed per (year, month) rather
+    /// than per month.
+    #[test]
+    fn a_leap_february_keeps_its_twenty_ninth() {
+        let css = dynamic_css(&[day(2024, 8, 7)]);
+        assert!(
+            css.contains(
+                ".pick:has(.y2024:checked):has(.m2:checked) .c30,\
+                 .pick:has(.y2024:checked):has(.m2:checked) .c31\
+                 {opacity:.16;pointer-events:none;text-decoration:line-through}"
+            ),
+            "2024 is a leap year: only 30 and 31 are impossible: {css}"
+        );
+        assert!(
+            !css.contains(".pick:has(.y2024:checked):has(.m2:checked) .c29"),
+            "the 29th of February 2024 exists and must stay clickable: {css}"
+        );
+        // And the neighbouring non-leap year in the same stylesheet does strike it.
+        assert!(css.contains(".pick:has(.y2023:checked):has(.m2:checked) .c29"));
+    }
+
+    /// The month radios carry 1 through 12, and the day radios 1 through 31.
+    ///
+    /// `index as u8 + 1` reads as obviously right, and `index as u8 * 1`
+    /// compiles to a picker whose months are 0 through 11 — every count in the
+    /// other tests stays identical, and the form posts a month `Day::new`
+    /// refuses. It survived mutation testing until this was written.
+    #[test]
+    fn the_month_and_day_radios_carry_the_values_a_date_is_built_from() {
+        let html = built();
+        for month in 1u8..=12 {
+            assert!(
+                html.contains(&format!(
+                    "name=\"from_m\" id=\"sfromm{month}\" value=\"{month}\""
+                )),
+                "month {month} is missing or misnumbered"
+            );
+        }
+        assert!(
+            !html.contains("name=\"from_m\" id=\"sfromm0\" value=\"0\""),
+            "there is no month zero; m0 is the empty-valued back-step"
+        );
+        // Scoped to the month group: `value="13"` on its own is day 13.
+        assert!(
+            !html.contains("name=\"from_m\" id=\"sfromm13\""),
+            "and no thirteenth month"
+        );
+        for d in 1u8..=31 {
+            assert!(
+                html.contains(&format!("name=\"from_d\" id=\"sfromd{d}\" value=\"{d}\"")),
+                "day {d} is missing or misnumbered"
+            );
+        }
+        for year in 2015u16..=2026 {
+            assert!(
+                html.contains(&format!(
+                    "name=\"from_y\" id=\"sfromy{year}\" value=\"{year}\""
+                )),
+                "year {year} is missing or misnumbered"
+            );
+        }
+        assert!(!html.contains("value=\"2027\""), "nothing past the ceiling");
+        assert!(!html.contains("value=\"2014\""), "nothing before the span");
     }
 
     /// Both branches the ceiling can skip: a December cap has no later month,

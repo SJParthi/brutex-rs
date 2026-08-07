@@ -420,6 +420,18 @@ fn container<'a>(
     })
 }
 
+/// Whether an answer of this many bytes is more than this build will hold.
+///
+/// **A function rather than an inline comparison, so the boundary is testable.**
+/// Written in place, `text.len() > MAX_RESPONSE_BYTES` is a comparison whose
+/// `>=` and `==` mutants can only be killed by a test that allocates 64 MiB —
+/// which is a test nobody should write and which therefore never got written.
+/// Split out, the same boundary is three assertions and no allocation at all.
+#[must_use]
+const fn too_large(len: usize) -> bool {
+    len > MAX_RESPONSE_BYTES
+}
+
 /// As much of a vendor's refusal as belongs in an error.
 ///
 /// A refusal body is unbounded input from outside, and an error string is a
@@ -557,7 +569,7 @@ impl HttpSource {
             .map_err(|why| FetchError::TransportFailed {
                 detail: format!("the answer could not be read: {why}"),
             })?;
-        if text.len() > MAX_RESPONSE_BYTES {
+        if too_large(text.len()) {
             return Err(FetchError::TransportFailed {
                 detail: format!(
                     "the vendor answered with {} bytes; this build accepts at \
@@ -1166,6 +1178,17 @@ mod tests {
         assert_eq!(status, 307);
         assert!(detail.contains("no Location header"), "{detail}");
         assert!(detail.contains("does not follow redirects"), "{detail}");
+        // AN EMPTY BODY ADDS NOTHING. Without the `body.is_empty()` guard the
+        // refusal ends `— and it said: ` with nothing after it, which reads as
+        // a vendor message that was lost rather than one that never existed.
+        assert!(
+            !detail.contains("and it said"),
+            "a 307 with no body must not claim the vendor said something: {detail}"
+        );
+        assert!(
+            detail.ends_with("no Location header"),
+            "the refusal ends where the facts do: {detail}"
+        );
 
         // And one that redirects AND explains itself.
         let chatty = "moved, ask elsewhere";
@@ -1286,6 +1309,32 @@ mod tests {
             HttpSource::wire_end(last, RangeEnd::Inclusive, DateFormat::DashedYmd)
                 .expect("unchanged"),
             "9999-12-31"
+        );
+    }
+
+    /// The two bounds this module states as numbers, asserted as numbers.
+    ///
+    /// `64 * 1024 * 1024` is a product, and `64 + 1024 + 1024` is 2,112 — a
+    /// bound that would refuse every real answer while still reading like a
+    /// generous one. Nothing else in the suite looks at the value.
+    #[test]
+    fn the_stated_bounds_are_the_numbers_they_are_written_as() {
+        assert_eq!(MAX_RESPONSE_BYTES, 67_108_864, "64 MiB, not 64+1024+1024");
+        assert_eq!(REQUEST_TIMEOUT_SECS, 30);
+
+        // And the size bound is tight: the last acceptable answer is exactly
+        // MAX_RESPONSE_BYTES, and one byte more is refused. Asserted here
+        // rather than over a real body, because a test that allocates 64 MiB to
+        // check a `>` is a test nobody runs.
+        assert!(!too_large(0), "an empty answer is not too large");
+        assert!(!too_large(MAX_RESPONSE_BYTES - 1));
+        assert!(
+            !too_large(MAX_RESPONSE_BYTES),
+            "the bound is inclusive: exactly the maximum is accepted"
+        );
+        assert!(
+            too_large(MAX_RESPONSE_BYTES + 1),
+            "and one byte past it is refused"
         );
     }
 
