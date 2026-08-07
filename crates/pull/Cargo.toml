@@ -46,6 +46,24 @@ reqwest = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 
+# THE CREDENTIAL READ, IN RUST AND NOTHING ELSE.
+#
+# `aws-sdk-ssm` was tried first and refused, on measurement rather than taste.
+# It reaches rustls through `aws-smithy-http-client`, which hard-enables the
+# `aws-lc-rs` backend, which vendors `aws-lc-sys` — a C library. Cargo features
+# are additive, so no `default-features = false` downstream can switch it off.
+# The tree went **145 crates to 232**, and `aws-lc-sys` appeared in the lock:
+# 87 extra crates AND the exact shape `CLAUDE.md` §2 bans, which CI gate 13
+# walks `Cargo.lock` to catch.
+#
+# The AWS *API* needs none of it. `GetParameter` is one HTTPS POST carrying a
+# SigV4 signature, and SigV4 is HMAC-SHA256 over a canonical string. `reqwest`
+# is already here for the broker; these two are pure-Rust RustCrypto crates
+# with no `asm` feature. Two crates instead of eighty-seven, and not one line
+# of C. See `src/ssm.rs` and D-0051.
+hmac = { workspace = true }
+sha2 = { workspace = true }
+
 [lints]
 workspace = true
 
