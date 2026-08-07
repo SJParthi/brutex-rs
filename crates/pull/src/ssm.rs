@@ -202,6 +202,128 @@ impl AwsIdentity {
             session_token: std::env::var("AWS_SESSION_TOKEN").ok(),
         })
     }
+
+    /// The identity, from wherever AWS keeps it on this machine.
+    ///
+    /// # Why a file, when the environment was the obvious answer
+    ///
+    /// [`Self::from_env`] was written first and would have failed on the very
+    /// machine this is for: `AWS_ACCESS_KEY_ID` is unset there, and the key
+    /// pair lives in `~/.aws/credentials` — which is where the AWS CLI, the
+    /// SDKs and every other AWS tool put it. An identity reader that only knows
+    /// about environment variables works on a CI runner and nowhere else.
+    ///
+    /// Order matters and follows AWS's own: the environment wins when it is
+    /// set, because that is how an operator overrides a file for one command.
+    ///
+    /// # What this does NOT read
+    ///
+    /// The broker token. `CLAUDE.md` §8 is not walked back by this — the broker
+    /// credential is read from Parameter Store and nowhere else, and this file
+    /// holds the *AWS* identity that proves you may read it. Two secrets, two
+    /// owners, two locations.
+    ///
+    /// # Errors
+    ///
+    /// [`SsmError`] naming every place that was looked at, so "no credentials"
+    /// is never the whole message.
+    pub fn discover() -> Result<Self, SsmError> {
+        if let Ok(from_env) = Self::from_env() {
+            return Ok(from_env);
+        }
+        Self::from_shared_file("default")
+    }
+
+    /// One profile out of `~/.aws/credentials`.
+    ///
+    /// A deliberately small INI reader: sections in `[brackets]`, `key = value`
+    /// lines, `#` and `;` comments. The real format has more in it — process
+    /// credentials, SSO sessions, role chaining — and none of that is
+    /// implemented, because a half-implemented credential resolver that
+    /// silently picks the wrong identity is worse than one that refuses. What
+    /// it does not understand, it does not find, and it says which profile it
+    /// was looking in.
+    ///
+    /// # Errors
+    ///
+    /// [`SsmError`] when the file is absent, the profile is not in it, or the
+    /// profile carries no key pair — three different faults, named separately.
+    pub fn from_shared_file(profile: &str) -> Result<Self, SsmError> {
+        let Some(home) = std::env::var_os("HOME") else {
+            return Err(SsmError::unreachable(
+                "HOME is unset, so ~/.aws/credentials cannot be located".to_owned(),
+            ));
+        };
+        Self::from_credentials_file(
+            &std::path::PathBuf::from(home)
+                .join(".aws")
+                .join("credentials"),
+            profile,
+        )
+    }
+
+    /// One profile out of a credentials file **the caller names**.
+    ///
+    /// Split from [`Self::from_shared_file`] for the reason
+    /// `api::server::run_in` gives about its own split: with the path read
+    /// inside, the only way to test this is to mutate `HOME` — and this crate
+    /// carries `#![forbid(unsafe_code)]`, which `std::env::set_var` now needs.
+    /// A function that takes the path is a function whose answer is a property
+    /// of a file a test owns, rather than of the machine it runs on.
+    ///
+    /// # Errors
+    ///
+    /// [`SsmError`] when the file is absent, the profile is not in it, or the
+    /// profile carries no key pair — three different faults, named separately.
+    pub fn from_credentials_file(path: &std::path::Path, profile: &str) -> Result<Self, SsmError> {
+        let text = std::fs::read_to_string(path).map_err(|why| {
+            SsmError::unreachable(format!(
+                "the AWS identity is in neither the environment nor {}: {why}. \
+                 This is the AWS key that proves you may READ the parameter — \
+                 not the broker token, which is what comes back from it.",
+                path.display()
+            ))
+        })?;
+
+        let (mut key_id, mut secret, mut token) = (None, None, None);
+        let mut inside = false;
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+                continue;
+            }
+            if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+                inside = name.trim() == profile;
+                continue;
+            }
+            if !inside {
+                continue;
+            }
+            let Some((name, value)) = line.split_once('=') else {
+                continue;
+            };
+            let value = value.trim().to_owned();
+            match name.trim() {
+                "aws_access_key_id" => key_id = Some(value),
+                "aws_secret_access_key" => secret = Some(value),
+                "aws_session_token" => token = Some(value),
+                _ => {}
+            }
+        }
+
+        match (key_id, secret) {
+            (Some(key_id), Some(secret)) => Ok(Self {
+                key_id,
+                secret,
+                session_token: token,
+            }),
+            _ => Err(SsmError::unreachable(format!(
+                "{} has no complete [{profile}] profile: both \
+                 aws_access_key_id and aws_secret_access_key must be present",
+                path.display()
+            ))),
+        }
+    }
 }
 
 /// Lower-case hex, which is the only encoding `SigV4` accepts.
@@ -618,4 +740,265 @@ mod tests {
         // literal, so an assertion on it here would assert nothing, and a
         // compile-time check fails the BUILD rather than a test.
     }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "a test that cannot panic cannot fail"
+)]
+mod shared_file_tests {
+    use super::*;
+
+    /// Writes a credentials file and hands back its path.
+    ///
+    /// No `HOME` is touched: `from_credentials_file` takes the path, which is
+    /// exactly why it was split out of `from_shared_file` — this crate carries
+    /// `#![forbid(unsafe_code)]` and `std::env::set_var` now needs `unsafe`.
+    fn file_holding(tag: &str, body: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("brutex-ssm-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a scratch dir");
+        let path = dir.join("credentials");
+        std::fs::write(&path, body).expect("a credentials file");
+        path
+    }
+
+    /// **THE SHAPE ON THE MACHINE THIS WAS WRITTEN FOR.**
+    ///
+    /// `AWS_ACCESS_KEY_ID` is unset there and the key pair lives in
+    /// `~/.aws/credentials` — so `from_env` alone would have refused, and
+    /// "going live" would have failed with a message about an environment
+    /// variable the operator was never going to set. That is the failure this
+    /// reader exists to prevent, and this is the fixture that pins it.
+    #[test]
+    fn a_default_profile_is_read_the_way_every_aws_tool_writes_it() {
+        let path = file_holding(
+            "default",
+            "[default]\naws_access_key_id = AKIAEXAMPLE\naws_secret_access_key = shhh\n",
+        );
+        let id = AwsIdentity::from_credentials_file(&path, "default").expect("reads");
+        assert_eq!(id.key_id, "AKIAEXAMPLE");
+        assert_eq!(id.secret, "shhh");
+        assert_eq!(id.session_token, None, "a long-lived key carries none");
+        // And it still redacts.
+        let shown = format!("{id:?}");
+        assert!(!shown.contains("shhh"), "leaked: {shown}");
+    }
+
+    /// Comments, spacing, and a second profile that must not leak into the first.
+    #[test]
+    fn the_reader_ignores_comments_and_never_crosses_a_profile_boundary() {
+        let path = file_holding(
+            "profiles",
+            "# a comment\n; another\n\n[default]\n\
+             aws_access_key_id     =    AKIADEFAULT\n\
+             aws_secret_access_key = default-secret\n\n\
+             [other]\naws_access_key_id = AKIAOTHER\n\
+             aws_secret_access_key = other-secret\n\
+             aws_session_token = other-token\n",
+        );
+
+        let default = AwsIdentity::from_credentials_file(&path, "default").expect("default");
+        assert_eq!(default.key_id, "AKIADEFAULT", "spacing is trimmed");
+        assert_eq!(default.secret, "default-secret");
+        assert_eq!(
+            default.session_token, None,
+            "the other profile's token must not cross the boundary"
+        );
+
+        let other = AwsIdentity::from_credentials_file(&path, "other").expect("other");
+        assert_eq!(other.key_id, "AKIAOTHER");
+        assert_eq!(other.session_token.as_deref(), Some("other-token"));
+
+        let Err(SsmError { detail, .. }) = AwsIdentity::from_credentials_file(&path, "nope") else {
+            panic!("a profile that is not in the file must be refused")
+        };
+        assert!(detail.contains("nope"), "the profile is named: {detail}");
+    }
+
+    /// Half a key pair is refused, not half-built.
+    #[test]
+    fn half_a_profile_is_refused_and_says_which_half_is_missing() {
+        let path = file_holding("half", "[default]\naws_access_key_id = AKIAONLY\n");
+        let Err(SsmError { detail, .. }) = AwsIdentity::from_credentials_file(&path, "default")
+        else {
+            panic!("an id with no secret cannot sign anything")
+        };
+        assert!(detail.contains("aws_secret_access_key"), "{detail}");
+    }
+
+    /// An absent file names the path it looked at, not "no credentials".
+    #[test]
+    fn an_absent_file_names_the_path_and_says_which_secret_this_is() {
+        let missing = std::env::temp_dir().join("brutex-ssm-no-such-file-ever/credentials");
+        let Err(SsmError { detail, .. }) = AwsIdentity::from_credentials_file(&missing, "default")
+        else {
+            panic!("a file that is not there cannot hold an identity")
+        };
+        assert!(detail.contains("brutex-ssm-no-such-file-ever"), "{detail}");
+        assert!(
+            detail.contains("not the broker token"),
+            "the two secrets are told apart in the refusal itself: {detail}"
+        );
+    }
+}
+
+/// One live `GetParameter` call, signed and sent.
+///
+/// # This is the function that makes it real
+///
+/// Everything above is pure: a signature is arithmetic over its inputs, and
+/// `tests` prove it against AWS's own published vectors without a socket. This
+/// is the one place a packet leaves the process, and it is deliberately small —
+/// build the body, sign it, send it, read the value out.
+///
+/// # What travels, and what does not
+///
+/// The AWS **identity's** signature travels, in the `Authorization` header. The
+/// AWS secret never does — that is the whole point of a signature. And the
+/// **broker token** does not travel at all: it is what comes *back*, and from
+/// here it goes to [`crate::http::HttpSource`] and nowhere else. It is never
+/// logged, never formatted into an error, and never written to disk.
+///
+/// # Errors
+///
+/// [`SsmError`] for a socket that did not answer, a status that is not 200, or
+/// a body this build cannot read. AWS's own error code is mapped to the port's
+/// vocabulary — `AccessDeniedException` and `ParameterNotFound` send an operator
+/// to opposite places and must not be flattened into "it failed".
+pub async fn get_parameter(
+    identity: &AwsIdentity,
+    region: &str,
+    name: &str,
+    stamp: &str,
+) -> Result<String, SsmError> {
+    let host = host_for(region);
+    let body = body(name, true);
+    let signable = Signable {
+        host: &host,
+        region,
+        stamp,
+        body: &body,
+        session_token: identity.session_token.as_deref(),
+    };
+    let authorization = signable.authorization(identity)?;
+
+    let client = reqwest::Client::builder()
+        .timeout(core::time::Duration::from_secs(CREDENTIAL_TIMEOUT_SECS))
+        // REDIRECTS ARE NOT FOLLOWED HERE EITHER, for the reason D-0050 gives
+        // about the broker: a signature is scoped to a host, and a client that
+        // chases a `Location` would carry an `Authorization` header to a host
+        // the signature was never computed for.
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|why| {
+            SsmError::unreachable(format!("the HTTPS client could not be built: {why}"))
+        })?;
+
+    let answer = client
+        .post(format!("https://{host}/"))
+        .header("content-type", CONTENT_TYPE)
+        .header("x-amz-target", TARGET)
+        .header("x-amz-date", stamp)
+        .header("authorization", authorization)
+        .body(body)
+        .send()
+        .await
+        .map_err(|why| {
+            // `why` is reqwest's own words and never carries a header this code
+            // set, so neither secret can reach this string.
+            SsmError::unreachable(format!("{host} was not reached: {why}"))
+        })?;
+
+    let status = answer.status();
+    let text = answer
+        .text()
+        .await
+        .map_err(|why| SsmError::unreachable(format!("the answer could not be read: {why}")))?;
+
+    if !status.is_success() {
+        // AWS names its faults in the body; the port's four variants are what
+        // an operator acts on. Mapped rather than flattened.
+        let kind = if text.contains("AccessDenied") || status.as_u16() == 403 {
+            SecretError::AccessDenied
+        } else if text.contains("ParameterNotFound") || status.as_u16() == 404 {
+            SecretError::NotFound
+        } else {
+            SecretError::Unreachable
+        };
+        return Err(SsmError {
+            detail: format!(
+                "Parameter Store refused with {}: {}",
+                status.as_u16(),
+                text.chars().take(300).collect::<String>()
+            ),
+            kind,
+        });
+    }
+
+    let value = value_of(&text)?;
+    if value.is_empty() {
+        return Err(SsmError {
+            detail: "the parameter exists and holds nothing. An empty \
+                     credential is not a credential, and this build will not \
+                     send one to a broker."
+                .to_owned(),
+            kind: SecretError::Empty,
+        });
+    }
+    Ok(value)
+}
+
+/// The current instant, in the basic ISO-8601 form `SigV4` requires.
+///
+/// Taken from the system clock at the one place a request is about to be sent,
+/// rather than threaded down — a signature is only valid for a few minutes, so
+/// there is nothing to gain by stamping it earlier, and a stamp that is an
+/// argument everywhere would be one more thing to pass wrongly.
+///
+/// # Errors
+///
+/// [`SsmError`] before 1970, which a system clock can report and which cannot
+/// produce a valid scope.
+pub fn now_stamp() -> Result<String, SsmError> {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| {
+            SsmError::unreachable(
+                "this machine's clock reads before 1970, which cannot scope a \
+                 signature. AWS will refuse anything signed with it."
+                    .to_owned(),
+            )
+        })?
+        .as_secs();
+    // Civil date from a day count, by the same closed form `costs::day` uses —
+    // no calendar crate, and no float.
+    let days = i64::try_from(secs / 86_400).unwrap_or(0);
+    let rest = secs % 86_400;
+    let (y, m, d) = civil_from_days(days);
+    Ok(format!(
+        "{y:04}{m:02}{d:02}T{:02}{:02}{:02}Z",
+        rest / 3600,
+        (rest % 3600) / 60,
+        rest % 60
+    ))
+}
+
+/// The civil date of a day count, by Howard Hinnant's `civil_from_days`.
+///
+/// The same algorithm `crates/costs/src/day.rs` carries, written here rather
+/// than depended on: `pull` does not take `costs`, and `docs/01-architecture.md`
+/// gives it `core` and `store` only. Integer arithmetic throughout.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
 }
