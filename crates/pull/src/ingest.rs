@@ -86,37 +86,6 @@ impl Ingested {
     }
 }
 
-/// Reads every CSV in `dir` and writes the bars that survive into the store.
-///
-/// # Errors
-///
-/// Whatever [`archive::read_dir`] refuses — a missing folder, a wrong column
-/// shape, a member that is not text. Those are **run-level**: they mean the
-/// folder or the declared shape is wrong, and every member shares both.
-///
-/// A failure on one member — a bad timestamp, a store refusal — is counted in
-/// [`Ingested::failures`] and the run continues.
-///
-/// # Examples
-///
-/// ```no_run
-/// # use std::path::Path;
-/// # use pull::{csv::Columns, ingest, session::{Cadence, Day, Window}, fetch::BarRequest};
-/// # use pull::vendor::{PriceScale, TimestampEncoding};
-/// # use store::path::Timeframe;
-/// let day = Day::new(2025, 7, 1)?;
-/// let done = ingest::from_dir(
-///     Path::new("/data/GFDLNFO_TICK_01072025/Futures/-III"),
-///     Path::new("/store"),
-///     Columns::Gdfl,
-///     &BarRequest { window: Window::new(day, day)?, cadence: Cadence::Minute },
-///     TimestampEncoding::EpochSecondsUtc,
-///     PriceScale::Paisa,
-///     Timeframe::MINUTE_1,
-/// )?;
-/// println!("{} bars from {} members", done.bars_stored, done.members);
-/// # Ok::<(), Box<dyn core::error::Error>>(())
-/// ```
 /// Everything one run needs, as one value.
 ///
 /// A struct rather than ten positional arguments, and not only to satisfy a

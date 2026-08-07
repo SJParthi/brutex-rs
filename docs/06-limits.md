@@ -860,9 +860,22 @@ now. What doubles is the middle — a 248,000-entry census (the measured scale
 
 ---
 
-## 24. What `crates/costs` does not know, and what it refuses to guess
+## 25. What `crates/costs` does not know, and what it refuses to guess
 
-Added by D-0041. Appended at the end of the file because two other changes were
+Added by D-0041 **as §24, colliding with the `crates/api` §24 further down this
+file — two sections carried the same number.** Renumbered to **§25 by D-0045**,
+and this section is the one that moved, for a reason worth stating: the api §24
+is cited from three places in `crates/api` source
+(`benches/ratio.rs` twice, `src/server.rs` once), and §25 was free. Moving the
+api section would have left three citations in code pointing at a heading that
+no longer exists; moving this one leaves every citation in the repository true.
+`crates/costs` cites only §26 and §27, both of which are unchanged.
+
+**The consequence is that this file's headings are no longer in numerical
+order** — §23, §25, §24, §26, §27 — and that is the honest cost of an
+append-only document repaired without rewriting it. **§20 does not exist and
+never will**: §21's own preamble records that it was skipped deliberately.
+Appended at the end of the file because two other changes were
 editing it at the same time.
 
 ### The whole pre-2024-10-01 exchange transaction charge is unknown, on both venues
@@ -1197,7 +1210,7 @@ crate can encounter that, because nothing here derives a step.
 
 ### What was measured, and what was not
 
-Gate 8 (`crates/costs/benches/ratio.rs`, C-18 through C-22) was run **four
+Gate 8 (`crates/costs/benches/ratio.rs`, C-K-05 through C-K-09) was run **four
 times** on the operator's machine on 2026-08-07. Per-call cost 0.62–15.7 ns;
 every ratio under the 3.0× ceiling.
 
@@ -1214,7 +1227,7 @@ every ratio under the 3.0× ceiling.
   compile-time constant — and they are exercised only inside the expiry ratios
   above. No isolated wall-clock figure is claimed for any of them.
 * `at_the_money`, `strike_at`, `moneyness_steps`, `contract_quantity` and
-  `notional` **are** timed, as C-18 through C-20.
+  `notional` **are** timed, as C-K-05 through C-K-07.
 
 ### Branch coverage is still not measured
 

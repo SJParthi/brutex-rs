@@ -5292,3 +5292,145 @@ fn a_missing_directory_refuses_rather_than_yielding_nothing() {
          two look identical downstream and only one of them is true"
     );
 }
+
+// ───────────────────── folding snapshots, and the ladder ─────────────────────
+
+/// The collision that produced zero bars from 354,675 real rows.
+#[test]
+fn snapshots_sharing_a_second_fold_into_one_bar() {
+    use pull::fold::{Bucket, fold};
+    use store::format::Bar;
+
+    let snap = |s: i64, p: i64| Bar {
+        ts_micros: s * 1_000_000,
+        open: p,
+        high: p,
+        low: p,
+        close: p,
+        volume: 1,
+        open_interest: i64::MIN,
+    };
+    // Four rows sharing 09:16:16, exactly what GDFL ships, then one later.
+    let raw = [
+        snap(0, 100),
+        snap(0, 130),
+        snap(0, 90),
+        snap(0, 110),
+        snap(59, 105),
+    ];
+
+    let bars = fold(&raw, Bucket::MINUTE).expect("non-decreasing");
+    assert_eq!(bars.len(), 1, "five snapshots in one minute become ONE bar");
+    assert_eq!(bars[0].ts_micros, 0, "stamped at the START of its bucket");
+    assert_eq!(bars[0].open, 100, "first in FILE order, not sorted");
+    assert_eq!(bars[0].high, 130);
+    assert_eq!(bars[0].low, 90);
+    assert_eq!(bars[0].close, 105, "last in file order");
+    assert_eq!(bars[0].volume, 5, "summed");
+    assert!(
+        bars.windows(2).all(|w| w[0].ts_micros < w[1].ts_micros),
+        "output timestamps strictly increase — which is what the store demands \
+         and what raw snapshots could not give it"
+    );
+}
+
+/// Out of order refuses rather than sorting.
+#[test]
+fn an_out_of_order_snapshot_refuses_rather_than_being_sorted() {
+    use pull::fold::{Bucket, FoldError, fold};
+    use store::format::Bar;
+
+    let snap = |s: i64| Bar {
+        ts_micros: s * 1_000_000,
+        open: 1,
+        high: 1,
+        low: 1,
+        close: 1,
+        volume: 0,
+        open_interest: i64::MIN,
+    };
+    let why = fold(&[snap(10), snap(5)], Bucket::MINUTE).expect_err("5 follows 10");
+    assert!(
+        matches!(why, FoldError::OutOfOrder { at: 1, .. }),
+        "named by position — sorting would invent an order these rows do not \
+         have and would change which price became the open. Got {why:?}"
+    );
+}
+
+/// Bucket width is runtime data, not a fixed set.
+#[test]
+fn the_bucket_width_is_a_runtime_value() {
+    use pull::fold::{Bucket, fold};
+    use store::format::Bar;
+
+    let snap = |s: i64| Bar {
+        ts_micros: s * 1_000_000,
+        open: 1,
+        high: 1,
+        low: 1,
+        close: 1,
+        volume: 1,
+        open_interest: i64::MIN,
+    };
+    let raw: Vec<Bar> = (0..300).map(snap).collect();
+
+    for (secs, want) in [(1_u32, 300_usize), (5, 60), (60, 5), (300, 1)] {
+        let b = Bucket::of_secs(secs).expect("non-zero");
+        let bars = fold(&raw, b).expect("in order");
+        assert_eq!(bars.len(), want, "{secs}s buckets over 300 seconds");
+    }
+    assert!(
+        Bucket::of_secs(0).is_none(),
+        "zero divides by zero — refused, not clamped"
+    );
+}
+
+/// The ladder cannot be skipped, and a failure does not advance it.
+#[test]
+fn the_ladder_refuses_to_skip_a_rung() {
+    use pull::fold::{Grain, LADDER, Ladder, Segment};
+
+    assert_eq!(LADDER.len(), 6, "3 segments x 2 granularities");
+
+    // Daily across every segment BEFORE any minute work: the cheap pass first.
+    assert_eq!(
+        LADDER.map(|s| (s.segment, s.grain)),
+        [
+            (Segment::Spot, Grain::Daily),
+            (Segment::Futures, Grain::Daily),
+            (Segment::Options, Grain::Daily),
+            (Segment::Spot, Grain::Minute),
+            (Segment::Futures, Grain::Minute),
+            (Segment::Options, Grain::Minute),
+        ],
+        "spot before futures before options; daily before minute"
+    );
+
+    let mut l = Ladder::new();
+    assert_eq!(l.next(), Some(LADDER[0]), "the cheapest rung first");
+
+    // A FAILED stage does not advance. This is the whole point.
+    for _ in 0..5 {
+        l.record(false);
+    }
+    assert_eq!(
+        l.next(),
+        Some(LADDER[0]),
+        "five failures later it is still on spot/daily — a partial success \
+         that advanced would carry its gap into a stage 375 times larger"
+    );
+    assert_eq!(l.completed(), 0);
+
+    // Clean stages advance, one rung each.
+    for (i, rung) in LADDER.iter().enumerate() {
+        assert_eq!(l.next().as_ref(), Some(rung), "rung {i}");
+        l.record(true);
+    }
+    assert!(l.finished());
+    assert_eq!(l.next(), None, "nothing left to climb");
+    assert_eq!(l.completed(), 6);
+
+    // Recording past the end does not overflow.
+    l.record(true);
+    assert_eq!(l.completed(), 6);
+}

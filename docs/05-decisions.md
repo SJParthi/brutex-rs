@@ -2615,7 +2615,7 @@ merely trivially small) and *prices it as zero anyway*. Promoting that to a
 refusal would have been a behaviour change this port had no authority to make.
 The zero ships, the marking ships with it in the constant's own documentation,
 and the direction of error is stated: if the true figure is positive, this
-under-charges. `docs/06-limits.md` §24 records it.
+under-charges. `docs/06-limits.md` §25 records it.
 
 ### O(1) is claimed literally, because the structure earns it
 
@@ -2643,7 +2643,7 @@ anchor row and at the last row, across a two-row and a three-row table, and on a
 refusal against a verified rate. Over three runs on the operator's machine:
 1.7–4.3 ns per lookup, worst ratio **1.552×** against a 3.0× ceiling — that one
 from a run taken while other work was compiling, with the two quiet runs at
-**1.189×**. `docs/06-limits.md` §24 records both rather than the flattering one.
+**1.189×**. `docs/06-limits.md` §25 records both rather than the flattering one.
 
 ### The structural contract is checked by the compiler, not by a test
 

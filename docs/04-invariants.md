@@ -110,6 +110,18 @@ instruments and 124.916 ms at 50,000 **rendering exactly 200 rows both times** �
 The row cap is what hid it. After D-0042: 147,987 ns → 151,618 ns, ratio 1.02×,
 marginal 0–259 ps per instrument.
 
+**Re-measured independently for D-0045**, by running `cargo bench -p api` on the
+same machine on 2026-08-07 — exit **0**, "all ratios within the ceiling". Across
+all six sort columns × four pills, plus the escape hatch and the clamped deep
+page: **C-14** ratio 2,787 → 50,000 spans **0.929× – 1.088×**; **C-15** marginal
+**0 – 259 ps** per instrument per request against the asserted 1,000 ps ceiling;
+**C-16** dashboard **1.052×** at 2 → 50,000; **C-17** cost per rendered row
+**0.202× – 0.404×**, with the row counts printed and checked (200 drawn at
+n = 50,000). The absolute page figure is ~137–166 µs at both sizes. The audit's
+"before" pair (3.569 ms and 124.916 ms) was taken on a **debug** server and this
+is a release bench, so only the *shape* is comparable between them — the ratio
+is, and the ratio is the claim.
+
 C-15 is the row that matters most, because it is the audit's own number and it
 needs no baseline: a slope measured between two sizes that draw the same 200
 rows is universe size and nothing else. It went from 85,400 ps to 0–259 ps.
@@ -163,17 +175,24 @@ directory, found none, and exited zero — see `docs/06-limits.md` §7b and §7c
 | # | Must hold | Proven by | |
 |---|---|---|---|
 | P-01 | A rate governor never issues above the configured ceiling, under any concurrency | **NOT PROVEN.** `pull::loom::governor_ceiling` exists in no file, and **`loom` appears in no `Cargo.toml` in this repository** — there is no concurrency checker here to run it. The single-caller arithmetic *is* proven, by P-20 through P-35. The words that stay unproven are *under any concurrency* | ✗ |
-| P-02 | A bar outside the requested window is never stored | `pull::unit::window_boundary` | — |
-| P-03 | A bar on a non-trading date is dropped and counted | `pull::unit::calendar_filter` | — |
-| P-04 | Re-running an ingest stores nothing new and reports zero net-new | `pull::integration::idempotent_repull` | — |
+| P-02 | A bar outside the requested window is never stored | **NOT PROVEN as written.** `pull::unit::window_boundary` exists in no file. The *window arithmetic* is proven — `pull::unit::a_window_is_inclusive_at_both_ends_and_refuses_to_run_backwards`, `pull::unit::every_second_of_a_day_falls_on_exactly_one_side_of_the_session`, `pull::unit::an_inclusive_window_survives_the_vendors_exclusive_to_date`. The words that stay unproven are **"never stored"**: no path in this repository writes a pulled bar to `crates/store` yet | ✗ |
+| P-03 | A bar on a non-trading date is dropped and counted | **NOT PROVEN, and the code says so first.** `pull::unit::calendar_filter` exists in no file, and `crates/pull/src/session.rs` states plainly that there is **no trading calendar and no holiday list** here — so there is nothing yet to prove. A weekend rule without a holiday list would be wrong, which is why `pull::unit::a_saturday_is_a_full_session_because_there_is_no_weekend_rule` asserts the *absence* as the current behaviour | ✗ |
+| P-04 | Re-running an ingest stores nothing new and reports zero net-new | **NOT PROVEN.** `pull::integration::idempotent_repull` exists in no file, and `crates/pull/tests/integration.rs` does not exist. Nothing stores a bar yet, so there is no re-run to be idempotent | ✗ |
 | P-05 | A credential is read, never written; no token is ever minted | `pull::unit::readonly_credentials` (a write attempt must panic the test double) | ✓ |
 | P-06 | An auth failure halts the pull loudly rather than degrading | `pull::unit::auth_halt` | ✓ |
 | P-07 | A missing, unreadable, or incomplete credential configuration halts the pull and names the absent segment; it never defaults | `pull::unit::credential_config_absent_halts` · `pull::unit::a_missing_table_or_key_is_a_halt` | ✓ |
 | P-08 | The credential configuration supplies path segments only; a secret value found in it is refused | `pull::unit::credential_config_rejects_secret_value` | ✓ |
 
-Added by D-0035. `P-01` through `P-04` keep their `—`: there is no rate
-governor, no window walk and no calendar filter yet, and the change that adds
-them is the change that makes a live vendor call.
+Added by D-0035. **That paragraph read "`P-01` through `P-04` keep their `—`:
+there is no rate governor, no window walk and no calendar filter yet." Two
+thirds of it went stale and nothing moved the rows.** D-0037 shipped
+`pull::rate::Governor`; `pull::session` shipped `Window`, `Day`, `DropReason`
+and `DropCensus`. So a rate governor and a window walk both exist today, and all
+four rows still named tests that exist in no file while wearing a glyph that
+means *the crate does not exist*. `crates/pull` is tracked and compiled.
+Corrected to `✗` by D-0045, each row saying which half is proven and which half
+is not. Only the calendar filter is still genuinely absent from the code, and
+`crates/pull/src/session.rs` is where that is decided and said.
 
 | # | Must hold | Proven by | |
 |---|---|---|---|
@@ -378,7 +397,7 @@ Added by D-0038. Every row here is proven by a test that runs today.
 | X-05 | `web` depends on `core` alone | CI gate 7 | ✓ |
 | X-06 | **Line and region** coverage is 100% on every crate, with no omit list | **THE GATE EXITS 1 ON THIS TREE.** Measured by running the CI command itself — `cargo llvm-cov --workspace --locked --fail-under-lines 100 --fail-under-regions 100 --summary-only`, cargo-llvm-cov 0.8.4, 2026-08-07: **exit 1**, TOTAL **97.41% regions** (672 of 25,907 missed), **96.93% lines** (478 of 15,557), 94.72% functions (80 of 1,515). Six files are short, and the table below names every one | ✗ |
 | X-06b | ~~Branch coverage is 100% on every crate~~ | **NOT MEASURED.** `llvm-cov` instruments zero branches on the pinned stable toolchain and `--branch` cannot run there at all. Narrowed by D-0030; recorded in `docs/06-limits.md` §7. | — |
-| X-07 | No mutant survives on a touched module | `cargo-mutants`, run per change. `crates/pull`, D-0036: **263 mutants, 227 caught, 36 unviable, 0 survivors** | ◐ |
+| X-07 | No mutant survives on a touched module | `cargo-mutants`, run per change. `crates/pull`, D-0036: **263 mutants, 227 caught, 36 unviable, 0 survivors**. `crates/costs`, D-0044: **163 mutants over `trip.rs`, `money.rs`, `fill.rs`, `scope.rs`, `error.rs` — 106 caught, 57 unviable, 0 survivors**, and one mutant that *did* survive a first run is written up in `docs/06-limits.md` §27. **Never measured at all: `crates/core`, `crates/store`, `crates/api`**, and the nine `crates/costs` files outside that list. `crates/store` planted five mutants by hand, which §22 records is not a survey. There is no `cargo-mutants` step in CI, so nothing enforces this row | ◐ |
 | X-08 | No tracked file contains a **slash-joined** credential path whose environment segment is a well-known one | CI gate 1c | ✓ |
 | X-08b | No literal under `crates/pull` that could be a path segment is undeclared | CI gate 1d | ✓ |
 | X-09 | `core` declares no dependency at all | CI gate 9 | ✓ |
@@ -420,19 +439,26 @@ lines / 95.91% regions; the gate has been red across both.
 by `grep -rn 'loom\|proptest' --include=Cargo.toml .`, which returns nothing.
 Nine rows name a module of one of those two names:
 
-| Row | Named | What is true |
-|---|---|---|
-| S-02 | `store::proptest::roundtrip` | ✗ no such function |
-| S-03 | `store::loom::commit_counter_publishes_last` | ✓ **exists** as `store::fault::…`, a plain `#[test]` — path corrected above |
-| S-08 | `store::proptest::oi_sentinel_distinct` | ✓ **exists** as `store::unit::…`, a plain `#[test]` — path corrected above |
-| V-03 | `indicators::proptest::suffix_independence` | `—` `crates/indicators` does not exist |
-| V-05 | `indicators::proptest::differential_vs_naive` | `—` `crates/indicators` does not exist |
-| E-01 | `engine::proptest::antimonotone` | `—` `crates/engine` does not exist |
-| E-02 | `engine::proptest::apriori_equals_bruteforce` | `—` `crates/engine` does not exist |
-| P-01 | `pull::loom::governor_ceiling` | ✗ no such function, `crates/pull` is tracked |
-| X-01 | `core::proptest::identity_sensitivity` | ✗ no such function, `crates/core` is tracked |
+*Written as a list, not a table: a `| id |` row here would be parsed by CI gate
+10 as a real invariant row and counted twice.*
 
-The four `—` rows are legitimately unreachable: their crates do not exist, which
+- **S-02** named `proptest::roundtrip` — ✗ no such function anywhere.
+- **S-03** named `loom::commit_counter_publishes_last` — ✓ it **exists**, as
+  `store::fault::…`, an ordinary `#[test]`. Path corrected above.
+- **S-08** named `proptest::oi_sentinel_distinct` — ✓ it **exists**, as
+  `store::unit::…`, an ordinary `#[test]`. Path corrected above.
+- **V-03** named `indicators::proptest::suffix_independence` — `—`,
+  `crates/indicators` does not exist.
+- **V-05** named `indicators::proptest::differential_vs_naive` — `—`, same.
+- **E-01** named `engine::proptest::antimonotone` — `—`, `crates/engine` does
+  not exist.
+- **E-02** named `engine::proptest::apriori_equals_bruteforce` — `—`, same.
+- **P-01** named `pull::loom::governor_ceiling` — ✗ no such function, and
+  `crates/pull` is tracked and compiled today.
+- **X-01** named `core::proptest::identity_sensitivity` — ✗ no such function,
+  and `crates/core` is tracked and compiled today.
+
+The four `—` entries are legitimately unreachable: their crates do not exist, which
 is what `—` means. But **the module name is a promise about a dependency**, and
 adding either tool is a workspace-manifest change nobody has made or decided on.
 Those four rows are naming an implementation that would have to be chosen first.

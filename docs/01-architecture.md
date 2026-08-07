@@ -1,6 +1,6 @@
 # 01 — Architecture
 
-Nine crates. Every arrow points one way. The graph is acyclic and the linker
+Ten crates. Every arrow points one way. The graph is acyclic and the linker
 enforces it.
 
 ---
@@ -11,11 +11,11 @@ enforces it.
                           ┌────────┐
                           │  core  │   no dependencies at all
                           └───┬────┘
-        ┌──────────┬──────────┼──────────┬──────────┬─────────┐
-        │          │          │          │          │         │
-    ┌───▼───┐  ┌───▼────┐ ┌───▼───┐  ┌───▼───┐  ┌───▼──┐  ┌───▼──┐
-    │ store │  │ vocab  │ │  web  │  │ pull  │  │ api  │  │ cli  │
-    └───┬───┘  └───┬────┘ └───────┘  └───┬───┘  └──┬───┘  └──┬───┘
+        ┌──────────┬──────────┼──────────┬──────────┬─────────┬─────────┐
+        │          │          │          │          │         │         │
+    ┌───▼───┐  ┌───▼────┐ ┌───▼───┐  ┌───▼───┐  ┌───▼──┐  ┌───▼──┐  ┌───▼───┐
+    │ store │  │ vocab  │ │  web  │  │ pull  │  │ api  │  │ cli  │  │ costs │
+    └───┬───┘  └───┬────┘ └───────┘  └───┬───┘  └──┬───┘  └──┬───┘  └───────┘
         │          │       wasm32        │         │         │
         │      ┌───▼──────────┐          │         │         │
         └─────►│ indicators   │          │         │         │
@@ -26,17 +26,48 @@ enforces it.
                └──────────┘
 ```
 
-| Crate | Owns | May depend on |
-|---|---|---|
-| `core` | types, error enums, the condition bit table, pure rules, the calendar | nothing |
-| `store` | the fixed-stride bar file: open, read, append, verify | `core` |
-| `vocab` | mask type, mask operations, the frequent-frontier structure | `core` |
-| `indicators` | bars in, condition bits out | `core`, `store` |
-| `engine` | Apriori generation, evaluation, trade walk, ranking | `core`, `store`, `vocab`, `indicators` |
-| `pull` | vendor ingest, rate governor, credential read | `core`, `store` |
-| `api` | HTTP surface | `core`, `store`, `engine`, `pull` |
-| `web` | browser UI, compiled to `wasm32-unknown-unknown` | **`core` only** |
-| `cli` | operator entry point | everything |
+| Crate | Owns | May depend on | Exists |
+|---|---|---|---|
+| `core` | types, error enums, the condition bit table, pure rules, the calendar | nothing | ✓ |
+| `store` | the fixed-stride bar file: open, read, append, verify | `core` | ✓ |
+| `vocab` | mask type, mask operations, the frequent-frontier structure | `core` | — |
+| `indicators` | bars in, condition bits out | `core`, `store` | — |
+| `engine` | Apriori generation, evaluation, trade walk, ranking | `core`, `store`, `vocab`, `indicators` | — |
+| `pull` | vendor ingest, rate governor, credential read | `core`, `store` | ✓ |
+| `api` | HTTP surface | `core`, `store`, `engine`, `pull` | ✓ |
+| `costs` | Indian F&O transaction costs: the dated statutory rate regimes, the option arithmetic, the round-trip charge stack | **`core` only** | ✓ |
+| `web` | browser UI, compiled to `wasm32-unknown-unknown` | **`core` only** | — |
+| `cli` | operator entry point | everything | — |
+
+**Five of the ten exist today**: `core`, `store`, `pull`, `api`, `costs`. The
+`Exists` column is read off `Cargo.toml`'s `members` list, which names a
+directory only once that directory is there — see the comment in that file. A
+row with `—` is a crate this document has planned and no code has yet.
+
+---
+
+## 1a. `costs` — added by D-0041, drawn here by D-0045
+
+`crates/costs` shipped across D-0041, D-0043 and D-0044, and **this diagram did
+not have it for any of them.** Each of those three entries recorded the omission
+as outstanding rather than fixing it, because the crate that wrote them did not
+own this file. It is drawn now.
+
+It sits beside `store` and `vocab` as a direct child of `core`, and **its only
+arrow points at `core`** — one dependency, `brutex_core`, for three things it
+refuses to define twice: `Exchange` (the circulars are exchange-scoped),
+`Paisa` (`CLAUDE.md` §7 fixes money at integer paisa) and the calendar
+validator (`day::TradeDay` validates through `core`'s, rather than writing a
+second leap-year rule). The graph stays acyclic; nothing depends on `costs`.
+
+**Nothing consumes it yet.** `grep 'costs' crates/*/Cargo.toml` returns only its
+own manifest. The intended consumer is the engine's trade-costing path, and
+`trip::price` is the single call it needs — so `engine` gains `costs` as a
+dependency when `engine` exists.
+
+**`CLAUDE.md` §5 draws this same graph and still does not list `costs`.** That
+file is session law and is not edited from here. The correction it needs is
+recorded in D-0045 and reported to the operator.
 
 ---
 
