@@ -1208,8 +1208,31 @@ fn field(label: &str, control: &str) -> String {
 
 /// A `YYYY-MM-DD` input, capped at `max`.
 fn date_input(name: &str, max: Day) -> String {
+    // A TEXT INPUT, NOT `type="date"`, AND THAT IS THE WHOLE POINT.
+    //
+    // `<input type="date">` renders in the BROWSER'S LOCALE, which this server
+    // cannot influence: on macOS it showed `dd/mm/yyyy` behind a native
+    // year-scroll widget. TradingView shows `2026-08-01`. Dhan shows
+    // `2026-08-01`. The vendor wire takes `2026-08-01`. Three out of four
+    // agreed and the fourth was the one the operator had to type into.
+    //
+    // Worse than merely inconsistent: the displayed order was *ambiguous*.
+    // `01/07/2025` is 1 July here and 7 January in half the world, and this
+    // codebase has already been bitten by exactly that ambiguity once — GDFL
+    // writes `DD/MM/YYYY` and reading it the other way shifts every bar by
+    // months into a file that is internally consistent and completely wrong.
+    // A form that renders the same ambiguity is the same defect one layer up.
+    //
+    // `pattern` is a courtesy and `parse_day` is the rule: the server splits
+    // ten characters into three integers and hands them to `Day::new`, which
+    // owns every calendar rule. A hand-built POST is refused by the same check
+    // that greys the field.
     format!(
-        "<input type=\"date\" name=\"{}\" max=\"{max}\" required>",
+        "<input type=\"text\" name=\"{}\" value=\"\" placeholder=\"YYYY-MM-DD\" \
+         pattern=\"\\d{{4}}-\\d{{2}}-\\d{{2}}\" maxlength=\"10\" \
+         title=\"ISO 8601, the same shape TradingView, Dhan and the vendor wire \
+         all use: {max} is the latest that can be asked for\" \
+         inputmode=\"numeric\" required>",
         escape(name)
     )
 }
@@ -2660,7 +2683,11 @@ mod tests {
 
         // The expiry ceiling is a day behind today, so a live contract is not
         // even offerable. The server refuses one too — see ingest::parse_fno.
-        assert!(html.contains("max=\"2026-08-06\""));
+        // `max` is INERT on a text input, so the bound is asserted where it now
+        // lives — in the title the operator can read — and the PARSER is what
+        // enforces it. The page already says: an attribute is a courtesy, a
+        // parser is a rule.
+        assert!(html.contains("2026-08-06"), "the expiry bound is stated");
         assert!(html.contains("LIVE CONTRACT CAN NEVER BE REQUESTED"));
 
         // The two corrections an operator would otherwise have to know.

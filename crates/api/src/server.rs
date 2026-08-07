@@ -2999,16 +2999,31 @@ mod tests {
         );
         assert!(!html.contains("method=\"get\""), "and never a GET: {html}");
 
-        // The date fields are `type=date`, which submits YYYY-MM-DD.
+        // THE DATE FIELDS ARE PLAIN TEXT IN ISO, NOT `type=date`, and the
+        // assertion changed with the code rather than being deleted.
+        // `type=date` renders in the BROWSER'S LOCALE — macOS showed
+        // `dd/mm/yyyy` — while TradingView, Dhan and the vendor wire all use
+        // `2026-08-01`. Worse, `01/07/2025` is ambiguous, and this codebase has
+        // already been bitten by exactly that reading GDFL.
+        assert_eq!(
+            html.matches("placeholder=\"YYYY-MM-DD\"").count(),
+            5,
+            "two on the spot form, three on the F&O form, all unambiguous"
+        );
         assert_eq!(
             html.matches("type=\"date\"").count(),
-            5,
-            "two on the spot form, three on the F&O form"
+            0,
+            "no locale-rendered date input survives"
         );
-        assert!(html.contains("max=\"2026-08-07\""), "no future spot window");
         assert!(
-            html.contains("max=\"2026-08-06\""),
-            "and the expiry stops a day earlier — a live contract is unofferable"
+            html.contains("2026-08-07"),
+            "the latest spot date is still stated"
+        );
+        assert!(
+            html.contains("2026-08-06"),
+            "and the expiry bound is still STATED — `max` is inert on a text
+             input, so the guard that matters is `parse_fno`, which refuses a
+             live contract whatever the form sends"
         );
 
         // The counts are the real ones from the loaded universe: the fixture
