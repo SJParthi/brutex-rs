@@ -478,3 +478,48 @@ working as stated rather than a scan appearing: the rollover arm does the month
 resolution and the table lookup **twice**, which is exactly the "at most two"
 the claim is. Every other stage-2 ratio, across all four runs, stayed inside
 0.81×–1.14×. No figure from a CI runner is claimed, because none was taken.
+
+## Transaction costs — the round trip
+
+`crates/costs` stage 3. Every row is proven by a test in `crates/costs`; the
+worked-example rows are the predecessor repository's own enforced oracles from
+`COSTS_VERIFIED` §5, reproduced to the paisa. See `docs/05-decisions.md` D-0044
+and `docs/06-limits.md` §27.
+
+| # | Must hold | Proven by | |
+|---|---|---|---|
+| K-38 | The four worked examples price to the **paisa** — one NIFTY lot, five NIFTY lots, one BANKNIFTY lot and the BSE rate set — with every rate and every lot size read out of this crate's own dated tables rather than restated in the test | `costs::trip::the_first_worked_example_prices_one_nifty_lot_to_the_paisa` · `costs::trip::the_second_worked_example_amortises_the_flat_brokerage_over_five_lots` · `costs::trip::the_third_worked_example_prices_one_banknifty_lot` · `costs::trip::the_fourth_worked_example_prices_the_bse_rate_set_through_the_pure_core` | ✓ |
+| K-39 | The transaction tax reads the **sell** premium and nothing else: not the buy leg, not both legs, and never `strike × quantity` — with each wrong answer priced out beside the right one | `costs::trip::the_transaction_tax_reads_the_sell_premium_and_nothing_else` | ✓ |
+| K-40 | Stamp duty is charged on the **buy** leg exactly once, and the sell-side rate is zero so the sell leg cannot be charged even deliberately | `costs::trip::the_stamp_duty_is_charged_on_the_buy_leg_and_exactly_once` | ✓ |
+| K-41 | GST is 18% on the services base — brokerage, exchange charge, SEBI fee and IPFT, each already rounded, with the tax and the stamp duty excluded — rounded **once**; rounding two 9% halves separately overcharges by exactly ₹1, computed rather than asserted | `costs::trip::the_gst_is_rounded_once_and_rounding_each_half_overcharges_by_a_rupee` · `costs::trip::the_gst_base_is_the_sum_of_all_four_service_components_with_a_plus_sign` | ✓ |
+| K-42 | Brokerage is per executed **order**, flat: a thousand lots pay what one lot pays, on both brokers, while every other charge scales | `costs::trip::the_brokerage_is_flat_per_order_and_a_thousand_lots_pay_what_one_pays` | ✓ |
+| K-43 | A round trip whose entry day lands in an unverified window **refuses entirely** — no charge is priced at zero and no current rate is applied backwards — and the refusal carries the window, the citation gap and the remedy out whole | `costs::trip::a_round_trip_in_the_unverified_window_refuses_the_whole_trip_and_names_it` · `costs::trip::the_dated_pair_carries_whichever_of_the_two_lookups_refused` | ✓ |
+| K-44 | Every regime is keyed on the **entry** day: a round trip that straddles a tax boundary is priced at the regime it opened under, and the lot size is the entry day's too | `costs::trip::the_regime_is_the_entry_days_and_the_exit_day_never_moves_it` · `costs::trip::the_lot_size_is_the_entry_days_and_a_pre_history_entry_refuses` | ✓ |
+| K-45 | Each leg fills on the adverse extreme of its **own** bar plus one further tick, the two directions read different anchors off the same two bars, the sell floor binds at one tick and shortens the realized slippage with it, and the buy leg needs no floor because no legal bar can reach one | `costs::fill::a_long_fills_the_entry_high_and_the_exit_low_each_one_tick_adverse` · `costs::fill::a_short_fills_the_exit_high_and_the_entry_low_and_is_adverse_on_both_legs` · `costs::fill::the_sell_floor_binds_at_one_tick_and_the_realized_slippage_follows_it` · `costs::fill::the_buy_leg_needs_no_floor_because_no_legal_bar_can_reach_it` | ✓ |
+| K-46 | The worst-case fill never flatters an open-anchored one, at either bracket end of any bar, on either direction | `costs::fill::the_worst_case_fill_never_flatters_an_open_anchored_one` | ✓ |
+| K-47 | The two rounding laws are different functions: a levy ceils to the paisa per leg and is summed after, a statutory levy floors to the paisa and then ceils to the whole rupee — and each is the **least** integer at or above its quotient, checked densely and at every remainder that can flip it | `costs::money::the_statutory_raw_stage_floors_where_the_levy_stage_ceils` · `costs::money::the_ceiling_is_the_least_integer_at_or_above_the_quotient` · `costs::money::the_rupee_ceiling_is_the_least_whole_rupee_at_or_above_the_amount` | ✓ |
+| K-48 | An index spot or index future is priced **signal-only** — every charge zero, net equal to gross, the fills unchanged — and it consults no rate, so it prices inside a window where every rate refuses | `costs::scope::only_the_option_segment_bears_the_charge_stack` · `costs::trip::a_signal_only_segment_pays_nothing_and_its_net_is_its_gross` · `costs::trip::a_signal_only_segment_prices_inside_a_window_where_every_rate_refuses` | ✓ |
+| K-49 | An expiry outcome is **refused**, never priced with premium arithmetic; an exit before its entry, a lot count on a segment with no options lot table, a zero or negative quantity, an inverted bar and a sub-tick bar high are each refused **by name** | `costs::trip::an_expiry_outcome_is_refused_rather_than_priced_as_a_normal_close` · `costs::trip::an_exit_day_before_its_entry_day_is_refused` · `costs::trip::a_lot_count_is_refused_for_a_segment_the_options_lot_table_does_not_cover` · `costs::trip::a_round_trip_of_no_contracts_is_refused_by_name_on_every_path` · `costs::fill::a_bar_whose_low_is_above_its_high_is_refused_rather_than_swapped` · `costs::fill::a_bar_whose_high_is_below_one_tick_is_refused_by_name` | ✓ |
+| K-50 | Every arithmetic site that can leave `i64` is refused **by name** and never wrapped or saturated — both notionals, the slippage line, the net, each per-leg levy, each two-leg sum, the GST base, the total, and each statutory stage | `costs::trip::every_position_overflow_site_is_refused_by_name_and_never_wrapped` · `costs::trip::every_levy_overflow_site_is_refused_by_name_and_never_wrapped` · `costs::trip::every_flat_levy_overflow_site_is_refused_by_name_and_never_wrapped` · `costs::trip::the_sell_leg_of_a_per_leg_levy_is_guarded_independently_of_the_buy_leg` · `costs::trip::the_statutory_rupee_ceiling_is_reachable_from_the_stack_and_refuses` · `costs::trip::a_signal_only_round_trip_guards_its_arithmetic_too` · `costs::fill::a_fill_or_a_slippage_past_i64_is_refused_by_name_and_never_wrapped` · `costs::money::a_result_past_i64_is_refused_by_name_and_never_saturated` | ✓ |
+| K-51 | A breakdown's own two laws hold on every swept combination — the total is the sum of its seven itemised charges and the net is the gross less the total — and a breakdown that broke either is **refused rather than reported** | `costs::trip::the_internal_laws_hold_across_a_deterministic_sweep_of_the_envelope` · `costs::trip::a_breakdown_that_broke_its_own_law_is_refused_rather_than_reported` · `costs::trip::the_breakdown_itemises_seven_charges_that_sum_to_its_total` | ✓ |
+| K-52 | A losing round trip still pays every charge, and a round trip whose charges exceed its gross reports a negative net — both computed, not asserted | `costs::trip::a_losing_round_trip_reports_a_negative_net_and_still_pays_every_charge` · `costs::trip::a_round_trip_whose_charges_exceed_its_gross_reports_a_negative_net` | ✓ |
+| K-53 | The entry point is the pure core plus the resolution and nothing else, on every swept combination of underlying, date, direction and segment | `costs::trip::the_entry_point_and_the_pure_core_agree_on_every_swept_combination` | ✓ |
+
+### Complexity rows for the round trip
+
+Enforced by gate 8, `crates/costs/benches/ratio.rs`, against the same **3.0×
+shared-CI ceiling**.
+
+| # | Must hold | Proven by | |
+|---|---|---|---|
+| C-23 | The charge stack costs the same however big the trade is: one lot against a million, a five-paisa premium against a lakh-rupee one, and a winning trip against a losing one | `costs::bench::the_trade_size_does_not_change_the_charge_stack_cost` | ✓ |
+| C-24 | The whole entry point costs the same whatever it is asked: the trade's size, its date and its underlying do not move it, and a signal-only trip never costs **more** than a cost-bearing one | `costs::bench::the_entry_point_costs_the_same_whatever_it_is_asked` | ✓ |
+| C-25 | The unverified window **refuses the whole round trip** — not merely refuses it quickly — while the day after prices and a signal-only trip in the same window prices at zero | `costs::bench::the_stage_three_refusals_are_still_refusals` | ✓ |
+
+Measured on the operator's machine, 2026-08-07, over four runs. Per-call cost
+32.9–37.6 ns for `charge_stack` and 37.3–41.2 ns for `price`. Every ratio held:
+C-23 spanned 0.895×–1.030× and C-24's three size/date/underlying ratios spanned
+0.954×–1.039×. The two figures far **below** 1.0× are the two arms that do less
+work by design and are reported rather than hidden: a signal-only trip resolves
+no rate (0.128×–0.137×) and a refused trip stops at the first refusal
+(0.164×–0.179×). No figure from a CI runner is claimed, because none was taken.

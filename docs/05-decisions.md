@@ -3005,3 +3005,176 @@ instruments, and a third row would be a scope change smuggled in as data.
   and is `O(2·half_width + 1)` by construction. A caller that wants the chain
   calls `strike_at` for each rung it actually needs; nothing here materialises a
   list.
+
+---
+
+## D-0044
+
+**The round-trip cost calculator: five traps made structural, two rounding laws
+kept apart, and one refusal that stops the whole trade.**
+
+`crates/costs` stage 3 of 3. Adds `money`, `fill`, `scope` and `trip`; edits
+`error` (six new refusals) and `lib` (module wiring and the crate's stage-3
+claim). Ported from the predecessor repository's `brutex/costs/calculator.py`,
+`brutex/costs/types.py`, `brutex/costs/scope.py` and the already-Rust
+`rust/fno-math/src/exec/{costs_options,money,fills}.rs`. Nothing was taken from
+`fno-math` as a dependency — it links `PyO3`, which `CLAUDE.md` §2 bans and
+`deny.toml` names. The arithmetic was read; the binding was left behind, exactly
+as D-0039 and D-0043 record for the earlier stages.
+
+### The five traps, and why each is a shape rather than a comment
+
+Every one of these is a defect the predecessor repository records finding and
+fixing. A comment saying "remember X" is not a fix, so each is expressed as
+something the code cannot get wrong:
+
+1. **The transaction tax is sell-side, on the PREMIUM.** The tax reads
+   `Position::sell_notional` and there is exactly one call site. There is no
+   strike anywhere in `trip`, so "STT on strike × lots" is not merely wrong here
+   — it is unwritable. `the_transaction_tax_reads_the_sell_premium_and_nothing_else`
+   prices out both the doubling error (₹22 against ₹12) and the strike-based one
+   (₹2,340 against ₹12).
+2. **Stamp duty is buy-side only.** The rate is fetched through
+   `rate::stamp_duty(OrderSide::Buy)`, which returns zero for a sell. "Which
+   leg" is a value the compiler carries.
+3. **GST is rounded once.** One `statutory_levy` on the services base. There is
+   no CGST/SGST split in the type, in the arithmetic, or anywhere else — an
+   intra-state trade may be *displayed* as two halves and is *computed* once.
+   `the_gst_is_rounded_once_and_rounding_each_half_overcharges_by_a_rupee`
+   computes both and asserts the difference is exactly ₹1, which is the
+   predecessor's `DEC-COST-001` figure, citing section 170 of the CGST Act.
+4. **Brokerage is per executed ORDER.** `Rates` resolves it once as a round-trip
+   total and nothing in the stack multiplies it. A thousand lots and one lot pay
+   the same ₹40, asserted.
+5. **An unverified regime refuses the whole trip.** `Rates::resolve` carries
+   stage one's `Refusal` out whole — window, citation gap and remedy intact —
+   and `price` returns it instead of a `Charges`. No component is priced at
+   zero, and no current rate is applied backwards.
+
+### The two rounding laws are two function NAMES, not one function with a flag
+
+`money::levy_ceiling` (ceil to the paisa, per leg) and `money::statutory_levy`
+(floor to the paisa, then ceil to the whole rupee) are different functions with
+different names, following the predecessor's own reasoning: a half-up in the
+statutory raw stage drifts the raw by one paisa and occasionally flips the rupee
+rounding, and nothing downstream can tell that happened. Making them a shared
+body with a mode parameter would make the trap expressible by accident.
+
+**Per leg, then summed — never summed then rounded.** `COSTS_VERIFIED` §5
+Example 1 gives 502 paisa because it is `228 + 274`; one rounding of the combined
+notional gives 501. Asserted directly in
+`money::the_two_composed_levies_reproduce_the_source_worked_example`.
+
+**Everything ceils, and that is a deliberate over-charge.** The predecessor's
+`DEC-FILL-WORST-CASE-ONLY-001` makes adverse rounding permanent, on the argument
+that a levy is a charge: the ceiled backtest charge is at least the real one, so
+the simulated net can only understate the truth. This is *not* the exchange's
+rounding, and the direction and size of the difference are recorded in
+`docs/06-limits.md` §27 rather than presented as accuracy.
+
+### There is one fill law and no mode
+
+`fill::worst_case_fills`: each leg anchors on the adverse extreme of its own bar
+— a buy on the HIGH, a sell on the LOW — and pays one further tick. The
+predecessor deleted the alternative ("precise", anchored on the bar open) along
+with the flag that selected it, and this port has no mode, no parameter and no
+second body. The short arm reads the *other* two anchors (cover on the exit
+high, opening sell on the entry low), which is the reconciled `CALCULATOR_SPEC`
+§8 rule and not the mirror of the long one.
+
+Two divergences from the source, both toward fewer branches:
+
+* **`Bar` carries no open.** The source's input type carries the bar open and
+  uses it solely to check that the extremes bracket it. That check is expressed
+  here as `low <= high`, which is what it implies. A field that never enters a
+  computation is a field that can drift.
+* **The buy fill has no floor.** The source floors both legs at one tick.
+  `Bar::new` refuses a high below one tick, so `high + TICK` is at least two
+  ticks on every constructible bar and a floor there would be a branch no input
+  could take. The **sell** floor is kept, because a sub-two-tick bar low really
+  does reach it, and both of its arms are tested.
+
+### The cost-scope predicate, restricted honestly
+
+`scope::is_cost_free` is the predecessor's `DEC-COST-SCOPE-INDEX-SIGNAL-ONLY-001`
+rule: cost-free is an index that is *not* an option. Index spot and index futures
+are signal-only; an index option is a tradable premium instrument and bears the
+whole stack.
+
+The source's rule also ranges over single stocks, which are cost-bearing. That
+half is **not** expressed as a variant, because this crate cannot price a single
+stock: it holds no single-name lot table and no single-name rates, and
+`venue::swept_slot` refuses anything outside `CLAUDE.md` §1's two NSE indices
+before a segment is ever consulted. A `SingleName` variant would be a scope claim
+the crate could not honour.
+
+**The short-circuit is after the fills, not before them.** Cost-free removes the
+charge stack and nothing else: the same two worst-case fills, the same gross.
+That is also what lets an index-spot backtest over 2019 price at all, in a window
+where every exchange transaction charge refuses —
+`a_signal_only_segment_prices_inside_a_window_where_every_rate_refuses` asserts
+both halves of that.
+
+### Quantity in units, with lots as a second constructor
+
+`RoundTrip::new` takes the quantity in **units**; `RoundTrip::in_lots` resolves
+it from stage two's dated lot table and refuses for any segment but
+`IndexOption`, because that table is the *options* lot history and its citations
+are options circulars. Sizing an index future from it would wear a citation that
+does not cover it. The lot size is keyed on the **trade date**, not the
+contract's vintage — the predecessor's documented limitation, carried across
+with its reason, in `docs/06-limits.md` §27.
+
+### The expiry outcomes are named and refused
+
+`Outcome` has four variants and only `NormalClose` is priced. The predecessor's
+`CALCULATOR_SPEC` §4.2 charge state machine — STT on intrinsic value for an
+exercise, no STT on an assignment, brokerage only on a worthless expiry — is not
+implemented there either, and it refuses rather than pricing an expiry with
+premium arithmetic. So does this. Naming the outcome and refusing is strictly
+better than not having the concept: a caller can *say* what happened and be
+told no, instead of passing a normal close and being silently mispriced.
+
+### `Charges` validates its own two laws before it is returned
+
+`total == the sum of its seven components` and `net == gross - total`, checked in
+`Charges::validated` and refused as `CostError::Inconsistent` rather than
+returned. It cannot fail if the arithmetic above it is wired correctly, which is
+the point: it is mutation-testing teeth on the field wiring, and it caught a
+mis-wired `net` in its own test.
+
+### Two structures exist so that a guard is TESTED rather than assumed
+
+Both were forced by the 100% region-coverage gate, and both are better code:
+
+* **`trip::dated_pair`** takes the two rate lookups as `Result`s instead of
+  writing two `?`s inline. The transaction-tax table has no unverified row
+  today, so its guard is unreachable through any date — and an unreachable guard
+  is indistinguishable from a missing one. Passing it a refusal built for the
+  purpose makes it a tested path, so the day that table gains a refusal row
+  nothing on the path is untried.
+* **`Rates::with_all`** (`#[cfg(test)]`, crate-private) supplies the flat SEBI,
+  stamp and GST rates as arguments. The shipped figures are far too small to
+  overflow anything, so their overflow guards could not otherwise be reached.
+  The public `Rates::new` still takes only the three rates that move, so nothing
+  outside this crate can get a flat rate wrong, and a test asserts that
+  `with_all` handed the shipped figures **is** `new`.
+
+### What stage three deliberately does not do
+
+* **The futures charge stack.** `brutex/costs/futures_costs.py` and its Rust twin
+  need futures rates — a futures STT, a futures exchange charge, the Groww
+  `min(flat, turnover)` brokerage arm — none of which stage one shipped, and
+  none of which has a citation in this repository. The only futures this engine
+  would ever see are **index** futures, which `scope` prices signal-only and
+  which therefore need no rate at all. Adding an unciteable futures rate table to
+  price a segment that is cost-free would be exactly the invention Golden Rule 1
+  forbids. `docs/06-limits.md` §27.
+* **The Muhurat brokerage waiver.** `COSTS_VERIFIED` §5 Example 5 carries an
+  explicit banner saying the predecessor's own calculator has no Muhurat branch
+  and that the example is spec-only. Neither has this one, and
+  `the_fifth_worked_example_is_not_ported_and_the_reason_is_asserted` asserts the
+  absence rather than leaving it as prose.
+* **Iceberg order slicing.** One executed order per leg, as the source stamps.
+* **A GST display split.** Intra-state and inter-state change how a total is
+  *shown*, never how it is computed. There is no such field.

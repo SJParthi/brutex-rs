@@ -79,6 +79,7 @@
 #![forbid(unsafe_code)]
 
 pub mod config;
+pub mod csv;
 pub mod fetch;
 pub mod manifest;
 pub mod rate;

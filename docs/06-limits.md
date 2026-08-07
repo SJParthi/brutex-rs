@@ -1268,3 +1268,214 @@ That is a real signal (the compiler caught them) but it is not the tests
 catching them, and it is reported in its own column rather than folded into
 "caught". `crates/rate` was not mutated because it was not touched; `crates/core`
 still has no mutation measurement at all.
+
+## 27. What the round-trip calculator does not know, and what it deliberately over-charges
+
+`crates/costs` stage 3. See `docs/05-decisions.md` D-0044 for the decisions;
+this section is only the gaps.
+
+### The rounding is deliberately MORE expensive than the exchange's
+
+Every rate-scaled levy **ceils**. A real exchange rounds statutorily half-up, so
+every figure this crate produces is at least the real charge and usually a little
+above it. The predecessor makes this permanent under
+`DEC-FILL-WORST-CASE-ONLY-001`, on the argument that a backtest that flatters is
+worse than one that is pessimistic.
+
+Stated as a bound, because it is one. Per round trip the deliberate over-charge
+is at most:
+
+| Component | Over-charge ceiling |
+|---|---|
+| exchange transaction charge | 1 paisa per leg — 2 paisa |
+| SEBI turnover fee | 2 paisa |
+| investor protection fund | 2 paisa |
+| securities transaction tax | 1 rupee (99 paisa) |
+| stamp duty | 1 rupee |
+| GST | 1 rupee |
+
+So at most **₹3.06 per round trip**, always in the same direction. On the ₹67.12
+of `COSTS_VERIFIED` §5 Example 1 that is up to 4.6% of the charge stack — small
+against the stack, and **not** small against the ₹3.25 gross of a one-tick
+winner. A strategy whose edge is a tick or two is being judged more harshly here
+than the exchange would judge it, and that is the intent, not an accuracy claim.
+
+The **direction** is certain; the size above is a ceiling, not a measurement of
+the typical case. No distribution of the actual over-charge over real trades has
+been computed, because no real trade set has been priced.
+
+### Nothing here has been checked against a broker contract note
+
+Unchanged from §26 and worth restating, because stage 3 is where it would show.
+Every figure traces to the predecessor repository's citations. "The rate matches
+the circular", "the arithmetic matches the specification" and "the total matches
+the contract note" are three different claims, and only the first two are being
+made. **No contract note, no exchange bill and no broker statement has been
+compared against any output of this crate.**
+
+The four worked examples are the predecessor's own enforced oracles, regenerated
+by it from its own shipped calculator. Reproducing them proves this port agrees
+with the source. It does **not** prove the source was right.
+
+### The lot size is keyed on the trade date, not the contract's vintage
+
+`RoundTrip::in_lots` reads the lot size in force on the **entry day**. A real
+exchange lot revision applies per contract from a stated expiry onward, so around
+a transition the two disagree: a NIFTY trip on 2024-11-19 is sized at 25 and one
+on 2024-11-20 at 75 — a threefold jump keyed purely on the day — even though a
+still-listed pre-revision contract kept its old lot until its own expiry.
+
+The predecessor records exactly this limitation and stamps its output with the
+basis it used. The per-circular contract-level rollout dates are UNVERIFIED, so
+no vintage logic is invented here either. **A trip on a pre-revision contract
+opened after a revision date is mis-sized, and by the full ratio.** How often
+that happens over a real backtest is UNVERIFIED and deliberately not estimated.
+
+A caller that knows the contract's vintage should resolve the quantity itself and
+use `RoundTrip::new`, which takes units.
+
+### The futures charge stack is NOT ported
+
+`brutex/costs/futures_costs.py` (48 KB) and `rust/fno-math/src/exec/costs_futures.rs`
+were read and are not ported. Two reasons, in order:
+
+1. **The rates do not exist here.** A futures stack needs a futures transaction
+   tax, a futures exchange transaction charge, and the Groww
+   `min(flat, turnover)` brokerage arm. Stage 1 shipped **options** rates only,
+   and no futures rate has a citation recorded in this repository. Writing one
+   down would be the invention Golden Rule 1 forbids.
+2. **Nothing would use it.** `CLAUDE.md` §1 fixes the engine surface at two NSE
+   indices, so the only futures this engine can see are **index** futures — and
+   `scope::is_cost_free` prices those signal-only, which needs no rate at all.
+   That arm **is** ported and tested.
+
+What that leaves unported: a **single-stock** futures round trip cannot be priced
+by this crate. It also cannot be reached, because `venue::swept_slot` refuses
+every symbol outside the swept set. Both halves are refusals rather than wrong
+answers.
+
+The parts of the futures model that differ from the options one — one gross
+formula for both directions instead of a sign branch, and per-leg
+`min(flat, turnover)` brokerage instead of a flat round trip — are recorded here
+so that a later port starts from the divergence rather than rediscovering it.
+
+### `scope.py`'s single-stock half is not expressed
+
+The source's rule is "an index that is not an option". The clause about single
+stocks — every stock, in every segment, is cost-bearing — is true and is **not**
+a variant of `scope::Segment`, because this crate holds no single-name lot table
+and no single-name rates. A `SingleName` variant would be a scope claim the crate
+cannot honour. The refusal happens earlier, at `venue::swept_slot`.
+
+### The expiry charge state machine is absent
+
+`Outcome::ExpiryExercise`, `ExpiryAssign` and `ExpiryWorthless` are **refused**,
+not priced. The `CALCULATOR_SPEC` §4.2 machine — the transaction tax on intrinsic
+value for an exercise, no tax on an assignment, brokerage only on a worthless
+expiry — is not implemented in the predecessor either. `regime::stt_exercise_rate`
+exists, is dated and is verified, and **nothing calls it**. A backtest that holds
+an option to expiry cannot be costed by this crate at all.
+
+### The Muhurat brokerage waiver is absent
+
+`COSTS_VERIFIED` §5 Example 5 documents ₹0 brokerage during a Muhurat session and
+carries the predecessor's own banner saying its calculator has no such branch.
+Neither has this one; a Muhurat trip is charged the full flat fee, which
+**over**-charges. Asserted rather than assumed by
+`costs::trip::the_fifth_worked_example_is_not_ported_and_the_reason_is_asserted`.
+
+### One rounding guard cannot be reached through the GST stage
+
+`money::ceil_to_rupee` refuses when the next whole rupee leaves `i64`. That arm is
+reachable through the transaction tax (a sell notional near `i64::MAX` at a
+rate-scale rate) and is tested there. It is **arithmetically unreachable** through
+the GST stage: the GST base is itself an `i64`, and 18% of any `i64` is at most a
+fifth of one, so its raw can never come within a rupee of the ceiling. Stated
+rather than left as an untested-looking corner.
+
+### GST is computed, never split
+
+An intra-state trade is CGST plus SGST on a bill. This crate has no split field,
+no `GstSplit` type and no display half. The split changes how a total is *shown*
+and never how it is computed — and computing it as two halves is the
+`DEC-COST-001` defect. A consumer that must display two halves derives them from
+`Charges::gst`, and the two displayed halves may not each be a whole rupee.
+
+### Trading holidays, iceberg slicing, and the SEBI-fee GST boundary
+
+* **Holidays** are still not accounted for anywhere in this crate (§26). Stage 3
+  adds no calendar of its own and inherits the gap unchanged.
+* **Iceberg slicing** is not implemented: one executed order per leg. A real
+  order sliced into several would pay brokerage per slice, so this
+  **under**-charges a sliced order. The predecessor defers it identically.
+* **GST on the SEBI fee** is applied for **all** dates. The predecessor records a
+  claimed ~2022-07-18 introduction of GST on the SEBI turnover fee with **no
+  in-repo citation**, and deliberately does not implement it. Neither does this.
+  A pre-boundary trip is over-charged by 18% of a sub-rupee fee — conservative,
+  and it is carried across rather than invented away.
+
+### Exactly what was and was not measured
+
+**Measured**, on the operator's machine on 2026-08-07, over four runs of
+`cargo bench -p costs`:
+
+* `charge_stack` at 32.9–37.6 ns per call; `price` at 37.3–41.2 ns.
+* C-K-10: one lot against a million (0.927×–1.030×), a five-paisa premium
+  against a lakh-rupee one (0.895×–0.957×), a win against a loss
+  (0.991×–1.027×).
+* C-K-11: one lot against a million (0.954×–0.977×), the first verified day
+  against the last regime (0.983×–1.012×), NIFTY against BANKNIFTY
+  (0.956×–1.039×).
+* C-K-11 and C-K-12's two sub-1.0× arms: a signal-only trip at 0.128×–0.137×
+  and a refused trip at 0.164×–0.179×. Both do less work by design; they are
+  reported rather than omitted for being flattering.
+
+**NOT measured.** No figure from a CI runner exists for any stage-3 row; the
+3.0× ceiling asserted in the harness is the shared-CI number and whether a GitHub
+runner stays under it is UNVERIFIED. `money`'s and `fill`'s primitives are never
+timed in isolation — only as components of C-K-10 — so their O(1) claims are
+structural (a fixed instruction sequence with no loop) and are labelled as such.
+The operation counts in `trip`'s module documentation are **counted by reading**,
+not by instrumenting a compiled binary; they are laid out per stage so that the
+reading can be repeated, and no instruction-level measurement backs them.
+
+### Coverage and mutation
+
+Line, region and function coverage are **100.00%** across the whole of
+`crates/costs` under the CI command's own thresholds
+(`cargo llvm-cov -p costs --locked --fail-under-lines 100 --fail-under-regions 100`,
+cargo-llvm-cov 0.8.4). Branch coverage is still **not measured** — llvm-cov
+instruments zero branches on the pinned toolchain, already recorded as X-06b and
+§7, unchanged by this work.
+
+**Mutation**, cargo-mutants 26.2.0, over the four files stage 3 wrote or edited:
+
+| File | Mutants | Caught | Unviable | Survived |
+|---|---|---|---|---|
+| `trip.rs` | 101 | 57 | 44 | 0 |
+| `money.rs`, `fill.rs`, `scope.rs` | 46 | 39 | 7 | 0 |
+| `error.rs` | 16 | 10 | 6 | 0 |
+
+One mutant survived the first run and is worth recording, because it is exactly
+the class of defect a golden example cannot catch: **`+ sebi` mutated to
+`- sebi` inside the GST base survived all four worked examples.** The shipped
+SEBI turnover fee is two paisa on a real trade, so flipping its sign moves the
+GST base by four paisa and the rupee ceiling absorbs it entirely. It is killed by
+`the_gst_base_is_the_sum_of_all_four_service_components_with_a_plus_sign`, which
+prices the same trip at a SEBI rate large enough for the sign to show. **A
+component small enough to hide inside a rounding is invisible to every example
+that uses its real rate**, and that is a general fact about this cost stack, not
+a one-off.
+
+51 of the 163 mutants were **unviable** — they did not compile. That is the
+compiler catching them, not the tests, and it is reported in its own column
+rather than folded into "caught".
+
+### Gates NOT run
+
+`cargo test --workspace --locked` and `cargo clippy --workspace --all-targets`
+were **not** run to green. Other agents are mid-edit in `crates/api`,
+`crates/pull` and `crates/store`, and a workspace-wide run currently reports
+diffs that are not stage 3's. `cargo fmt -p costs --check`,
+`cargo clippy -p costs --all-targets -- -D warnings`, `cargo test -p costs` and
+the coverage command above all pass at exit 0.

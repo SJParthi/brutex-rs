@@ -15,7 +15,9 @@
 //!    `strike × lots`. The single most common error in an Indian F&O cost
 //!    model, because the equity-delivery rule *is* both-sides and the
 //!    futures-physical-settlement rule *is* on the settlement value. Here the
-//!    tax reads [`Position::sell_notional`] and there is no other call site.
+//!    tax reads the sell leg's premium notional and there is no other call
+//!    site — and there is no strike anywhere in this module, so the
+//!    strike-based error is not merely wrong but unwritable.
 //! 2. **Stamp duty is buy-side only.** Charging both legs doubles it. The rate
 //!    is fetched through [`crate::rate::stamp_duty`], which takes an
 //!    [`OrderSide`] and returns zero for a sell, so "which leg" is a value the
@@ -1485,6 +1487,66 @@ mod tests {
         assert_eq!(once.raw(), 9_00);
         assert_eq!(twice, 10_00);
         assert_eq!(twice - once.raw(), 1_00, "exactly one rupee, every trade");
+    }
+
+    #[test]
+    fn the_gst_base_is_the_sum_of_all_four_service_components_with_a_plus_sign() {
+        // The shipped SEBI fee is two paisa on a real trade, so a sign error on
+        // it inside the GST base is invisible behind the rupee ceiling: every
+        // worked example still comes out right. It only shows when the fee is
+        // large, so it is made large here, at a rate only this crate can mint.
+        // (Found by mutation testing: `+ sebi` mutated to `- sebi` survived
+        // every golden example.)
+        let loud_sebi = Rates::with_all(
+            Broker::Groww,
+            BpsX100::new(15_000),
+            NSE_EXCHANGE_CHARGE,
+            ipft(Exchange::Nse),
+            BpsX100::new(100_000),
+            stamp_duty(OrderSide::Buy),
+            GST_ON_FEE_BASE,
+        );
+        let charges = charge_stack(
+            flat_fills(100_00, 120_00, Direction::Long),
+            65,
+            Direction::Long,
+            &loud_sebi,
+        )
+        .expect("in range");
+
+        assert_eq!(charges.brokerage().raw(), 40_00);
+        assert_eq!(charges.exchange().raw(), 5_02);
+        assert_eq!(charges.sebi().raw(), 143_01);
+        assert_eq!(charges.ipft().raw(), 8);
+
+        // The base is the four of them added, and the GST is one rounding of it.
+        let base = Paisa::from_raw(40_00 + 5_02 + 143_01 + 8);
+        assert_eq!(base.raw(), 188_11);
+        assert_eq!(
+            charges.gst(),
+            statutory_levy(base, GST_ON_FEE_BASE).expect("in range")
+        );
+        assert_eq!(charges.gst().raw(), 34_00);
+
+        // With the fee's sign flipped the base would be negative and the GST
+        // would be a credit. It is not.
+        let flipped = statutory_levy(Paisa::from_raw(188_11 - 2 * 143_01), GST_ON_FEE_BASE)
+            .expect("in range");
+        assert_eq!(flipped.raw(), -17_00);
+        assert_ne!(
+            charges.gst(),
+            flipped,
+            "the fee must enter the base as a plus"
+        );
+
+        // And the tax and the stamp duty are still OUT of the base: adding
+        // either would move the answer at this magnitude.
+        assert_eq!(charges.stt().raw(), 12_00);
+        assert_eq!(charges.stamp().raw(), 1_00);
+        let with_taxes = statutory_levy(Paisa::from_raw(188_11 + 12_00 + 1_00), GST_ON_FEE_BASE)
+            .expect("in range");
+        assert_ne!(charges.gst(), with_taxes, "taxes are not services");
+        assert_eq!(charges.total_charges().raw(), 235_11);
     }
 
     #[test]

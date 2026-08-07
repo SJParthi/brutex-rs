@@ -5058,3 +5058,136 @@ fn every_row_is_either_a_bar_or_a_counted_drop() {
         "the out-of-session ones were counted"
     );
 }
+
+// ─────────────── the vendor CSV decoder, against real shapes ───────────────
+
+/// `TrueData`'s index layout, verbatim from the operator's 2022 archive.
+#[test]
+fn truedata_index_rows_decode_to_paisa_and_utc() {
+    use pull::csv::{Columns, decode};
+
+    // Copied byte-for-byte from NSE_IDX_TICK_20221003.zip -> BANKNIFTY.csv.
+    let body = "20221003,09:07:41,38444.90,0,0\n\
+                20221003,09:15:01,38445.65,0,0\n\
+                20221003,15:31:42,38029.65,0,0\n";
+    let rows = decode(body, Columns::TrueDataIndex).expect("the real shape");
+    assert_eq!(rows.len(), 3, "five fields, no header, three data rows");
+
+    assert_eq!(
+        rows.first().map(|r| r.close),
+        Some(3_844_490),
+        "38444.90 rupees is 3,844,490 paisa — exact, never a float"
+    );
+    assert!(
+        rows.windows(2).all(|w| w[0].timestamp < w[1].timestamp),
+        "09:07:41 < 09:15:01 < 15:31:42 after the IST-to-UTC conversion"
+    );
+    // 09:07:41 is PRE-OPEN and 15:31:42 is POST-CLOSE. The decoder keeps both;
+    // deciding is the session filter's job, and it counts them by reason.
+    assert_eq!(
+        rows.last()
+            .map(|r| r.timestamp)
+            .zip(rows.first().map(|r| r.timestamp)),
+        Some((rows[2].timestamp, rows[0].timestamp)),
+        "the decoder judges nothing — it decodes"
+    );
+}
+
+/// GDFL's layout, and the date trap that would shift every bar by months.
+#[test]
+fn gdfl_dates_are_day_first_and_the_header_is_skipped() {
+    use pull::csv::{Columns, decode};
+    use pull::session::IstMoment;
+
+    // Verbatim from GFDLNFO_TICK_01072025/Futures/-III/FINNIFTY-III.NFO.csv.
+    let body = "Ticker,Date,Time,LTP,BuyPrice,BuyQty,SellPrice,SellQty,LTQ,OpenInterest\n\
+                FINNIFTY-III.NFO,01/07/2025,09:16:16,27674,0,0,0,0,65,65\n";
+    let rows = decode(body, Columns::Gdfl).expect("the real shape");
+    assert_eq!(rows.len(), 1, "the header row is skipped, not decoded");
+
+    let at = IstMoment::from_epoch_secs(rows[0].timestamp).expect("a real instant");
+    assert_eq!(
+        (at.day().year(), at.day().month(), at.day().day()),
+        (2025, 7, 1),
+        "01/07/2025 is 1 JULY, not 7 January — reading it the other way shifts \
+         every bar by months and produces a file that is internally consistent \
+         and completely wrong"
+    );
+    assert_eq!(at.minute_of_day(), 9 * 60 + 16, "09:16 IST");
+    assert_eq!(rows[0].close, 2_767_400, "27674 rupees in paisa");
+}
+
+/// One vendor, two segments, two column counts — the shape that breaks a
+/// per-vendor layout.
+#[test]
+fn the_same_vendor_emits_different_column_counts_per_segment() {
+    use pull::csv::{Columns, decode};
+
+    let index_row = "20221003,09:15:01,38445.65,0,0";
+    let futures_row = "20221003,09:15:01,38445.65,0,0,0,0,0,0";
+
+    assert_eq!(Columns::TrueDataIndex.count(), 5);
+    assert_eq!(Columns::TrueDataFutures.count(), 9);
+
+    assert!(decode(index_row, Columns::TrueDataIndex).is_ok());
+    assert!(decode(futures_row, Columns::TrueDataFutures).is_ok());
+
+    // Crossed shapes must REFUSE, never silently read a price as a volume.
+    let wrong =
+        decode(index_row, Columns::TrueDataFutures).expect_err("five fields cannot be nine");
+    assert!(
+        wrong.to_string().contains("5 fields, expected 9"),
+        "named by count so the operator sees which layout was assumed — got {wrong}"
+    );
+    assert!(decode(futures_row, Columns::TrueDataIndex).is_err());
+}
+
+/// The 12,145 ghosts that would be parsed as CSVs.
+#[test]
+fn macosx_ghosts_are_not_data() {
+    use pull::csv::is_ghost;
+
+    assert!(is_ghost(
+        "__MACOSX/GFDLNFO_TICK_01072025/Options/._NIFTY.NFO.csv"
+    ));
+    assert!(is_ghost("GFDLNFO_TICK_01072025/Options/._NIFTY.NFO.csv"));
+    assert!(is_ghost("GFDLNFO_TICK_01072025/.DS_Store"));
+    assert!(!is_ghost(
+        "GFDLNFO_TICK_01072025/Options/NIFTY25SEP2525700PE.NFO.csv"
+    ));
+    assert!(
+        !is_ghost("NSE_IDX_TICK_20221003.zip"),
+        "a real nested archive is not a ghost"
+    );
+}
+
+/// Every way a line can be wrong refuses the whole file, by name.
+#[test]
+fn a_malformed_line_refuses_the_file_rather_than_the_line() {
+    use pull::csv::{Columns, decode};
+
+    let cases: [(&str, &str); 5] = [
+        ("20221003,09:15:01,38445.65,0", "4 fields"),
+        (
+            "2022-10-03,09:15:01,38445.65,0,0",
+            "a dashed date in a compact field",
+        ),
+        ("20221003,9:15:01,38445.65,0,0", "a one-digit hour"),
+        ("20221003,25:00:00,38445.65,0,0", "hour 25"),
+        ("20221003,09:15:01,38445.657,0,0", "a third decimal place"),
+    ];
+    for (line, why) in cases {
+        assert!(
+            decode(line, Columns::TrueDataIndex).is_err(),
+            "{why} must refuse — a file missing an arbitrary subset of its rows \
+             is not a shorter file, it is a wrong one"
+        );
+    }
+
+    // CRLF is tolerated: `lines()` strips \n and leaves \r, which would turn
+    // the last field into a number that does not parse.
+    assert!(
+        decode("20221003,09:15:01,38445.65,0,0\r\n", Columns::TrueDataIndex).is_ok(),
+        "a Windows line ending is a file property, not a data fault"
+    );
+}
