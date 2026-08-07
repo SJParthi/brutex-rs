@@ -319,9 +319,30 @@ pub fn picker(name: &str, id: &str, form: &str, max: Day) -> String {
     // What a radio cannot do is untick itself, so the panel carries an explicit
     // `Close` in its footer pointing at the group's resting member — see
     // [`shut`]. The group posts `cal=` and no reader looks for that key.
+    // THE SCRIM IS WHY CLICKING ANYWHERE ELSE NOW CLOSES THE PANEL.
+    //
+    // The panel was shown by exactly one rule — `.popopen:checked~.cal` — and
+    // nothing outside the panel pointed at the group's resting member, so the
+    // only way out was the `Close` label in the footer. Measured in a browser:
+    // after choosing a day, clicking the page body left `display:block`, and so
+    // did Escape. That is the operator's "after selecting it is not going away
+    // looks like stuck", exactly.
+    //
+    // A full-viewport label pointing at the resting member turns any click
+    // outside the panel into a click on `Close`. It sits BEFORE the panel in
+    // source order and below it in z-index, so the panel keeps its own clicks.
+    //
+    // WHAT THIS STILL DOES NOT DO, said plainly rather than left to be
+    // discovered: it does not close when the DAY itself is clicked. A `<label>`
+    // drives exactly one control, and `:has()` state is monotonic — once
+    // `.d6:checked` is true it stays true, so no selector can tell "a day was
+    // chosen just now" from "a day was chosen a minute ago". Closing on the day
+    // click is not expressible in CSS at all. One click outside, or `Close`,
+    // is the whole of what a script-free picker can offer.
     let _ = write!(
         out,
         "<input type=\"radio\" name=\"cal\" id=\"o-{id}\" value=\"\" class=\"popopen\">\
+         <label class=\"scrim\" for=\"{form}-calshut\" aria-hidden=\"true\"></label>\
          <label class=\"readout\" for=\"o-{id}\">\
          <span class=\"v-ph\">Pick a date</span>\
          <span class=\"v-d\"></span><span class=\"v-m\"></span><span class=\"v-y\"></span>\
@@ -340,7 +361,8 @@ pub fn picker(name: &str, id: &str, form: &str, max: Day) -> String {
     let _ = write!(
         out,
         "<input type=\"radio\" name=\"{name}_y\" id=\"{id}y0\" value=\"\" class=\"yr-x\">\
-         <input type=\"radio\" name=\"{name}_m\" id=\"{id}m0\" value=\"\" class=\"mo-x\">"
+         <input type=\"radio\" name=\"{name}_m\" id=\"{id}m0\" value=\"\" class=\"mo-x\">\
+         <input type=\"radio\" name=\"{name}_d\" id=\"{id}d0\" value=\"\" class=\"dy-x\">"
     );
 
     out.push_str("<div class=\"cal\">");
@@ -408,8 +430,12 @@ pub fn picker(name: &str, id: &str, form: &str, max: Day) -> String {
     let _ = write!(
         out,
         "<p class=\"calnote\">Latest that can be asked for: <b>{max}</b>. \
-         Days that do not exist in the month you picked grey out — there is no \
-         31 February here and no 29 February outside a leap year. \
+         Days that do not exist in the month you picked grey out and cannot be \
+         clicked. A day already chosen in a longer month survives a step back — \
+         pick 31, then February, and the field reads a day that is not there. \
+         <b>Clear</b> is the way out, and the server refuses the date either \
+         way. \
+         <label class=\"shut\" for=\"{id}d0\">Clear</label> \
          <label class=\"shut\" for=\"{form}-calshut\">Close</label></p>"
     );
     out.push_str("</div></div>");
@@ -606,13 +632,13 @@ pub fn dynamic_css(caps: &[Day]) -> String {
 pub const CAL_STYLE: &str = "\
 .pick{position:relative;display:block}\
 .pick input,.popshut{position:absolute;opacity:0;width:0;height:0;pointer-events:none}\
-.readout{display:flex;align-items:center;gap:6px;cursor:pointer;user-select:none;\
+.readout{display:flex;align-items:center;gap:6px;cursor:pointer;user-select:none;white-space:nowrap;overflow:hidden;\
 font:inherit;font-variant-numeric:tabular-nums;padding:10px 13px;border:1px solid var(--line);\
 border-radius:11px;background:var(--panel);color:var(--ink);box-shadow:var(--sh);\
 transition:border-color .2s,box-shadow .2s,transform .2s}\
 .readout:hover{border-color:var(--acc);transform:translateY(-1px)}\
 .pick .v-ph{color:var(--dim)}\
-.pick:has(.yr-in:checked):has(.mo-in:checked):has(.dy-in:checked) .v-ph{display:none}\
+.pick:has(.yr-in:checked) .v-ph{display:none}\
 .pick .v-ico{margin-left:auto;color:var(--acc);font-size:15px}\
 .pick .v-d,.pick .v-m,.pick .v-y{font-weight:700}\
 .popopen:checked~.readout{border-color:var(--acc);\
@@ -623,6 +649,8 @@ box-shadow:0 0 0 4px color-mix(in srgb,var(--acc) 18%,transparent)}\
 width:100%;min-width:min(254px,100%);max-width:330px;\
 background:var(--panel);border:1px solid var(--line);border-radius:15px;padding:12px;\
 box-shadow:0 18px 48px rgba(16,24,40,.18),var(--sh)}\
+.scrim{display:none}\
+.popopen:checked~.scrim{display:block;position:fixed;inset:0;z-index:39;cursor:default}\
 .popopen:checked~.cal{display:block;animation:calin .22s cubic-bezier(.2,.8,.2,1) both}\
 @keyframes calin{from{opacity:0;transform:translateY(-6px) scale(.98)}}\
 .cal .pane{display:none}\
@@ -902,13 +930,45 @@ mod tests {
     }
 
     /// The three radio groups the form actually posts, at their full counts.
+    ///
+    /// **Every group has a resting member, and the day group did not.** Year and
+    /// month each carried an empty-valued radio from the start, so stepping back
+    /// clears them. The day group carried 31 real values and nothing else, and
+    /// CSS cannot uncheck a radio — so a day chosen in a 31-day month survived a
+    /// step back into February and the field read `31 Feb '26`, with the cell
+    /// struck out and highlighted-as-selected at once and `pointer-events:none`
+    /// so it could not even be clicked away.
+    ///
+    /// Nothing was ever corrupted: `Day::new` refuses `2026-02-31` as
+    /// `Refusal::DateImpossible`. The defect was that the operator was shown a
+    /// date that does not exist and given no way out. `{id}d0` is that way out.
     #[test]
-    fn the_picker_posts_three_groups_and_fifty_seven_controls() {
+    fn every_group_in_the_picker_has_a_resting_member() {
         let html = built();
         // 2015..=2026 is twelve years, plus the empty one.
         assert_eq!(html.matches("name=\"from_y\"").count(), 13);
         assert_eq!(html.matches("name=\"from_m\"").count(), 13);
-        assert_eq!(html.matches("name=\"from_d\"").count(), 31);
+        // Thirty-one days, plus the empty one that `Clear` points at.
+        assert_eq!(html.matches("name=\"from_d\"").count(), 32);
+
+        // The resting member of each group is empty-valued, so posting it names
+        // no day rather than naming a wrong one.
+        for (group, id) in [
+            ("from_y", "sfromy0"),
+            ("from_m", "sfromm0"),
+            ("from_d", "sfromd0"),
+        ] {
+            assert!(
+                html.contains(&format!("name=\"{group}\" id=\"{id}\" value=\"\"")),
+                "{group} needs an empty-valued resting member: {html}"
+            );
+        }
+        // And it is reachable: a label points at the day's.
+        assert!(
+            html.contains("for=\"sfromd0\">Clear</label>"),
+            "the day group's resting member needs a control, or it cannot be \
+             reached and the group is still one-way: {html}"
+        );
     }
 
     /// Alignment, impossible days, and both halves of the ceiling.
