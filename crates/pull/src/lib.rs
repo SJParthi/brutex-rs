@@ -78,6 +78,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod archive;
 pub mod config;
 pub mod csv;
 pub mod fetch;

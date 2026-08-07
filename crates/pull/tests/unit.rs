@@ -5191,3 +5191,104 @@ fn a_malformed_line_refuses_the_file_rather_than_the_line() {
         "a Windows line ending is a file property, not a data fault"
     );
 }
+
+// ─────────────────────── the local-archive transport ───────────────────────
+
+/// Ghosts are skipped at the walk, before anything is opened.
+#[test]
+fn the_walk_skips_ghosts_and_decodes_the_rest() {
+    use pull::archive::{read_dir, total_rows};
+    use pull::csv::Columns;
+
+    let dir =
+        std::env::temp_dir().join(format!("brutex-archive-{}-{}", std::process::id(), line!()));
+    std::fs::create_dir_all(&dir).expect("a scratch dir");
+
+    // Two real members, one AppleDouble ghost that ENDS IN .csv and is binary,
+    // and one file that is not a CSV at all.
+    std::fs::write(
+        dir.join("NIFTY-I.NFO.csv"),
+        "Ticker,Date,Time,LTP,BuyPrice,BuyQty,SellPrice,SellQty,LTQ,OpenInterest\n\
+         NIFTY-I.NFO,01/07/2025,09:16:16,27674,0,0,0,0,65,65\n",
+    )
+    .expect("write");
+    std::fs::write(
+        dir.join("BANKNIFTY-I.NFO.csv"),
+        "Ticker,Date,Time,LTP,BuyPrice,BuyQty,SellPrice,SellQty,LTQ,OpenInterest\n\
+         BANKNIFTY-I.NFO,01/07/2025,09:16:17,55000.50,0,0,0,0,1,1\n",
+    )
+    .expect("write");
+    // The hazard: binary, and named `.csv`.
+    std::fs::write(dir.join("._NIFTY-I.NFO.csv"), [0x00u8, 0x05, 0x16, 0x07]).expect("write");
+    std::fs::write(dir.join("README.txt"), "not data").expect("write");
+
+    let members = read_dir(&dir, Columns::Gdfl).expect("the ghost is skipped, not parsed");
+    assert_eq!(
+        members.len(),
+        2,
+        "two real members — the AppleDouble stub would have failed as UTF-8 if \
+         it had been opened, and 12,145 of them sit in the operator's GDFL zip"
+    );
+    assert_eq!(total_rows(&members), 2);
+    assert_eq!(
+        members
+            .iter()
+            .map(|m| m.instrument.as_str())
+            .collect::<Vec<_>>(),
+        ["BANKNIFTY-I", "NIFTY-I"],
+        "sorted by path so an import is reproducible — filesystem order differs \
+         between machines and CLAUDE.md §3 rule 5 requires same in, same out"
+    );
+    assert_eq!(
+        members
+            .first()
+            .and_then(|m| m.rows.first())
+            .map(|r| r.close),
+        Some(5_500_050),
+        "55000.50 rupees is 5,500,050 paisa"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A malformed member refuses the whole walk.
+#[test]
+fn one_bad_member_refuses_the_whole_walk() {
+    use pull::archive::{ArchiveError, read_dir};
+    use pull::csv::Columns;
+
+    let dir =
+        std::env::temp_dir().join(format!("brutex-archive-{}-{}", std::process::id(), line!()));
+    std::fs::create_dir_all(&dir).expect("a scratch dir");
+    std::fs::write(dir.join("GOOD.csv"), "20221003,09:15:01,38445.65,0,0\n").expect("write");
+    std::fs::write(dir.join("BAD.csv"), "20221003,09:15:01,38445.65\n").expect("write");
+
+    let why = read_dir(&dir, Columns::TrueDataIndex).expect_err("three fields is not five");
+    assert!(
+        matches!(why, ArchiveError::MemberMalformed { .. }),
+        "named by member and line — a directory that yielded SOME of its \
+         contracts is not a smaller import, it is one nobody can characterise \
+         afterwards. Got {why:?}"
+    );
+    assert!(
+        why.to_string().contains("BAD.csv"),
+        "the message names the file"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A path that is not a directory refuses by name.
+#[test]
+fn a_missing_directory_refuses_rather_than_yielding_nothing() {
+    use pull::archive::{ArchiveError, read_dir};
+    use pull::csv::Columns;
+
+    let nowhere = std::env::temp_dir().join("brutex-no-such-dir-ever");
+    let why = read_dir(&nowhere, Columns::Gdfl).expect_err("it does not exist");
+    assert!(
+        matches!(why, ArchiveError::NotADirectory { .. }),
+        "an absent folder is a refusal, never an empty successful import — the \
+         two look identical downstream and only one of them is true"
+    );
+}
