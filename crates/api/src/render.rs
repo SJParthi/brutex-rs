@@ -29,10 +29,16 @@
 //! shows what a person can read; the other 90,000 instruments cost nothing
 //! because they are never touched.
 
+use crate::census::{Coverage, VendorCensus};
+use crate::ingest::{Series, SpotTarget};
 use brutex_core::instrument::{InstrumentKey, Kind};
 use brutex_core::isin::Isin;
 use brutex_core::universe::Universe;
 use brutex_core::vendor::{Vendor, VendorSet};
+use pull::session::{
+    BARS_PER_REGULAR_SESSION, Day, DropCensus, DropReason, SESSION_CLOSE_MINUTE,
+    SESSION_OPEN_MINUTE, Window,
+};
 use std::fmt::Write as _;
 
 /// The stylesheet, inlined so the page is a single response.
@@ -181,6 +187,52 @@ box-shadow:var(--sh);animation:rise .5s both;transition:transform .22s,box-shado
 .card.loud .cv{color:var(--bad)}\
 .cn{font-size:11.5px;color:var(--dim)}\
 footer{margin:22px auto 0;max-width:1180px;padding:0 20px;color:var(--dim);font-size:12.5px;line-height:1.9}\
+.wrap{max-width:1180px;margin:0 auto 20px;padding:0 20px}\
+.duo{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:16px;\
+max-width:1180px;margin:0 auto 20px;padding:0 20px;align-items:start}\
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:20px;\
+box-shadow:var(--sh);animation:rise .5s both;transition:transform .22s,box-shadow .22s}\
+.panel:hover{transform:translateY(-3px);box-shadow:0 14px 34px rgba(16,24,40,.15)}\
+.panel h2{font-size:17px;font-weight:830;letter-spacing:-.5px;margin:0 0 3px;\
+display:flex;align-items:center;gap:9px}\
+.panel h2 .dot{background:var(--acc)}\
+.panel .lead{color:var(--dim);font-size:13px;margin:0 0 15px;line-height:1.5}\
+form.pull{display:block;max-width:none;margin:0;padding:0}\
+.field{margin:0 0 12px}\
+.field>span{display:block;font-size:10.5px;font-weight:790;letter-spacing:.85px;\
+text-transform:uppercase;color:var(--dim);margin:0 0 5px}\
+.field input,.field select{font:inherit;width:100%;padding:10px 13px;border:1px solid var(--line);\
+border-radius:11px;background:var(--bg);color:var(--ink);\
+transition:border-color .2s,box-shadow .2s}\
+.field input:focus,.field select:focus{outline:0;border-color:var(--acc);\
+box-shadow:0 0 0 4px color-mix(in srgb,var(--acc) 18%,transparent)}\
+.pair{display:grid;grid-template-columns:1fr 1fr;gap:11px}\
+.fine{color:var(--dim);font-size:11.5px;line-height:1.65;margin:12px 0 0;\
+border-top:1px dashed var(--line);padding-top:11px}\
+.fine b{color:var(--warn);font-weight:800}\
+.fine code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;\
+background:color-mix(in srgb,var(--acc) 10%,transparent);padding:1px 5px;border-radius:5px}\
+.halt{padding:15px 18px;border-radius:14px;font-size:13.5px;line-height:1.6;\
+background:color-mix(in srgb,var(--bad) 10%,var(--panel));\
+border:1px solid color-mix(in srgb,var(--bad) 42%,transparent);color:var(--bad);\
+animation:rise .5s both}\
+.halt b{display:block;font-size:11px;letter-spacing:1.2px;text-transform:uppercase;\
+margin-bottom:5px;font-weight:850}\
+.halt.good{background:color-mix(in srgb,var(--ok) 10%,var(--panel));\
+border-color:color-mix(in srgb,var(--ok) 42%,transparent);color:var(--ok)}\
+.kv{width:100%;font-size:13.5px}\
+.kv th{text-align:left;color:var(--dim);font-weight:700;width:15rem;\
+padding:9px 0;border-bottom:1px solid var(--line);white-space:nowrap}\
+.kv td{padding:9px 0;border-bottom:1px solid var(--line);\
+font-variant-numeric:tabular-nums}\
+.meters{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:13px;margin:4px 0 0}\
+.meter{background:var(--bg);border:1px solid var(--line);border-radius:13px;padding:14px}\
+.meter .ck{font-size:10.5px;font-weight:770;letter-spacing:.9px;text-transform:uppercase;color:var(--dim)}\
+.meter .cv{font-size:25px;font-weight:850;letter-spacing:-1.2px;margin:5px 0 4px;\
+font-variant-numeric:tabular-nums}\
+.meter.none .cv{color:var(--dim)}\
+.hscroll{overflow-x:auto;max-width:1180px;margin:0 auto;padding:0 20px}\
+td.miss{color:var(--dim)}\
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}";
 
 /// Words that make a note a failure rather than a tally.
@@ -411,10 +463,12 @@ fn filter_pills(view: &View<'_>) -> String {
 
 /// How many instruments each universe holds, over the WHOLE tracked set.
 ///
-/// Counted by the caller from the merged map, never from the rendered page: a
-/// pill whose number counts only the 200 rows on screen says 52 when the answer
-/// is 208, and looks authoritative doing it.
-#[derive(Debug, Clone, Copy, Default)]
+/// Counted **once at load** by [`crate::catalog::Catalog`], never from the
+/// rendered page and never per request: a pill whose number counts only the 200
+/// rows on screen says 52 when the answer is 208, and looks authoritative doing
+/// it — and a pill that re-counts the whole universe on every request is the
+/// D-0042 defect.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct UniverseCounts {
     /// Every tracked instrument.
     pub all: usize,
@@ -583,6 +637,10 @@ fn clamp(note: &str) -> String {
 /// a nav that links to a page which does not answer is worse. These are
 /// rendered as disabled with the reason, so the shape of the system is visible
 /// and nothing lies about being ready.
+///
+/// `/pull` and `/store` moved from disabled to real in D-0038 and now answer.
+/// `/runs` has not: there is no sweep yet, so it stays a `lnk off`, which is
+/// what keeps this rule a rule rather than a phase the nav passed through.
 fn nav(current: &str) -> String {
     let mut out = String::with_capacity(512);
     out.push_str("<nav class=\"top\"><div class=\"inner\">");
@@ -590,8 +648,8 @@ fn nav(current: &str) -> String {
     for (href, label, built) in [
         ("/", "Dashboard", true),
         ("/instruments", "Instruments", true),
-        ("/pull", "Ingest", false),
-        ("/store", "Store", false),
+        ("/pull", "Ingest", true),
+        ("/store", "Store", true),
         ("/runs", "Runs", false),
     ] {
         let on = if href == current { " on" } else { "" };
@@ -851,6 +909,587 @@ pub fn instruments_page(view: &View<'_>) -> String {
     body
 }
 
+// ===========================================================================
+// The ingest and store pages. D-0038.
+//
+// One design language, not two: the shell, the gradient hero, the animated
+// cards and the loud-note rules above are reused verbatim. A second visual
+// vocabulary on a second page is how an operator learns to read one screen and
+// then has to relearn the next.
+// ===========================================================================
+
+/// Everything before the first section: head, stylesheet, body, nav.
+///
+/// Extracted because three pages now open identically, and three copies of a
+/// `<head>` is three places for a `<meta viewport>` to go missing from one.
+fn open(title: &str, current: &str) -> String {
+    let mut out = String::with_capacity(STYLE.len() + 512);
+    out.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">");
+    out.push_str("<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">");
+    out.push_str("<title>");
+    out.push_str(&escape(title));
+    out.push_str("</title><style>");
+    out.push_str(STYLE);
+    out.push_str("</style></head><body>");
+    out.push_str(&nav(current));
+    out
+}
+
+/// The footer every page carries, and the closing tags.
+const FOOT: &str = "<footer>Rendered on the server. No JavaScript — \
+     CLAUDE.md section 2 does not permit it, and CI gate 1 enforces that.\
+     </footer></body></html>";
+
+/// The gradient hero, with the eyebrow, heading, lede and status badge.
+///
+/// `heading` is raw HTML because every caller needs a `<br>` and a
+/// non-breaking hyphen in it; everything else is escaped.
+fn hero(eyebrow: &str, heading: &str, lede: &str, good: bool, badge: &str) -> String {
+    let mut out = String::with_capacity(768);
+    let _ = write!(
+        out,
+        "<header class=\"hero\"><div class=\"hw\">\
+         <div class=\"eyebrow\"><span class=\"dot\"></span>{}</div>\
+         <h1>{heading}</h1><p class=\"lede\">{}</p>\
+         <span class=\"badge {}\">{}</span></div></header>",
+        escape(eyebrow),
+        escape(lede),
+        if good { "good" } else { "bad" },
+        escape(badge),
+    );
+    out
+}
+
+/// A loud block naming something an operator must not miss.
+fn halt_block(title: &str, body: &str) -> String {
+    format!(
+        "<section class=\"wrap\"><div class=\"halt\"><b>{}</b>{}</div></section>",
+        escape(title),
+        escape(body)
+    )
+}
+
+/// The collapsible note list, identical on every page that has one.
+fn notes_block(notes: &[String]) -> String {
+    let loud_count = notes
+        .iter()
+        .filter(|n| LOUD.iter().any(|w| n.contains(w)))
+        .count();
+    let mut out = String::with_capacity(256 + notes.len() * 96);
+    let _ = write!(
+        out,
+        "<details class=\"notes\"><summary>{} note{} · <b>{loud_count}</b> needing attention</summary><ul>",
+        notes.len(),
+        if notes.len() == 1 { "" } else { "s" },
+    );
+    for note in notes {
+        let loud = if LOUD.iter().any(|w| note.contains(w)) {
+            " class=\"loud\""
+        } else {
+            ""
+        };
+        let _ = write!(out, "<li{loud}>{}</li>", escape(&clamp(note)));
+    }
+    out.push_str("</ul></details>");
+    out
+}
+
+/// A number, or an em dash when there is no number to show.
+///
+/// **A dash is not a zero.** "Nothing was dropped" and "nothing measured this"
+/// are different facts, and rendering the second as `0` is exactly the silent
+/// degradation `CLAUDE.md` §4 forbids.
+fn count_cell(n: Option<u64>) -> String {
+    n.map_or_else(|| "—".to_owned(), |v| v.to_string())
+}
+
+/// `HH:MM` from minutes since midnight. Integer division; no float anywhere.
+fn hhmm(minute_of_day: u32) -> String {
+    format!("{:02}:{:02}", minute_of_day / 60, minute_of_day % 60)
+}
+
+/// The day before `day`, or `day` itself at the start of the epoch.
+///
+/// The expiry input's `max`: an operator cannot even offer a contract that has
+/// not expired. The server refuses one anyway — see [`crate::ingest::parse_fno`]
+/// — because an attribute is a courtesy and a parser is a rule.
+fn yesterday(day: Day) -> Day {
+    day.days_from_epoch()
+        .checked_sub(1)
+        .and_then(|d| Day::from_days(d).ok())
+        .unwrap_or(day)
+}
+
+/// One labelled form control.
+fn field(label: &str, control: &str) -> String {
+    format!(
+        "<label class=\"field\"><span>{}</span>{control}</label>",
+        escape(label)
+    )
+}
+
+/// A `YYYY-MM-DD` input, capped at `max`.
+fn date_input(name: &str, max: Day) -> String {
+    format!(
+        "<input type=\"date\" name=\"{}\" max=\"{max}\" required>",
+        escape(name)
+    )
+}
+
+/// A live capture, as the page shows it.
+///
+/// Held rather than invented: the census is
+/// [`pull::session::DropCensus`] itself, so every reason the page names is a
+/// reason the filter actually counts, and adding a fifth there adds it here.
+#[derive(Debug, Clone, Copy)]
+pub struct Capture<'a> {
+    /// What is being fetched, in one line.
+    pub what: &'a str,
+    /// The operator's inclusive window.
+    pub window: Window,
+    /// Bars the vendor returned.
+    pub fetched: u64,
+    /// Bars that landed in the store.
+    pub stored: u64,
+    /// What was dropped, and why.
+    pub census: DropCensus,
+}
+
+/// Everything one rendering of the ingest page needs.
+#[derive(Debug, Clone, Copy)]
+pub struct PullView<'a> {
+    /// Today in IST: the expiry gate's reference, and the date inputs' ceiling.
+    pub today: Day,
+    /// How many instruments each spot target covers, in [`SpotTarget::ALL`]
+    /// order. Counted from the loaded universe, never guessed.
+    pub targets: &'a [(SpotTarget, usize)],
+    /// The capture in flight. `None` renders every counter as `—`.
+    pub capture: Option<Capture<'a>>,
+    /// Why nothing can be captured, when nothing can be.
+    ///
+    /// `Some` puts a loud block at the top of the page and is the reason every
+    /// counter below reads `—`. `CLAUDE.md` §4: degrade loudly and name the
+    /// reason — never a progress bar over a process that does not exist.
+    pub halt: Option<&'a str>,
+    /// Everything an operator has to be told.
+    pub notes: &'a [String],
+}
+
+/// The two forms. Split out of [`pull_page`] to stay under clippy's 100-line
+/// ceiling; the split is a lint, not a design.
+fn pull_forms(view: &PullView<'_>) -> String {
+    let today = view.today;
+    let mut out = String::with_capacity(4096);
+    out.push_str("<section class=\"duo\">");
+
+    // ---- SPOT ------------------------------------------------------------
+    out.push_str(
+        "<div class=\"panel\"><h2><span class=\"dot\"></span>Spot</h2>\
+         <p class=\"lead\">Index and cash series, one-minute bars. \
+         NSE only — there is no BSE and no MCX on this surface.</p>\
+         <form class=\"pull\" method=\"post\" action=\"/pull/spot\">",
+    );
+    let mut options = String::with_capacity(512);
+    for &(target, members) in view.targets {
+        let _ = write!(
+            options,
+            "<option value=\"{}\">{} · {members} instrument(s) — {}</option>",
+            escape(target.slug()),
+            escape(target.label()),
+            escape(target.note()),
+        );
+    }
+    out.push_str(&field(
+        "Target",
+        &format!("<select name=\"target\" required>{options}</select>"),
+    ));
+    let _ = write!(
+        out,
+        "<div class=\"pair\">{}{}</div>",
+        field("From (inclusive)", &date_input("from", today)),
+        field("To (inclusive)", &date_input("to", today)),
+    );
+    out.push_str("<button type=\"submit\">Start spot pull</button>");
+    out.push_str("</form>");
+    out.push_str(&pull_fine_print(today));
+    out.push_str("</div>");
+
+    // ---- EXPIRED F&O -----------------------------------------------------
+    out.push_str(
+        "<div class=\"panel\"><h2><span class=\"dot\"></span>Expired F&amp;O</h2>\
+         <p class=\"lead\">Futures and option chains on series that have \
+         already expired. These are stored and never swept.</p>\
+         <form class=\"pull\" method=\"post\" action=\"/pull/fno\">",
+    );
+    out.push_str(&field(
+        "Underlying",
+        "<input type=\"text\" name=\"underlying\" placeholder=\"NIFTY, BANKNIFTY, RELIANCE…\" required>",
+    ));
+    let mut series = String::with_capacity(128);
+    for s in Series::ALL {
+        let _ = write!(
+            series,
+            "<option value=\"{}\">{}</option>",
+            escape(s.slug()),
+            escape(s.label())
+        );
+    }
+    let expiry_max = yesterday(today);
+    let _ = write!(
+        out,
+        "<div class=\"pair\">{}{}</div>",
+        field(
+            "Series",
+            &format!("<select name=\"series\" required>{series}</select>")
+        ),
+        field("Expiry", &date_input("expiry", expiry_max)),
+    );
+    let _ = write!(
+        out,
+        "<div class=\"pair\">{}{}</div>",
+        field("From (inclusive)", &date_input("from", expiry_max)),
+        field("To (inclusive)", &date_input("to", expiry_max)),
+    );
+    out.push_str("<button type=\"submit\">Start expired-series pull</button>");
+    out.push_str("</form>");
+    let _ = write!(
+        out,
+        "<p class=\"fine\"><b>A LIVE CONTRACT CAN NEVER BE REQUESTED.</b> The \
+         expiry field will not accept a date after <code>{expiry_max}</code>, \
+         and the server refuses one anyway — an attribute is a courtesy, a \
+         parser is a rule. The window may not run past the expiry either: there \
+         are no bars there to fetch.</p>",
+    );
+    out.push_str("</div></section>");
+    out
+}
+
+/// The small print under the spot form: the two corrections an operator would
+/// otherwise have to know about.
+fn pull_fine_print(today: Day) -> String {
+    format!(
+        "<p class=\"fine\">Both dates are <b>inclusive</b>. Dhan's \
+         <code>toDate</code> is <b>not</b> — so what goes on the wire is the day \
+         <em>after</em> the one you pick, and the extra day's bars come back and \
+         are dropped as <code>after the requested window</code>, counted below. \
+         The correction is stated because a correction you cannot see is the kind \
+         this repository forbids.<br>Bars are kept only inside <code>{}</code> to \
+         <code>{}</code> IST, exclusive at the close — {BARS_PER_REGULAR_SESSION} \
+         one-minute bars in a regular session. Nothing after <code>{today}</code> \
+         can be asked for.</p>",
+        hhmm(SESSION_OPEN_MINUTE),
+        hhmm(SESSION_CLOSE_MINUTE),
+    )
+}
+
+/// The capture panel: what landed, and what was dropped, by reason.
+fn capture_panel(capture: Option<Capture<'_>>) -> String {
+    // EVERY REASON THE FILTER COUNTS, NAMED. `DropReason` is `#[non_exhaustive]`
+    // so there is no `ALL` to iterate; the four are listed here and each one's
+    // label comes from `DropReason::label`, so a renamed reason renames itself
+    // on the page rather than drifting from it.
+    const DROPS: [DropReason; 4] = [
+        DropReason::BeforeWindow,
+        DropReason::AfterWindow,
+        DropReason::BeforeSessionOpen,
+        DropReason::AtOrAfterSessionClose,
+    ];
+    let census = capture.map(|c| c.census);
+    let mut out = String::with_capacity(2048);
+    out.push_str(
+        "<section class=\"wrap\"><div class=\"panel\">\
+         <h2><span class=\"dot\"></span>Capture</h2>\
+         <p class=\"lead\">What the vendor returned, what landed, and what was \
+         discarded — with the reason kept all the way to the answer.</p>",
+    );
+
+    out.push_str("<div class=\"meters\">");
+    for (label, value, note) in [
+        (
+            "In flight",
+            capture.map_or_else(|| "—".to_owned(), |c| escape(c.what)),
+            "instrument and window",
+        ),
+        (
+            "Window",
+            capture.map_or_else(|| "—".to_owned(), |c| escape(&c.window.to_string())),
+            "inclusive, both ends",
+        ),
+        (
+            "Bars fetched",
+            count_cell(capture.map(|c| c.fetched)),
+            "returned by the vendor",
+        ),
+        (
+            "Bars stored",
+            count_cell(capture.map(|c| c.stored)),
+            "written to the bar file",
+        ),
+        (
+            "Bars dropped",
+            count_cell(census.map(|c| u64::from(c.total()))),
+            "by the reasons below",
+        ),
+    ] {
+        let cls = if value == "—" { " none" } else { "" };
+        let _ = write!(
+            out,
+            "<div class=\"meter{cls}\"><div class=\"ck\">{}</div>\
+             <div class=\"cv\">{value}</div><div class=\"cn\">{}</div></div>",
+            escape(label),
+            escape(note)
+        );
+    }
+    out.push_str("</div>");
+
+    // The bar widths are INTEGER percentages of the largest drop on the panel.
+    // `clippy::float_arithmetic` is denied workspace-wide (CLAUDE.md §7) and a
+    // progress bar has no business being the first exception.
+    let peak = census.map_or(1, |c| {
+        DROPS.iter().map(|&r| c.of(r)).max().unwrap_or(0).max(1)
+    });
+    out.push_str(
+        "<table><thead><tr><th>Dropped because</th><th>Bars</th><th>Share</th></tr></thead><tbody>",
+    );
+    for reason in DROPS {
+        let n = census.map(|c| c.of(reason));
+        let bar = n.map_or_else(String::new, |v| {
+            format!(
+                "<div class=\"cbar\"><span style=\"width:{}%\"></span></div>",
+                (u64::from(v).saturating_mul(100) / u64::from(peak)).max(3)
+            )
+        });
+        // ONE `class` attribute, not two. This was `class="num"{cls}` with
+        // `cls` supplying a second `class="miss"`, which is malformed HTML: a
+        // browser keeps the first and silently drops the second, so the "not
+        // measured" styling was never applied and nothing on screen said so.
+        let cls = if n.is_none() { " miss" } else { "" };
+        let _ = write!(
+            out,
+            "<tr><td>{}</td><td class=\"num{cls}\">{}</td><td>{bar}</td></tr>",
+            escape(reason.label()),
+            count_cell(n.map(u64::from)),
+        );
+    }
+    out.push_str("</tbody></table></div></section>");
+    out
+}
+
+/// The ingest page: two forms, and an honest account of what is running.
+#[must_use]
+pub fn pull_page(view: &PullView<'_>) -> String {
+    let mut body = open("brutex · ingest", "/pull");
+    body.push_str(&hero(
+        "NSE · SPOT AND EXPIRED F&O · POST ONLY",
+        "Ingest,<br>on the record.",
+        "Two forms, because a spot pull and an expired-series pull do not take \
+         the same fields. Starting one is a POST and only a POST — a crawler, a \
+         refresh or a back button must never fetch a vendor.",
+        view.halt.is_none(),
+        if view.halt.is_none() {
+            "ready"
+        } else {
+            "CAPTURE UNAVAILABLE"
+        },
+    ));
+    if let Some(reason) = view.halt {
+        body.push_str(&halt_block("nothing can be captured yet", reason));
+    }
+    body.push_str(&pull_forms(view));
+    body.push_str(&capture_panel(view.capture));
+    body.push_str(&notes_block(view.notes));
+    body.push_str(FOOT);
+    body
+}
+
+/// What one POST decided.
+#[derive(Debug, Clone)]
+pub struct Receipt<'a> {
+    /// Which form it came from.
+    pub scope: &'a str,
+    /// The one word at the top: what happened.
+    pub verdict: &'a str,
+    /// The loud line: the refusal, or why an accepted request did not run.
+    pub reason: &'a str,
+    /// The request as the server understood it, field by field.
+    ///
+    /// Rendered even for a refusal, because "what you asked for" and "what I
+    /// read" differing is itself the diagnosis.
+    pub facts: &'a [(&'a str, String)],
+}
+
+/// The page one POST answers with.
+///
+/// Never a redirect back to the form: an operator who submits a window and gets
+/// the empty form back has been told nothing, and the browser's own re-POST
+/// warning is the only thing standing between a refresh and a second pull.
+#[must_use]
+pub fn receipt_page(receipt: &Receipt<'_>) -> String {
+    let mut body = open("brutex · ingest · result", "/pull");
+    body.push_str(&hero(
+        "POST · ONE REQUEST · ONE ANSWER",
+        "Asked, read,<br>answered.",
+        "Every field below is what the server understood, not what was typed. \
+         Where the two differ, that is the diagnosis.",
+        false,
+        receipt.verdict,
+    ));
+    body.push_str(&halt_block(receipt.scope, receipt.reason));
+    body.push_str("<section class=\"wrap\"><div class=\"panel\"><table class=\"kv\"><tbody>");
+    for &(label, ref value) in receipt.facts {
+        let _ = write!(
+            body,
+            "<tr><th>{}</th><td>{}</td></tr>",
+            escape(label),
+            escape(value)
+        );
+    }
+    body.push_str("</tbody></table>");
+    body.push_str(
+        "<p class=\"fine\">Nothing here was written to the store. \
+         <a href=\"/pull\">Back to the forms</a>.</p>",
+    );
+    body.push_str("</div></section>");
+    body.push_str(FOOT);
+    body
+}
+
+/// Everything one rendering of the store page needs.
+#[derive(Debug, Clone, Copy)]
+pub struct StoreView<'a> {
+    /// Today in IST: the newest month the coverage grid reaches.
+    pub today: Day,
+    /// One per vendor, in [`Vendor::ALL`] order.
+    pub censuses: &'a [VendorCensus],
+    /// The coverage rows this page shows, already selected by ordinal.
+    pub rows: &'a [Coverage],
+    /// Which page of the grid this is, zero-based.
+    pub page: usize,
+    /// The highest page number that has rows.
+    pub last_page: usize,
+    /// How many rows the whole grid has.
+    pub total: usize,
+    /// Everything an operator has to be told.
+    pub notes: &'a [String],
+}
+
+/// The per-vendor counter cards. One field read each, never a walk.
+fn census_cards(censuses: &[VendorCensus]) -> String {
+    let mut out = String::with_capacity(1024);
+    out.push_str("<section class=\"cards\">");
+    for (i, census) in censuses.iter().enumerate() {
+        let (months, rows, entries) = census
+            .counters()
+            .map_or((None, None, None), |(m, r, e)| (Some(m), Some(r), Some(e)));
+        let cls = if census.is_loud() { " loud" } else { "" };
+        let _ = write!(
+            out,
+            "<div class=\"card{cls}\" style=\"animation-delay:{}ms\">\
+             <div class=\"ck\">{} · months held</div><div class=\"cv\">{}</div>\
+             <div class=\"cn\">{} row(s) across {} committed entr(ies)</div>\
+             <div class=\"cn\">{}</div></div>",
+            i * 60,
+            escape(census.vendor.as_str()),
+            count_cell(months),
+            count_cell(rows),
+            count_cell(entries),
+            escape(&format!("generation {}", count_cell(census.generation()))),
+        );
+    }
+    out.push_str("</section>");
+    out
+}
+
+/// The coverage grid: one row per instrument-month, one hash probe per cell.
+fn coverage_table(view: &StoreView<'_>) -> String {
+    let mut out = String::with_capacity(512 + view.rows.len() * 192);
+    out.push_str("<div class=\"hscroll\"><table><thead><tr>");
+    out.push_str("<th>Instrument</th><th>Month</th><th>Timeframe</th>");
+    for vendor in Vendor::ALL {
+        let _ = write!(out, "<th>{} rows</th>", escape(vendor.as_str()));
+    }
+    out.push_str("</tr></thead><tbody>");
+    for row in view.rows {
+        let cls = if row.is_held() { "swept" } else { "" };
+        let _ = write!(
+            out,
+            "<tr class=\"{cls}\"><td>{}</td><td>{}</td><td>1m</td>",
+            escape(&row.key.to_string()),
+            escape(&row.month.to_string()),
+        );
+        for &(_, n) in &row.rows {
+            let miss = if n.is_none() { " miss" } else { "" };
+            let _ = write!(out, "<td class=\"num{miss}\">{}</td>", count_cell(n));
+        }
+        out.push_str("</tr>");
+    }
+    out.push_str("</tbody></table></div>");
+    out
+}
+
+/// The store page: the counters, then the coverage grid over them.
+#[must_use]
+pub fn store_page(view: &StoreView<'_>) -> String {
+    let loud = view.censuses.iter().any(VendorCensus::is_loud);
+    let mut body = open("brutex · store", "/store");
+    body.push_str(&hero(
+        "LAYER 13 · COUNTERS, NEVER A DIRECTORY WALK",
+        "What is held,<br>without looking.",
+        "Every figure on this page is a field read from one manifest header, and \
+         every cell in the grid is one hash probe. Nothing here lists a \
+         directory — answering \"how many months do I hold\" by walking ~248,000 \
+         files is the cost this layer exists to remove.",
+        !loud,
+        if loud { "DEGRADED" } else { "ok" },
+    ));
+    for census in view.censuses {
+        if census.is_loud() {
+            body.push_str(&halt_block(census.vendor.as_str(), &census.note()));
+        }
+    }
+    body.push_str(&census_cards(view.censuses));
+    let _ = write!(
+        body,
+        "<p class=\"sub\">{} instrument-month(s) in the grid · showing {} · \
+         newest month is {}-{:02}, three years back</p>",
+        view.total,
+        view.rows.len(),
+        view.today.year(),
+        view.today.month(),
+    );
+    body.push_str(&coverage_table(view));
+
+    // PAGING. The grid is instruments × months and both factors are bounded, so
+    // the last page is arithmetic and the rows past this one were never built.
+    if view.last_page > 0 {
+        body.push_str("<nav class=\"pager\">");
+        if view.page > 0 {
+            let _ = write!(
+                body,
+                "<a href=\"/store?page={}\">&larr; previous</a>",
+                view.page - 1
+            );
+        }
+        let _ = write!(
+            body,
+            "<span>page {} of {}</span>",
+            view.page + 1,
+            view.last_page + 1
+        );
+        if view.page < view.last_page {
+            let _ = write!(
+                body,
+                "<a href=\"/store?page={}\">next &rarr;</a>",
+                view.page + 1
+            );
+        }
+        body.push_str("</nav>");
+    }
+    body.push_str(&notes_block(view.notes));
+    body.push_str(FOOT);
+    body
+}
+
 #[cfg(test)]
 #[allow(
     clippy::indexing_slicing,
@@ -1019,6 +1658,123 @@ mod tests {
     }
 
     #[test]
+    fn the_sort_header_marks_the_active_column_and_offers_the_other_direction() {
+        // Found by `cargo mutants` while D-0038 was measuring `render.rs`: the
+        // header link's four decisions — which column is active, which
+        // direction it is in, which direction the link offers next, and which
+        // arrow it draws — were reachable but not distinguished by any
+        // assertion, so `==` could be `!=` and the ▲/▼ arms could be deleted
+        // with the suite green.
+        let r = [row(nifty(), &[Vendor::Groww])];
+        let view = |sort: &'static str, active: &'static str| -> String {
+            instruments_page(&View {
+                title: "t",
+                total: 1,
+                rows: &r,
+                query: "",
+                sort,
+                all: false,
+                counts: UniverseCounts::default(),
+                active,
+                page: 0,
+                last_page: 0,
+                notes: &[],
+            })
+        };
+
+        // Ascending on `symbol`: that header alone is marked ▲, and its own
+        // link offers the descending order.
+        //
+        // The assertions are on the WHOLE header anchor, not on a `sort=`
+        // substring: the universe pills carry the current sort too, so a bare
+        // substring is present whichever direction the header offers.
+        let up = view("symbol", "");
+        assert!(
+            up.contains("sort=-symbol&amp;u=\">Underlying ▲</a>"),
+            "marked ascending, offering descending: {up}"
+        );
+        assert_eq!(up.matches(" ▲").count(), 1, "exactly one column is active");
+        assert_eq!(up.matches(" ▼").count(), 0);
+        // Another column is neither marked nor reversed.
+        assert!(up.contains("sort=isin&amp;u=\">ISIN</a>"), "{up}");
+
+        // Descending on the same column: ▼, and the link offers ascending back.
+        let down = view("-symbol", "");
+        assert!(
+            down.contains("sort=symbol&amp;u=\">Underlying ▼</a>"),
+            "marked descending, offering ascending: {down}"
+        );
+        assert_eq!(down.matches(" ▼").count(), 1);
+        assert_eq!(down.matches(" ▲").count(), 0);
+
+        // A column nobody sorted by is unmarked in both directions, and its
+        // link starts that column ascending.
+        let none = view("", "");
+        assert!(
+            none.contains("sort=symbol&amp;u=\">Underlying</a>"),
+            "{none}"
+        );
+        assert_eq!(none.matches(" ▲").count(), 0, "{none}");
+        assert_eq!(none.matches(" ▼").count(), 0, "{none}");
+
+        // And the universe pill: exactly the selected one is `on`, and it is
+        // the one whose slug matches.
+        let ntm = view("", "ntm");
+        assert_eq!(
+            ntm.matches("\" class=\"on\">").count(),
+            1,
+            "exactly one pill is selected: {ntm}"
+        );
+        assert!(
+            ntm.contains("u=ntm\" class=\"on\">NIFTY Total Market"),
+            "and it is the one that was asked for: {ntm}"
+        );
+        // With nothing selected, "All" carries it — the empty slug is a slug.
+        assert!(none.contains("u=\" class=\"on\">All"), "{none}");
+        assert_eq!(none.matches("\" class=\"on\">").count(), 1);
+    }
+
+    #[test]
+    fn a_bar_is_the_figures_share_of_the_largest_one_on_the_page() {
+        // Found by `cargo mutants` while D-0038 was measuring `render.rs`: with
+        // every figure equal to the peak, `v * 100 / peak` and `v * 100 % peak`
+        // are indistinguishable, so the division could be a modulo or a
+        // multiplication and no assertion would notice. Three different figures
+        // pin the arithmetic.
+        let figures = [
+            Stat {
+                label: "Peak",
+                value: "40",
+                note: "the largest",
+                loud: false,
+            },
+            Stat {
+                label: "Quarter",
+                value: "10",
+                note: "a quarter of it",
+                loud: false,
+            },
+            Stat {
+                label: "None",
+                value: "0",
+                note: "and none at all",
+                loud: false,
+            },
+        ];
+        let html = dashboard_page("ok", &figures, &[]);
+        assert!(html.contains("width:100%"), "the largest fills it: {html}");
+        assert!(html.contains("width:25%"), "10 of 40 is a quarter: {html}");
+        assert!(
+            html.contains("width:3%"),
+            "and zero still draws the floor, so it reads as none rather than \
+             as not rendered: {html}"
+        );
+        assert!(!html.contains("width:0%"), "{html}");
+        // Integer arithmetic all the way: no fraction reaches the attribute.
+        assert!(!html.contains("width:25.0"), "{html}");
+    }
+
+    #[test]
     fn a_note_that_became_a_list_is_clamped_on_a_boundary_it_provides() {
         // Short notes pass through untouched.
         let short = "groww: 2750 kept, 0 unreadable";
@@ -1052,6 +1808,34 @@ mod tests {
         let unbroken = "X".repeat(400);
         let clamped = clamp(&unbroken);
         assert!(clamped.len() < unbroken.len());
+
+        // THE BOUND IS THE FIRST BYTE THAT IS TOO MANY, AND NOT ONE BEFORE.
+        // Found by `cargo mutants` while D-0038 was measuring `render.rs`: with
+        // no note sitting exactly on the limit, `<=` could be `<` and nothing
+        // would notice.
+        let exactly = "Y".repeat(160);
+        assert_eq!(clamp(&exactly), exactly, "160 bytes passes through whole");
+        let one_more = "Y".repeat(161);
+        assert_ne!(clamp(&one_more), one_more, "161 does not");
+
+        // AND THE CUT IS ON A CHARACTER BOUNDARY, NOT A BYTE ONE. `·` is two
+        // bytes, so a note built from it crosses 160 mid-character; adding each
+        // character's own width is what keeps the slice legal. Without a
+        // multi-byte note that addition could be a multiplication, or the slice
+        // could panic, with the suite green — and a vendor note really does
+        // carry `·` between its tallies.
+        let wide = "·".repeat(200);
+        let cut = clamp(&wide);
+        assert!(cut.len() < wide.len(), "it was clamped: {cut}");
+        assert!(cut.starts_with('·'), "and it still starts with one: {cut}");
+        // The head is the whole characters that fit inside 160 bytes: 80 of
+        // them, because each is two bytes. One more or one fewer means the
+        // boundary arithmetic moved.
+        assert_eq!(
+            cut.matches('·').count(),
+            80,
+            "160 bytes is exactly 80 two-byte characters: {cut}"
+        );
     }
 
     #[test]
@@ -1115,6 +1899,238 @@ mod tests {
             one.contains("1 note · <b>0</b> needing attention"),
             "one note is singular, not \"1 notes\""
         );
+    }
+
+    /// A day, for the pages that take one.
+    fn d(y: u16, m: u8, day: u8) -> Day {
+        Day::new(y, m, day).expect("a real date")
+    }
+
+    /// An ingest view with nothing running — what the server renders today.
+    fn pull_view<'a>(halt: Option<&'a str>, capture: Option<Capture<'a>>) -> PullView<'a> {
+        const TARGETS: [(SpotTarget, usize); 3] = [
+            (SpotTarget::Swept, 2),
+            (SpotTarget::Indices, 24),
+            (SpotTarget::Equities, 750),
+        ];
+        PullView {
+            today: d(2026, 8, 7),
+            targets: &TARGETS,
+            capture,
+            halt,
+            notes: &[],
+        }
+    }
+
+    #[test]
+    fn the_ingest_page_carries_two_forms_and_never_a_get_that_starts_a_pull() {
+        let html = pull_page(&pull_view(Some("the fetch is not built"), None));
+        assert!(html.starts_with("<!doctype html>"));
+        assert!(html.ends_with("</html>"));
+        assert!(
+            html.contains("class=\"hero\""),
+            "one design language, not two"
+        );
+        assert!(html.contains("nav class"), "and the same nav");
+
+        // TWO FORMS. Spot and F&O take different fields, so they are different
+        // forms rather than one form with a mode switch.
+        assert_eq!(html.matches("<form class=\"pull\"").count(), 2);
+        assert_eq!(html.matches("method=\"post\"").count(), 2);
+        assert_eq!(html.matches("method=\"get\"").count(), 0);
+        assert!(
+            html.contains("Expired F&amp;O"),
+            "and never a raw ampersand"
+        );
+        assert!(!html.contains("Expired F&O<"), "{html}");
+
+        // The counts on the form are the ones passed in, not invented.
+        assert!(html.contains("2 instrument(s)"));
+        assert!(html.contains("24 instrument(s)"));
+        assert!(html.contains("750 instrument(s)"));
+
+        // The expiry ceiling is a day behind today, so a live contract is not
+        // even offerable. The server refuses one too — see ingest::parse_fno.
+        assert!(html.contains("max=\"2026-08-06\""));
+        assert!(html.contains("LIVE CONTRACT CAN NEVER BE REQUESTED"));
+
+        // The two corrections an operator would otherwise have to know.
+        assert!(html.contains("toDate"), "{html}");
+        assert!(
+            html.contains("<b>not</b>"),
+            "the non-inclusive rule: {html}"
+        );
+        assert!(html.contains("09:15") && html.contains("15:30"));
+        assert!(html.contains("375"));
+
+        // And no script of any kind reaches the page.
+        for forbidden in ["<script", "javascript:", "onclick", "onload", "onerror"] {
+            assert!(!html.contains(forbidden), "{forbidden} must never appear");
+        }
+    }
+
+    #[test]
+    fn a_capture_that_is_not_running_shows_dashes_and_a_named_reason() {
+        // A DASH IS NOT A ZERO. `0 dropped` is a measurement; `—` is the
+        // absence of one, and rendering the second as the first is exactly the
+        // silent degradation CLAUDE.md section 4 forbids.
+        let html = pull_page(&pull_view(Some("pull::fetch does not exist"), None));
+        assert!(
+            html.contains("class=\"halt\""),
+            "the reason is loud: {html}"
+        );
+        assert!(html.contains("pull::fetch does not exist"));
+        assert!(html.contains("CAPTURE UNAVAILABLE"), "and badged: {html}");
+        assert!(!html.contains("badge good"));
+        assert!(!html.contains("<div class=\"cv\">0</div>"), "{html}");
+        assert!(html.contains("<div class=\"cv\">—</div>"));
+        assert!(html.contains("class=\"num miss\">—</td>"), "{html}");
+        // EVERY meter is marked as carrying no measurement, not merely
+        // rendered with a dash in it: the class is what greys it, and a class
+        // applied to the wrong half would leave a dash looking like a figure.
+        assert_eq!(
+            html.matches("class=\"meter none\"").count(),
+            5,
+            "all five meters carry no measurement: {html}"
+        );
+        assert_eq!(html.matches("class=\"meter\"").count(), 0, "{html}");
+        assert!(
+            !html.contains("<span style=\"width:"),
+            "no bar is drawn over a number nobody has: {html}"
+        );
+        // Every reason the filter counts is still NAMED, so the shape of what
+        // will be measured is visible even while nothing is measured.
+        for reason in [
+            DropReason::BeforeWindow,
+            DropReason::AfterWindow,
+            DropReason::BeforeSessionOpen,
+            DropReason::AtOrAfterSessionClose,
+        ] {
+            let label = reason.label();
+            assert!(html.contains(label), "{label} must be named: {html}");
+        }
+    }
+
+    #[test]
+    fn a_running_capture_reports_real_counts_with_integer_bars() {
+        // The other half of the same renderer, driven by a real DropCensus.
+        // Written now because the panel's whole purpose is to carry these
+        // numbers, and a renderer proved only in its empty state is a renderer
+        // nobody has checked.
+        let mut census = DropCensus::new();
+        for _ in 0..40 {
+            census.count(DropReason::BeforeSessionOpen);
+        }
+        for _ in 0..10 {
+            census.count(DropReason::AfterWindow);
+        }
+        let window = Window::new(d(2022, 1, 8), d(2022, 2, 8)).expect("forwards");
+        let capture = Capture {
+            what: "NSE-NIFTY · 1m",
+            window,
+            fetched: 12_040,
+            stored: 11_990,
+            census,
+        };
+        let html = pull_page(&pull_view(None, Some(capture)));
+
+        assert!(html.contains("badge good"), "something is running: {html}");
+        assert!(!html.contains("class=\"halt\""), "{html}");
+        // The mirror of the empty case: every meter now carries a measurement,
+        // so none of them is greyed.
+        assert_eq!(html.matches("class=\"meter none\"").count(), 0, "{html}");
+        assert_eq!(html.matches("class=\"meter\"").count(), 5, "{html}");
+        assert!(html.contains("NSE-NIFTY · 1m"));
+        assert!(html.contains("2022-01-08..=2022-02-08"), "{html}");
+        assert!(html.contains("12040") && html.contains("11990"));
+        assert!(html.contains(">50<"), "the drop total: {html}");
+        assert!(html.contains(">40<") && html.contains(">10<"));
+        // INTEGER bar widths, never a float: 40/40 is 100%, 10/40 is 25%, and
+        // a reason with nothing dropped still draws the 3% floor so that a zero
+        // reads as "none" rather than as "not rendered".
+        assert!(html.contains("width:100%"), "{html}");
+        assert!(html.contains("width:25%"), "{html}");
+        assert!(html.contains("width:3%"), "{html}");
+        assert!(!html.contains("width:0%"), "{html}");
+    }
+
+    #[test]
+    fn a_receipt_states_what_the_server_read_and_that_nothing_ran() {
+        let facts = [
+            ("Target", "Swept indices".to_owned()),
+            ("toDate on the wire", "2022-02-09".to_owned()),
+        ];
+        let html = receipt_page(&Receipt {
+            scope: "Spot pull",
+            verdict: "NOT STARTED",
+            reason: "the fetch does not exist",
+            facts: &facts,
+        });
+        assert!(html.starts_with("<!doctype html>"));
+        assert!(html.contains("NOT STARTED"));
+        assert!(html.contains("Spot pull"));
+        assert!(html.contains("the fetch does not exist"));
+        assert!(html.contains("<th>Target</th><td>Swept indices</td>"));
+        assert!(html.contains("2022-02-09"));
+        assert!(html.contains("Nothing here was written to the store"));
+        assert!(html.contains("href=\"/pull\""), "a way back: {html}");
+        // A refusal is escaped like everything else.
+        let facts = [("Field", "<b>x</b>".to_owned())];
+        let html = receipt_page(&Receipt {
+            scope: "<i>s</i>",
+            verdict: "REFUSED",
+            reason: "M&M",
+            facts: &facts,
+        });
+        assert!(html.contains("&lt;b&gt;x&lt;/b&gt;"));
+        assert!(html.contains("&lt;i&gt;s&lt;/i&gt;"));
+        assert!(html.contains("M&amp;M"));
+        assert!(!html.contains("<td><b>"));
+    }
+
+    #[test]
+    fn the_store_page_marks_a_held_month_and_dashes_one_it_does_not_hold() {
+        let nifty_key = nifty();
+        let month = store::path::YearMonth::new(2026, 7).expect("valid");
+        let held = Coverage {
+            key: nifty_key,
+            month,
+            rows: vec![(Vendor::Groww, Some(8_250)), (Vendor::Dhan, None)],
+        };
+        let absent = Coverage {
+            key: nifty_key,
+            month: store::path::YearMonth::new(2026, 6).expect("valid"),
+            rows: vec![(Vendor::Groww, None), (Vendor::Dhan, None)],
+        };
+        let rows = [held, absent];
+        let html = store_page(&StoreView {
+            today: d(2026, 8, 7),
+            censuses: &[],
+            rows: &rows,
+            page: 0,
+            last_page: 0,
+            total: 2,
+            notes: &["store root: /tmp/x".to_owned()],
+        });
+        assert!(html.starts_with("<!doctype html>"));
+        assert!(html.ends_with("</html>"));
+        assert!(html.contains("NSE-NIFTY"));
+        assert!(html.contains("2026-07") && html.contains("2026-06"));
+        assert!(html.contains(">8250<"), "the row count: {html}");
+        assert!(html.contains("class=\"num miss\">—</td>"), "{html}");
+        assert_eq!(
+            html.matches("<tr class=\"swept\">").count(),
+            1,
+            "exactly one of the two months is held"
+        );
+        assert!(html.contains("2 instrument-month(s) in the grid"));
+        assert!(html.contains("showing 2"));
+        assert!(!html.contains("class=\"pager\""), "one page, no pager");
+        assert!(html.contains("badge good"), "no census is not a bad census");
+        assert!(html.contains("groww rows") && html.contains("dhan rows"));
+        // The claim the whole page rests on is written on it.
+        assert!(html.contains("hash probe"), "{html}");
+        assert!(html.contains("248,000"), "{html}");
     }
 
     #[test]

@@ -7,7 +7,7 @@
     clippy::indexing_slicing
 )]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use brutex_core::instrument::{Exchange, Expiry, InstrumentKey, Kind, OptionSide, Segment};
@@ -19,8 +19,8 @@ use store::block;
 use store::crc::{CHECK_VALUE, crc32c, crc32c_split};
 use store::format::{
     BLOCK_LEN, Bar, FLAG_CHECKSUMS, FORMAT_VERSION, FormatError, HEADER_LEN, MAGIC, MAGIC_FAMILY,
-    MAX_SLOT_COUNT, OI_NULL, RECORD_STRIDE, RECORDS_PER_BLOCK, RETIRED_VERSIONS, SLOT_COUNT,
-    SLOT_LEN, SLOT_STRIDE,
+    MAX_SLOT_COUNT, OI_NULL, RECORD_LEN, RECORD_STRIDE, RECORDS_PER_BLOCK, RETIRED_VERSIONS,
+    SLOT_COUNT, SLOT_LEN, SLOT_STRIDE,
 };
 use store::header::Header;
 use store::layout::Layout;
@@ -295,6 +295,391 @@ fn ohlc_sanity_accepts_real_bars_and_rejects_impossible_ones() {
         }
         .ohlc_is_sane(),
         "low above close",
+    );
+}
+
+// ===========================================================================
+// The record's 56 bytes — the encoder, pinned
+// ===========================================================================
+//
+// WHY THIS SECTION EXISTS. `Bar::image` documents itself as "the single
+// authoritative encoder for the 56 bytes on disk" and argues that a second
+// encoder "would be a second definition of the format, free to drift". An
+// audit measured what the code actually had:
+//
+//   - nothing in the repository called `Bar::image`, so it carried zero
+//     coverage;
+//   - replacing its entire body with `[0u8; 56]` left all 79 store tests
+//     green;
+//   - `store::fault` re-implemented the encoder privately — the exact
+//     duplication the comment forbids.
+//
+// A comment asserting a property the code does not have is worse than an
+// untested function, because it stops anyone looking. The private copy is
+// deleted, `store::fault::bitflip_detected` now builds its bytes through
+// `Bar::image`, and the tests below pin the output so the zero mutant, a
+// swapped field pair, a moved offset and a flipped byte order each fail.
+// D-0039.
+
+/// The real first bar of 2024-06-03 from the lake, in paisa.
+///
+/// Spot, so its open interest is [`OI_NULL`] and its volume is a real zero —
+/// the two values a record can carry that mean something other than a number.
+const REAL_BAR: Bar = Bar {
+    ts_micros: 1_717_386_300_000_000,
+    open: 2_333_870,
+    high: 2_333_870,
+    low: 2_308_370,
+    close: 2_310_955,
+    volume: 0,
+    open_interest: OI_NULL,
+};
+
+/// Where each field's eight bytes begin in the image, in the order
+/// `Bar::image` writes them.
+const FIELD_OFFSETS: [usize; 7] = [0, 8, 16, 24, 32, 40, 48];
+
+/// How many fields one record has.
+const FIELDS: usize = 7;
+
+const _: () = assert!(FIELD_OFFSETS.len() == FIELDS);
+
+/// `base` with field `index` replaced by `value`.
+///
+/// The seven-arm match is the point: it names the fields in the order the
+/// image writes them, so a field added to `Bar` without a place in the format
+/// stops compiling here rather than silently going unencoded.
+fn with(base: Bar, index: usize, value: i64) -> Bar {
+    let mut bar = base;
+    match index {
+        0 => bar.ts_micros = value,
+        1 => bar.open = value,
+        2 => bar.high = value,
+        3 => bar.low = value,
+        4 => bar.close = value,
+        5 => bar.volume = value,
+        6 => bar.open_interest = value,
+        _ => panic!("a record has {FIELDS} fields; {index} is not one of them"),
+    }
+    bar
+}
+
+/// A record with `value` in field `index` and zero in every other field.
+fn only(index: usize, value: i64) -> Bar {
+    with(Bar::default(), index, value)
+}
+
+/// A deterministic 64-bit stream.
+///
+/// Not a random source — a *reproducible* one. `CLAUDE.md` §3 rule 5: same
+/// inputs, same outputs. A test that samples a different set on every run
+/// produces a failure nobody can reproduce, which is a test that reports
+/// nothing.
+struct Xorshift(u64);
+
+impl Xorshift {
+    /// The next value, as an `i64` with the same bits.
+    ///
+    /// Through `to_le_bytes`/`from_le_bytes` rather than a cast: this
+    /// workspace denies casts that can wrap, and the reinterpretation is what
+    /// is wanted — every 64-bit pattern, including the negative half.
+    fn draw(&mut self) -> i64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        i64::from_le_bytes(self.0.to_le_bytes())
+    }
+}
+
+#[test]
+fn the_record_image_is_the_pinned_bytes_of_a_known_bar() {
+    // THE TEST THE ALL-ZERO MUTANT CANNOT SURVIVE. A round trip cannot catch
+    // that mutant: `decode(image(r)) == r` is an identity under any pair of
+    // mutually inverse functions, and under an all-zero encoder the decode of
+    // zeros is a legal flat bar. Only literal bytes can catch it.
+    //
+    // These 56 bytes ARE the format. If this array has to change, a format
+    // version changes with it — CLAUDE.md §3 rule 8, and the reason
+    // `RETIRED_VERSIONS` exists.
+    #[rustfmt::skip]
+    const PINNED: [u8; RECORD_LEN] = [
+        // ts_micros     1_717_386_300_000_000 == 0x0006_19F4_285A_8700
+        0x00, 0x87, 0x5A, 0x28, 0xF4, 0x19, 0x06, 0x00,
+        // open                    2_333_870 == 0x0000_0000_0023_9CAE
+        0xAE, 0x9C, 0x23, 0x00, 0x00, 0x00, 0x00, 0x00,
+        // high                    2_333_870 == 0x0000_0000_0023_9CAE
+        0xAE, 0x9C, 0x23, 0x00, 0x00, 0x00, 0x00, 0x00,
+        // low                     2_308_370 == 0x0000_0000_0023_3912
+        0x12, 0x39, 0x23, 0x00, 0x00, 0x00, 0x00, 0x00,
+        // close                   2_310_955 == 0x0000_0000_0023_432B
+        0x2B, 0x43, 0x23, 0x00, 0x00, 0x00, 0x00, 0x00,
+        // volume                          0 -- a REAL zero
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        // open_interest  OI_NULL == i64::MIN == 0x8000_0000_0000_0000
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80,
+    ];
+
+    assert_eq!(REAL_BAR.image(), PINNED);
+    assert_eq!(REAL_BAR.image().len(), 56);
+    assert_eq!(RECORD_LEN, 56);
+    assert_eq!(u64::try_from(RECORD_LEN), Ok(RECORD_STRIDE));
+
+    // The mutant the audit actually planted, refused by name.
+    assert_ne!(REAL_BAR.image(), [0u8; RECORD_LEN], "the all-zero body");
+
+    // The two bytes that carry a meaning rather than a magnitude, on their
+    // own: the sentinel's sign bit is the LAST byte of the record, and a real
+    // zero volume is eight zero bytes and not an absence.
+    assert_eq!(PINNED[55], 0x80, "OI_NULL's sign bit, at byte 55");
+    assert_eq!(&PINNED[40..48], &[0u8; 8][..], "volume 0 IS eight zeros");
+
+    // The inverse taken on the PINNED bytes rather than on the encoder's
+    // output, so the decoder is pinned to the same 56 bytes and not merely to
+    // whatever `image` happens to return.
+    assert_eq!(Bar::decode(&PINNED), Ok(REAL_BAR));
+    assert_eq!(
+        Bar::decode(&[0u8; RECORD_LEN]),
+        Ok(Bar::default()),
+        "zeros decode to a flat bar with a REAL zero open interest",
+    );
+    assert_ne!(Bar::decode(&[0u8; RECORD_LEN]), Ok(REAL_BAR));
+}
+
+#[test]
+fn the_image_is_little_endian_and_each_field_owns_its_own_offset() {
+    // `Bar::image`'s doc comment claims little-endian. Stated here WITHOUT
+    // `to_le_bytes`, so the test does not prove the claim by restating it:
+    // the LEAST significant byte comes first.
+    let stepped = Bar {
+        ts_micros: 0x0102_0304_0506_0708,
+        ..Bar::default()
+    };
+    let image = stepped.image();
+    assert_eq!(
+        &image[..8],
+        &[0x08u8, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01][..],
+        "little-endian: least significant byte first",
+    );
+    assert_ne!(
+        &image[..8],
+        &[0x01u8, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08][..],
+        "big-endian, named so the claim cannot pass on a symmetric value",
+    );
+    assert_eq!(
+        &image[8..],
+        &[0u8; 48][..],
+        "one field set, one field moved"
+    );
+
+    // Every field, every byte of it: 7 x 8 = 56 placements, each asserted
+    // against all 56 bytes of the image. A swapped pair of fields, an offset
+    // off by one, or a byte order flipped inside a SINGLE field fails here.
+    let mut placements = 0usize;
+    for (field, &offset) in FIELD_OFFSETS.iter().enumerate() {
+        for byte in 0..8usize {
+            let mut wanted = [0u8; 8];
+            wanted[byte] = 0xA5;
+            let bar = only(field, i64::from_le_bytes(wanted));
+            let placed = bar.image();
+            for (at, got) in placed.iter().enumerate() {
+                let expect = if at == offset + byte { 0xA5u8 } else { 0u8 };
+                assert_eq!(*got, expect, "field {field} byte {byte}: image[{at}]");
+            }
+            assert_eq!(Bar::decode(&placed), Ok(bar), "and back again");
+            placements += 1;
+        }
+    }
+    assert_eq!(placements, 56, "every byte of every field was placed");
+    assert_eq!(FIELD_OFFSETS, [0, 8, 16, 24, 32, 40, 48]);
+    assert_eq!(
+        FIELD_OFFSETS[FIELDS - 1] + 8,
+        RECORD_LEN,
+        "no slack, no pad"
+    );
+}
+
+#[test]
+fn decoding_the_image_returns_the_record_byte_for_byte() {
+    // Every boundary a 64-bit field has. i64::MIN is OI_NULL -- the one value
+    // whose meaning is "absent" rather than a number -- so it appears in EVERY
+    // field, not only in the field that gives it that meaning.
+    const CORNERS: [i64; 12] = [
+        i64::MIN,
+        i64::MIN + 1,
+        -2_147_483_649,
+        -1,
+        0,
+        1,
+        255,
+        256,
+        2_147_483_648,
+        0x0102_0304_0506_0708,
+        i64::MAX - 1,
+        i64::MAX,
+    ];
+    const DRAWS: usize = 4_096;
+
+    assert_eq!(CORNERS[0], OI_NULL, "the null sentinel is a corner");
+    assert_eq!(CORNERS[4], 0, "and so is a real zero");
+
+    let mut cases: Vec<Bar> = Vec::new();
+    // One corner in one field at a time, twice: once against a real bar, so a
+    // field that is never written is caught, and once against zeros, so a
+    // field written into the WRONG offset is caught.
+    for field in 0..FIELDS {
+        for &corner in &CORNERS {
+            cases.push(with(REAL_BAR, field, corner));
+            cases.push(only(field, corner));
+        }
+    }
+    // Every field at the same corner at once.
+    for &corner in &CORNERS {
+        let mut bar = Bar::default();
+        for field in 0..FIELDS {
+            bar = with(bar, field, corner);
+        }
+        cases.push(bar);
+    }
+    // And 4,096 records whose every field is an unrelated 64-bit pattern.
+    let mut rng = Xorshift(0x2545_F491_4F6C_DD1D);
+    for _ in 0..DRAWS {
+        cases.push(Bar {
+            ts_micros: rng.draw(),
+            open: rng.draw(),
+            high: rng.draw(),
+            low: rng.draw(),
+            close: rng.draw(),
+            volume: rng.draw(),
+            open_interest: rng.draw(),
+        });
+    }
+    assert_eq!(
+        cases.len(),
+        FIELDS * CORNERS.len() * 2 + CORNERS.len() + DRAWS
+    );
+    assert_eq!(cases.len(), 4_276);
+
+    // `seen` maps an image back to the record that produced it; `distinct`
+    // counts the records themselves. If the two sizes agree, no two different
+    // records share one image -- the encoder is injective on this whole set,
+    // which is the property that makes a file's bytes mean one thing.
+    let mut seen: HashMap<[u8; RECORD_LEN], Bar> = HashMap::new();
+    let mut distinct: HashSet<[i64; 7]> = HashSet::new();
+    for bar in cases {
+        let image = bar.image();
+        assert_eq!(image.len(), RECORD_LEN);
+
+        // decode(image(r)) == r, EXACTLY.
+        let back = Bar::decode(&image).expect("56 bytes is a whole record");
+        assert_eq!(back, bar, "decode(image(r)) != r for {bar:?}");
+        // image(decode(image(r))) == image(r), byte for byte -- so the two are
+        // inverse in both directions, not merely in one.
+        assert_eq!(back.image(), image, "image(decode(image(r))) drifted");
+        // Field by field, so `PartialEq` alone is not what is being trusted.
+        assert_eq!(back.ts_micros, bar.ts_micros);
+        assert_eq!(back.open, bar.open);
+        assert_eq!(back.high, bar.high);
+        assert_eq!(back.low, bar.low);
+        assert_eq!(back.close, bar.close);
+        assert_eq!(back.volume, bar.volume);
+        assert_eq!(back.open_interest, bar.open_interest);
+        assert_eq!(back.oi_is_null(), bar.oi_is_null(), "the sentinel survived");
+        assert_eq!(back.oi(), bar.oi());
+
+        // A longer buffer decodes the FIRST record and never reads the tail.
+        let mut long = image.to_vec();
+        long.extend([0xFFu8; RECORD_LEN]);
+        assert_eq!(Bar::decode(&long), Ok(bar), "the tail reached the record");
+
+        if let Some(previous) = seen.insert(image, bar) {
+            assert_eq!(previous, bar, "two different records share one image");
+        }
+        distinct.insert([
+            bar.ts_micros,
+            bar.open,
+            bar.high,
+            bar.low,
+            bar.close,
+            bar.volume,
+            bar.open_interest,
+        ]);
+    }
+    assert_eq!(seen.len(), distinct.len(), "the encoder is not injective");
+    assert!(distinct.len() > DRAWS, "the sample did not collapse");
+}
+
+#[test]
+fn a_short_record_is_refused_and_never_completed_with_zeros() {
+    let image = REAL_BAR.image();
+
+    // Every length a ragged tail can leave behind, zero included.
+    for len in 0..RECORD_LEN {
+        assert_eq!(
+            Bar::decode(&image[..len]),
+            Err(FormatError::RecordTooShort { len }),
+            "a {len}-byte tail must be named, not completed",
+        );
+    }
+    assert_eq!(Bar::decode(&image), Ok(REAL_BAR), "56 bytes is enough");
+    assert_eq!(
+        Bar::decode(&[]),
+        Err(FormatError::RecordTooShort { len: 0 }),
+        "an empty tail is a tail",
+    );
+
+    // Measured against the specific wrong answer rather than against "not
+    // ok". The sentinel's sign bit is the LAST byte of the record, so a
+    // 55-byte tail completed with one zero would decode as a bar whose open
+    // interest is a REAL zero -- the field that tells a derivative series
+    // from an index series, inverted by an invented byte.
+    let mut completed = image;
+    completed[RECORD_LEN - 1] = 0;
+    let invented = Bar::decode(&completed).expect("56 bytes");
+    assert!(
+        !invented.oi_is_null(),
+        "this is what zero-filling would say"
+    );
+    assert_eq!(invented.oi(), Some(0));
+    assert_ne!(invented, REAL_BAR);
+    assert!(REAL_BAR.oi_is_null(), "and this is what the record says");
+
+    // The refusal names the length it saw, so the operator is not sent to a
+    // hex dump to find out how ragged the tail was.
+    let refusal = FormatError::RecordTooShort { len: 55 };
+    assert!(refusal.to_string().contains("55"));
+    assert!(refusal.to_string().contains("56"), "and the length needed");
+}
+
+#[test]
+fn decoding_reads_exactly_fifty_six_bytes_however_long_the_buffer_is() {
+    // CLAUDE.md §3 rule 4: bar lookup is O(1). `Bar::decode`'s copy loop is
+    // `image.iter_mut().zip(bytes.iter())` -- `image` is 56 bytes, so the zip
+    // stops at 56 whatever `bytes.len()` is. That is the structural argument;
+    // this is the observable form of it.
+    //
+    // NOT A TIMING MEASUREMENT. It proves the ANSWER does not depend on the
+    // buffer's length, which is why the trip count cannot either. Gate 8's
+    // bench measures header read and block seal, not this.
+    let image = REAL_BAR.image();
+    let mut haystack = image.to_vec();
+    // A whole month file's worth of bytes past the record, every one of them
+    // 0xFF -- the value that would corrupt any field it reached.
+    haystack.extend(std::iter::repeat_n(0xFFu8, 1 << 20));
+    assert_eq!(haystack.len(), RECORD_LEN + 1_048_576);
+
+    let from_long = Bar::decode(&haystack).expect("the first 56 bytes");
+    let from_exact = Bar::decode(&image).expect("the same 56 bytes");
+    assert_eq!(from_long, from_exact, "byte 57 onward changed the answer");
+    assert_eq!(from_long, REAL_BAR);
+    assert_eq!(from_long.image(), image, "and re-encodes to the same bytes");
+
+    // The same at the two lengths either side of the stride, so the boundary
+    // itself is walked and not stepped over.
+    assert_eq!(Bar::decode(&haystack[..RECORD_LEN]), Ok(REAL_BAR));
+    assert_eq!(Bar::decode(&haystack[..=RECORD_LEN]), Ok(REAL_BAR));
+    assert_eq!(
+        Bar::decode(&haystack[..RECORD_LEN - 1]),
+        Err(FormatError::RecordTooShort { len: 55 }),
     );
 }
 
@@ -1485,6 +1870,12 @@ fn every_format_error_renders_a_distinct_reason() {
     let all = [
         FormatError::OffsetOverflow,
         FormatError::SlotTooShort { len: 63 },
+        // A short RECORD and a short SLOT are two different files being wrong
+        // in two different places, and the enum says so -- but until D-0039
+        // this list omitted the record arm, so `Display` for it had never
+        // run. An arm nobody renders is an arm free to render as another
+        // arm's message.
+        FormatError::RecordTooShort { len: 55 },
         FormatError::HeaderRegionTooShort { slots: 1, need: 2 },
         FormatError::NotABarFile,
         FormatError::UnknownVersion(7),
@@ -1526,13 +1917,20 @@ fn every_format_error_renders_a_distinct_reason() {
         FormatError::NoValidHeader,
     ];
     assert_distinct(&all);
+    assert_eq!(all.len(), 22, "every variant the enum has, rendered");
     assert!(all[1].to_string().contains("63"), "the length is visible");
-    assert!(all[4].to_string().contains('7'), "the version is visible");
+    assert!(all[2].to_string().contains("55"), "the length is visible");
+    assert_ne!(
+        all[1].to_string(),
+        all[2].to_string(),
+        "a short slot and a short record must not share one message",
+    );
     assert!(all[5].to_string().contains('7'), "the version is visible");
-    assert!(all[7].to_string().contains("64"), "the stride is visible");
-    assert!(all[14].to_string().contains('4'), "the block is visible");
+    assert!(all[6].to_string().contains('7'), "the version is visible");
+    assert!(all[8].to_string().contains("64"), "the stride is visible");
+    assert!(all[15].to_string().contains('4'), "the block is visible");
     assert!(
-        all[19].to_string().contains("magic"),
+        all[20].to_string().contains("magic"),
         "the field is visible"
     );
     let as_error: &dyn std::error::Error = &FormatError::NotABarFile;

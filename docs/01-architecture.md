@@ -34,9 +34,21 @@ enforces it.
 | `indicators` | bars in, condition bits out | `core`, `store` |
 | `engine` | Apriori generation, evaluation, trade walk, ranking | `core`, `store`, `vocab`, `indicators` |
 | `pull` | vendor ingest, rate governor, credential read | `core`, `store` |
-| `api` | HTTP surface | `core`, `store`, `engine` |
+| `api` | HTTP surface | `core`, `store`, `engine`, `pull` |
 | `web` | browser UI, compiled to `wasm32-unknown-unknown` | **`core` only** |
 | `cli` | operator entry point | everything |
+
+---
+
+**`api → pull` was added by D-0038**, and the diagram above still draws them as
+siblings. `/pull` and `/store` are the operator's window onto ingest, and every
+rule they render already has exactly one definition in `pull`: the validated
+calendar (`session::Day`), the inclusive window and the vendor's non-inclusive
+`toDate` (`session::Window::wire_to`), the drop reasons and their tally
+(`session::{DropReason, DropCensus}`), and the per-vendor counter file
+(`manifest::Manifest`). Re-deriving any of them inside `api` would be a second
+Gregorian rule and a second answer to what goes on the wire. The graph is still
+acyclic — `pull` does not depend on `api` — and the build order is unchanged.
 
 ---
 

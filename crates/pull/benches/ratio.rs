@@ -210,6 +210,20 @@ fn header_region(commit: &Commit) -> Vec<u8> {
 /// mechanism `docs/06-limits.md` §17 and `docs/07-o1-architecture.md` line 79
 /// attribute it to, which is the shape `CLAUDE.md` §3 rule 6 forbids. D-0036.
 fn census(count: u32) -> (Manifest, Vec<u8>) {
+    let (region, data) = census_bytes(count);
+    match Manifest::load(Vendor::Groww, &region, &data) {
+        Ok(manifest) => (manifest, data),
+        Err(e) => refuse(&e.to_string()),
+    }
+}
+
+/// The header region and the entry region of a census of `count` months.
+///
+/// Split out of [`census`] so that a measurement which must start from a
+/// *freshly loaded* manifest on every trial can reload from the same bytes
+/// instead of cloning — a clone of the index is O(keys) and would be charged to
+/// whatever it was wrapped around.
+fn census_bytes(count: u32) -> (Vec<u8>, Vec<u8>) {
     let Ok(mut writer) = Manifest::open(Vendor::Groww, &[], &[]) else {
         refuse("a genesis manifest")
     };
@@ -233,10 +247,7 @@ fn census(count: u32) -> (Manifest, Vec<u8>) {
     let Some(commit) = published else {
         refuse("a census of no months")
     };
-    match Manifest::load(Vendor::Groww, &header_region(&commit), &data) {
-        Ok(manifest) => (manifest, data),
-        Err(e) => refuse(&e.to_string()),
-    }
+    (header_region(&commit), data)
 }
 
 /// C-11 — the census is a counter read, not a walk of what it counts.
@@ -325,11 +336,141 @@ fn entry_lookup_is_flat() -> bool {
     a && b && c && d
 }
 
+/// New keys appended inside one timed region.
+///
+/// A single `record` is a few tens of nanoseconds, which is inside the clock
+/// granularity this file measures and prints. A fixed batch amortises the timer
+/// over enough work to be resolvable while staying **far below** the headroom
+/// the reservation is supposed to carry, so a batch that rehashes is a
+/// reservation that was wrong rather than a batch that was greedy.
+const APPEND_BATCH: u32 = 256;
+
+/// Reloads per size before the minimum is taken.
+///
+/// Fewer than [`TRIALS`] because each trial pays a full [`Manifest::load`] of
+/// the largest census outside the timed region. The minimum over twelve
+/// reloads is still a minimum: a scheduler can only ever make a sample slower.
+const APPEND_TRIALS: u32 = 12;
+
+/// The census sizes the audit reported, and the census sizes that are the
+/// **worst case** for a table reserved to exactly what was loaded.
+///
+/// `HashMap::with_capacity(n)` rounds `n` up to `7·2^k` — so at `n = 7·2^k`
+/// exactly it hands back a table of capacity `n` and **no free slot at all**,
+/// and the first new key rebuilds the whole table. 1,792, 14,336 and 57,344 are
+/// `7·2^8`, `7·2^11` and `7·2^13`: the 1k / 10k / 50k of the audit, moved onto
+/// the boundary where the defect is not a matter of luck. Both sets are
+/// measured, because a bench that only visited the round numbers would report
+/// whatever slack the rounding happened to leave that day.
+const APPEND_SIZES: [u32; 3] = [1_000, 10_000, 50_000];
+
+/// [`APPEND_SIZES`], moved onto the capacity boundary. See there.
+const APPEND_WORST_SIZES: [u32; 3] = [1_792, 14_336, 57_344];
+
+const _: () = {
+    let [a, b, c] = APPEND_WORST_SIZES;
+    assert!(a == 7 * 256 && b == 7 * 2_048 && c == 7 * 8_192);
+};
+
+/// Picoseconds per append, appending [`APPEND_BATCH`] **new** keys to a
+/// manifest freshly loaded from these bytes.
+///
+/// The load happens outside the timer on every trial, so what is charged is the
+/// append path alone. `first_index` is chosen past the census so every key in
+/// the batch is one the census does not hold — an update to an existing key
+/// replaces in place and could never rehash, so measuring one would measure the
+/// case that was never in doubt.
+fn append_cost_ps(region: &[u8], data: &[u8], first_index: u32) -> u128 {
+    let mut best = u128::MAX;
+    for _ in 0..APPEND_TRIALS {
+        let Ok(mut manifest) = Manifest::load(Vendor::Groww, region, data) else {
+            refuse("a census this harness had just written")
+        };
+        let mut refused = false;
+        let start = Instant::now();
+        for i in 0..APPEND_BATCH {
+            let entry = Entry {
+                key: key(first_index + i),
+                rows: 7_312,
+                first_ts_micros: 1_000,
+                last_ts_micros: 2_000,
+            };
+            match manifest.record(entry) {
+                Ok(append) => {
+                    black_box(append);
+                }
+                Err(_) => refused = true,
+            }
+        }
+        let ps = start.elapsed().as_nanos() * 1_000 / u128::from(APPEND_BATCH);
+        if refused {
+            refuse("an append the manifest would not accept");
+        }
+        if ps < best {
+            best = ps;
+        }
+    }
+    best
+}
+
+/// C-13 — appending a month after a load costs the same whatever the census
+/// holds.
+///
+/// `CLAUDE.md` §3 rule 4 lists **result append** among the operations that must
+/// be O(1), and until this function existed no bench in the repository touched
+/// the manifest's append path at all. The reservation was exactly the committed
+/// entry count, which leaves a table at a capacity boundary with zero free
+/// slots, so the next new month rebuilt the whole index — an O(keys) step
+/// behind a doc comment that said "O(1) worst case".
+///
+/// A ratio rather than a nanosecond threshold, for the reason [`ratio`] gives:
+/// an absolute number would have to be guessed for hardware this repository has
+/// never run on, and a ratio taken in one process on one machine is a property
+/// of the code.
+fn append_after_load_is_flat() -> bool {
+    println!(
+        "  {:<44} {} bytes per key/value pair",
+        "index element width (context, not a ratio)",
+        size_of::<(EntryKey, Entry)>()
+    );
+
+    let mut ok = true;
+    for (label, sizes) in [
+        // Spelled with spaces rather than as one lower-case word on purpose:
+        // CI gate 1d flags every `"[a-z0-9][a-z0-9_-]*"` literal under
+        // crates/pull as a possible parameter path segment, and a bench label
+        // is not worth an entry on that allowlist.
+        ("at a round count", APPEND_SIZES),
+        ("at the capacity boundary", APPEND_WORST_SIZES),
+    ] {
+        let [small, medium, large] = sizes;
+        let cost = |count: u32| {
+            let (region, data) = census_bytes(count);
+            let Ok(loaded) = Manifest::load(Vendor::Groww, &region, &data) else {
+                refuse("a census this harness had just written")
+            };
+            println!(
+                "  {:<44} census {count}, reserved {}",
+                format!("C-13 {label} reservation"),
+                loaded.reserved()
+            );
+            append_cost_ps(&region, &data, count)
+        };
+        let base = cost(small);
+        let at_ten = cost(medium);
+        let at_fifty = cost(large);
+        ok &= ratio(&format!("C-13 append, {label}, {medium}"), base, at_ten);
+        ok &= ratio(&format!("C-13 append, {label}, {large}"), base, at_fifty);
+    }
+    ok
+}
+
 fn main() {
     println!("gate 8 — crates/pull, ceiling {CEILING_PERMILLE} permille");
     let mut ok = true;
     ok &= census_beats_the_scan_it_replaces();
     ok &= entry_lookup_is_flat();
+    ok &= append_after_load_is_flat();
     if ok {
         println!("all ratios within the ceiling");
     } else {

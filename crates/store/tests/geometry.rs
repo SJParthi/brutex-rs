@@ -70,6 +70,25 @@ fn the_old_geometry_straddled_and_record_145_is_the_cited_case() {
 fn no_record_straddles_a_block() {
     let v2 = Layout::V2;
 
+    // The arithmetic first, because it is what makes the walk below come out
+    // the way it does rather than a coincidence of the indices chosen.
+    // 56 x 73 = 4088, in both directions.
+    assert_eq!(RECORD_STRIDE, 56);
+    assert_eq!(RECORDS_PER_BLOCK, 73);
+    assert_eq!(BLOCK_LEN, 4_088);
+    assert_eq!(RECORD_STRIDE * RECORDS_PER_BLOCK, BLOCK_LEN);
+    assert_eq!(BLOCK_LEN % RECORD_STRIDE, 0, "no record can straddle");
+    assert_eq!(BLOCK_LEN / RECORD_STRIDE, RECORDS_PER_BLOCK);
+    // The closed form `store::format` carries as a const assertion, restated
+    // here so the invariant table names a test: the LAST record of a block
+    // ends exactly on the block's last byte, so with the divisibility above
+    // every earlier record ends strictly inside it.
+    assert_eq!(
+        (RECORDS_PER_BLOCK - 1) * RECORD_STRIDE + RECORD_STRIDE,
+        BLOCK_LEN,
+        "the last record of a block ends on the block boundary",
+    );
+
     // The property, for every index a month file could hold and well beyond.
     for index in 0..WALK {
         let (start, end) = v2.record_byte_range(index).expect("fits");

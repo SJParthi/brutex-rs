@@ -28,7 +28,9 @@
 )]
 
 use store::block;
-use store::format::{Bar, FLAG_CHECKSUMS, FormatError, HEADER_LEN, RECORD_STRIDE, SLOT_LEN};
+use store::format::{
+    Bar, FLAG_CHECKSUMS, FormatError, HEADER_LEN, RECORD_LEN, RECORD_STRIDE, SLOT_LEN,
+};
 use store::header::{Commit, Header};
 use store::layout::Layout;
 use store::path::FileKind;
@@ -94,21 +96,13 @@ const fn file_len(records: u64) -> u64 {
     HEADER_LEN + records * RECORD_STRIDE
 }
 
-/// One bar's 56 bytes, little-endian, in field order.
-fn bar_bytes(bar: &Bar) -> Vec<u8> {
-    [
-        bar.ts_micros,
-        bar.open,
-        bar.high,
-        bar.low,
-        bar.close,
-        bar.volume,
-        bar.open_interest,
-    ]
-    .iter()
-    .flat_map(|field| field.to_le_bytes())
-    .collect()
-}
+// A private `bar_bytes` helper used to live here, spelling the seven
+// little-endian fields out again. It was a SECOND DEFINITION of the record
+// format -- precisely what `Bar::image`'s own doc comment forbids -- and while
+// it existed nothing in the repository called `Bar::image` at all. Deleted by
+// D-0039: this file now builds record bytes with the encoder the format
+// document is the authority for, so a drift between the two is no longer
+// possible because there is only one.
 
 #[test]
 fn a_torn_header_commit_never_reports_an_uncommitted_count() {
@@ -287,9 +281,13 @@ fn bitflip_detected() {
         ts_micros: T0 + MINUTE,
         ..real
     };
-    let mut bytes = bar_bytes(&real);
-    bytes.extend(bar_bytes(&next));
+    // Through `Bar::image` -- the one encoder `docs/02-store-format.md` §3 is
+    // the authority for. Not a local copy of it.
+    let mut bytes = real.image().to_vec();
+    bytes.extend(next.image());
     assert_eq!(bytes.len(), 112);
+    assert_eq!(real.image().len(), RECORD_LEN);
+    assert_eq!(Bar::decode(&bytes), Ok(real), "the encoder's own inverse");
 
     let sealed = block::seal(v2, header.n_valid, 0, &bytes).expect("one partial block");
     assert_eq!(block::verify(&header, v2, 0, &bytes, sealed), Ok(()));

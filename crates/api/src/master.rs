@@ -319,7 +319,7 @@ mod tests {
     use std::io::Write as _;
 
     fn tmp(name: &str, body: &str) -> std::path::PathBuf {
-        let p = std::env::temp_dir().join(format!("brutex-master-{name}.csv"));
+        let p = crate::scratch::path(&format!("master-{name}.csv"));
         let mut f = std::fs::File::create(&p).expect("create");
         f.write_all(body.as_bytes()).expect("write");
         p
@@ -552,7 +552,7 @@ mod tests {
 
     #[test]
     fn an_unreadable_or_empty_file_is_refused() {
-        let missing = std::env::temp_dir().join("brutex-does-not-exist.csv");
+        let missing = crate::scratch::path("does-not-exist.csv");
         assert!(load(&missing, Vendor::Groww).is_err());
         let p = tmp("empty", "");
         assert!(
@@ -562,7 +562,7 @@ mod tests {
         );
         // A file whose SIZE is fine but whose BYTES are not text. `metadata`
         // succeeds and the read is what fails, so both refusal arms are real.
-        let raw = std::env::temp_dir().join("brutex-master-notutf8.csv");
+        let raw = crate::scratch::path("master-notutf8.csv");
         std::fs::File::create(&raw)
             .expect("create")
             .write_all(&[0xFF, 0xFE, 0x00, 0x41])
@@ -580,7 +580,13 @@ mod tests {
         // Sparse: `set_len` allocates no blocks, so this costs no disk. The
         // file is never read -- the refusal happens before `read_to_string`,
         // which is exactly the property under test.
-        let p = std::env::temp_dir().join("brutex-master-toobig.csv");
+        //
+        // THE PATH CARRIES THIS PROCESS'S ID. It used to be one fixed name in
+        // the shared temporary directory, and the `remove_file` below then
+        // failed with NotFound about one run in three: a second process running
+        // the same test deleted the fixture while this one was inside the
+        // 256 MiB read. See `crate::scratch`.
+        let p = crate::scratch::path("master-toobig.csv");
         let f = std::fs::File::create(&p).expect("create");
         f.set_len(MAX_MASTER_BYTES + 1).expect("set_len");
         drop(f);
@@ -592,6 +598,8 @@ mod tests {
         );
         // Exactly at the bound is not over it.
         f_at_bound(&p);
+        // The cleanup is an ASSERTION, not housekeeping: this fixture is
+        // 256 MiB and nothing else may have removed it.
         std::fs::remove_file(&p).expect("cleanup");
     }
 

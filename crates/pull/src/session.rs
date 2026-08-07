@@ -10,12 +10,18 @@
 //! [`BARS_PER_REGULAR_SESSION`] are pinned to each other by a compile-time
 //! assertion so they cannot drift apart.
 //!
-//! **An operator asserted 15:40. The exchange says 15:30**, and NSE's own
-//! `marketStatus` endpoint was read to confirm it. Ten phantom minutes a day is
-//! not a rounding difference: every VWAP, every session-close figure and every
-//! forced-exit bar would be computed over a window the exchange never traded.
-//! The number is written **once**, here, and every filter reads it from this
-//! module — `CLAUDE.md` §3 rule 1, and the reason a constant repeated in three
+//! **An operator asserted 15:40. The exchange says 15:30.** The source is
+//! `docs/00-charter.md` §3, which records the close, the 15:29 last bar and the
+//! 375-bar count together, and records the weekend budget sessions as 375 bars
+//! each *confirmed in the lake*. It is cited that way and no other way:
+//! `CLAUDE.md` §3 rule 1 wants a claim about an exchange traceable to the
+//! charter, and an earlier draft of this header instead claimed that NSE's
+//! `marketStatus` endpoint had been read to confirm it — a live read recorded
+//! in no document, which nobody reading this file can check. Ten phantom
+//! minutes a day is not a rounding difference: every VWAP, every session-close
+//! figure and every forced-exit bar would be computed over a window the
+//! exchange never traded. The number is written **once**, here, and every
+//! filter reads it from this module — the reason a constant repeated in three
 //! filters is a constant that will one day disagree with itself.
 //!
 //! # A daily bar is exempt, and that is not a special case
@@ -24,27 +30,52 @@
 //! open, or at the close, and none of those is inside 09:15–15:30 by
 //! coincidence. Applying an intraday window to it would drop every daily bar
 //! ever fetched, so [`Cadence`] is an argument to the filter rather than an
-//! assumption inside it, and `pull::fetch::a_daily_bar_is_exempt_from_the_
+//! assumption inside it, and `pull::unit::a_daily_bar_is_exempt_from_the_
 //! session_filter` is what holds it up.
+//!
+//! # What this module does **not** check, and says so
+//!
+//! **Minute alignment.** [`IstMoment::second_of_minute`] is computed and
+//! exposed, and [`Window::verdict`] does not look at it: a bar stamped
+//! 09:15:30 is inside the 09:15 minute and is kept. Whether a vendor stamping
+//! a one-minute bar off the minute boundary is a fault is a *decoder*
+//! question, not a window question, and inventing a [`DropReason`] for it here
+//! would put a data-quality judgement inside a clock. `pull::unit::a_bar_that_
+//! is_not_minute_aligned_is_kept_and_its_offset_is_visible` pins the current
+//! behaviour so that changing it has to be deliberate.
 //!
 //! # What this module deliberately does **not** know
 //!
 //! **There is no trading calendar here.** It does not know a holiday, a Muhurat
 //! session or a Saturday budget session, and it therefore never claims a bar is
-//! on a non-trading date. `docs/00-charter.md` records three special-session
-//! shapes and no holiday list, so a weekend rule would be *wrong* — 2025-02-01
-//! was a Saturday and a full 375-bar session. Invariant P-03 stays `—` for that
-//! reason, and `docs/06-limits.md` §20 says so rather than letting a
-//! session-window filter be mistaken for a calendar. What is filtered here is
-//! the **window**: the operator's date range, and the intraday session bounds.
+//! on a non-trading date. `docs/00-charter.md` §3 records special-session shapes
+//! and **no holiday list**, so a weekend rule would be *wrong* — it records
+//! 2025-02-01 as a Saturday and a full 375-bar session, alongside 2020-02-01
+//! (Sat) and 2026-02-01 (Sun). Nothing in this module computes a day of the
+//! week; there is no `% 7` in it, and
+//! `pull::unit::a_saturday_is_a_full_session_because_there_is_no_weekend_rule`
+//! walks all seven days of one week and asserts the same 375 for each.
+//!
+//! Invariant `P-03` — "a bar on a non-trading date is dropped and counted" —
+//! therefore stays `—` in `docs/04-invariants.md`, and is **not** advanced by
+//! this module. That status was checked against the table rather than asserted.
+//! An earlier draft of this header pointed at `docs/06-limits.md` §20 for the
+//! explanation; that section does not exist — `docs/06-limits.md` runs §19 then
+//! §21 — so the reason is written out here instead of cited to nothing.
+//!
+//! What is filtered here is the **window**: the operator's date range, and the
+//! intraday session bounds.
 //!
 //! # Cost
 //!
 //! Every function here is arithmetic on two integers. There is no table, no
-//! search and no allocation: `days_from_civil` and `civil_from_days` are the
-//! standard closed-form civil-calendar pair, so a timestamp in 1970 and one in
+//! search and no allocation: [`Day::days_from_epoch`] and [`Day::from_days`]
+//! are the standard closed-form civil-calendar pair (published as
+//! `days_from_civil` and `civil_from_days`), so a timestamp in 1970 and one in
 //! 9999 cost the same — `docs/07-o1-architecture.md` law 4, arithmetic beats
-//! lookup.
+//! lookup. `pull::unit::the_calendar_round_trips_every_day_this_build_can_name`
+//! drives every one of the 2,932,897 day counts through both directions and
+//! through `succ`, so the pair is exhaustively checked rather than spot-checked.
 
 use std::fmt;
 
@@ -89,6 +120,11 @@ pub const BARS_PER_REGULAR_SESSION: u32 = 375;
 const _: () = assert!(SESSION_CLOSE_MINUTE - SESSION_OPEN_MINUTE == BARS_PER_REGULAR_SESSION);
 const _: () = assert!(SESSION_OPEN_MINUTE == 555 && SESSION_CLOSE_MINUTE == 930);
 const _: () = assert!(IST_OFFSET_SECS == 19_800);
+const _: () = assert!(SECS_PER_DAY == 86_400);
+// `IstMoment::from_epoch_secs` narrows this one to `u32`. The cast is exact
+// only while it is 60, and this is what says so at compile time.
+const _: () = assert!(SECS_PER_MINUTE == 60);
+const _: () = assert!(SECS_PER_DAY % SECS_PER_MINUTE == 0);
 
 /// The first year a bar can carry. Timestamps are seconds since the epoch.
 pub const MIN_YEAR: u32 = 1_970;
@@ -104,23 +140,47 @@ pub const MAX_YEAR: u32 = 9_999;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum SessionError {
-    /// The timestamp is before the Unix epoch.
+    /// The timestamp names an instant before 1970-01-01 00:00 IST.
     ///
-    /// No bar predates 1970, and a negative epoch second is a vendor field that
-    /// was read at the wrong offset or a sentinel that leaked. Refused rather
-    /// than clamped: a clamped timestamp is a bar filed under 1970-01-01.
+    /// **The bound is on the IST instant, not on the sign of the input**, and
+    /// the two differ by exactly [`IST_OFFSET_SECS`]: `-19_800` is 1970-01-01
+    /// 00:00:00 IST and is accepted, `-19_801` is the second before it and is
+    /// refused. A negative epoch second is therefore *not* by itself a refusal
+    /// — `-1` is 1970-01-01 05:29:59 IST, a date a [`Day`] can hold. Anything
+    /// this variant does carry is genuinely before the Unix epoch as well, so
+    /// the message it prints is true whenever it is printed.
+    ///
+    /// Refused rather than clamped: a clamped timestamp is a bar filed under
+    /// 1970-01-01, which is a fault that looks like data.
+    /// `pull::unit::the_before_epoch_boundary_is_the_ist_instant_not_the_sign`
+    /// is what holds the boundary up on both sides.
     BeforeEpoch {
         /// The value that was refused.
         secs: i64,
     },
     /// The timestamp does not name a date this build can render.
     ///
-    /// Reached by a value so large that the day count leaves `u32`, or a year
-    /// that leaves `u16`. Both are the same fault to an operator — the column
-    /// is not epoch seconds — so they are one variant.
+    /// Reached three ways, all of which are the same fault to an operator —
+    /// the column is not epoch seconds — so they are one variant: a value whose
+    /// IST day count leaves `u32`, one whose day count overflows the calendar's
+    /// epoch shift, and one whose year leaves `1970..=9999`.
     TimestampOutOfRange {
         /// The value that was refused.
         secs: i64,
+    },
+    /// A day count [`Day::from_days`] cannot name, because adding the civil
+    /// calendar's epoch shift to it would leave `u32`.
+    ///
+    /// Its own variant rather than a [`SessionError::YearOutOfRange`] carrying
+    /// a computed year, because there is no year to compute: the addition that
+    /// would produce one is the addition that overflows. Before this refusal
+    /// existed the add wrapped, and a wrapped day count is the worst shape a
+    /// fault can take — `Day::from_days(u32::MAX)` **panicked in a debug build
+    /// and returned `YearOutOfRange { year: 1969 }` in a release build**, which
+    /// is a build-dependent answer to a pure function. `CLAUDE.md` §3 rule 5.
+    DayCountOutOfRange {
+        /// The day count that was refused.
+        days: u32,
     },
     /// The year is outside `1970..=9999`.
     YearOutOfRange {
@@ -170,6 +230,9 @@ impl fmt::Display for SessionError {
             }
             Self::TimestampOutOfRange { secs } => {
                 write!(f, "timestamp {secs} names no date this build can render")
+            }
+            Self::DayCountOutOfRange { days } => {
+                write!(f, "day count {days} names no date this build can render")
             }
             Self::YearOutOfRange { year } => {
                 write!(f, "year {year} is not {MIN_YEAR}..={MAX_YEAR}")
@@ -381,14 +444,23 @@ impl Day {
     /// The date `days` days after 1970-01-01.
     ///
     /// The inverse of [`Day::days_from_epoch`], and
-    /// `pull::fetch::the_calendar_round_trips_every_day_this_build_can_name`
+    /// `pull::unit::the_calendar_round_trips_every_day_this_build_can_name`
     /// walks all 2,932,897 of them through both.
     ///
     /// # Errors
     ///
-    /// [`SessionError::YearOutOfRange`] past 9999-12-31.
+    /// [`SessionError::YearOutOfRange`] past 9999-12-31, and
+    /// [`SessionError::DayCountOutOfRange`] for a count so large that the
+    /// epoch shift below cannot even be applied to it.
     pub const fn from_days(days: u32) -> Result<Self, SessionError> {
-        let z = days + 719_468;
+        // CHECKED, NOT PLAIN. `days` is a `u32` and every one of them is a
+        // legal argument, so `days + 719_468` overflows for the top 719,468 of
+        // them — which used to panic in a debug build and wrap in a release
+        // build, giving a pure function two different answers depending on how
+        // it was compiled. See [`SessionError::DayCountOutOfRange`].
+        let Some(z) = days.checked_add(719_468) else {
+            return Err(SessionError::DayCountOutOfRange { days });
+        };
         let era = z / 146_097;
         let doe = z - era * 146_097;
         let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
@@ -430,6 +502,35 @@ impl fmt::Display for Day {
     }
 }
 
+/// The largest day count a [`Day`] can carry: 9999-12-31, the last date this
+/// build will name.
+///
+/// **Derived, not written down.** The assertion below computes it from the
+/// calendar itself at compile time, so the number and the two bounds it comes
+/// from cannot drift apart — the same argument
+/// [`BARS_PER_REGULAR_SESSION`] is pinned by. The day *count* is one less than
+/// the number of nameable days, because 1970-01-01 is day zero: 2,932,896 here
+/// and 2,932,897 dates in `0..=MAX_DAY_NUMBER`.
+pub const MAX_DAY_NUMBER: u32 = 2_932_896;
+
+const _: () = assert!(match Day::new(9999, 12, 31) {
+    Ok(last) => last.days_from_epoch() == MAX_DAY_NUMBER,
+    Err(_) => false,
+});
+const _: () = assert!(match Day::new(1970, 1, 1) {
+    Ok(first) => first.days_from_epoch() == 0,
+    Err(_) => false,
+});
+
+/// The largest day count `u32` can hold at all, as an `i64`.
+///
+/// Spelled as a literal because `i64::from` is not const-stable on this
+/// toolchain and this is used from a `const fn`.
+/// `pull::unit::the_day_count_ceiling_is_exactly_u32_max` is what proves the
+/// literal is `u32::MAX` rather than a typo, since a compile-time assertion
+/// would need the very cast the literal exists to avoid.
+const U32_DAYS_MAX: i64 = 4_294_967_295;
+
 /// One instant, as IST sees it: which day, and how far into it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct IstMoment {
@@ -446,10 +547,13 @@ impl IstMoment {
     ///
     /// # Errors
     ///
-    /// [`SessionError::BeforeEpoch`] for a negative value, or
-    /// [`SessionError::TimestampOutOfRange`] for one whose day count leaves
-    /// `u32` — both of which are what a vendor column read at the wrong offset
-    /// looks like.
+    /// [`SessionError::BeforeEpoch`] for a value below `-19_800` — that is,
+    /// one whose *IST* instant precedes 1970-01-01 00:00 IST, which is not the
+    /// same set as "negative"; see that variant. Or
+    /// [`SessionError::TimestampOutOfRange`] for one above `253_402_280_999`,
+    /// whose IST day is past 9999-12-31 or whose day count does not fit `u32`
+    /// at all. Both are what a vendor column read at the wrong offset looks
+    /// like.
     ///
     /// # Examples
     ///
@@ -479,36 +583,76 @@ impl IstMoment {
         }
         let day_number = local / SECS_PER_DAY;
         let into_day = local % SECS_PER_DAY;
-        // Same const-fn constraint as `Day::from_days`. `local` was bounded
-        // before the division, so `day_number` is below `u32::MAX`, and
-        // `into_day` is a remainder modulo 86,400. `Day::from_days` refuses a
-        // day count whose year exceeds 9,999, so an out-of-range day is caught
-        // immediately below rather than trusted.
+        // THE CAST BELOW IS ONLY SAFE BECAUSE OF THIS GUARD, AND IT WAS NOT
+        // HERE. `local` is bounded only by `i64`, so `day_number` reaches
+        // 106,751,991,167,300 and `as u32` silently kept its low 32 bits:
+        // epoch second 371,086,500,594,600 is day 4,294,982,646, which is
+        // 11761233-01-30, and it came back as `Ok(2012-01-11 00:00:00)`. Not a
+        // refusal, not a panic, a *plausible date* — the one outcome
+        // `CLAUDE.md` §4 forbids outright. The bound is `u32::MAX` rather than
+        // [`MAX_DAY_NUMBER`] so that the calendar keeps its own refusal below
+        // rather than having it pre-empted here into an arm no input reaches.
+        //
+        // THE ONE EQUIVALENT MUTANT IN THIS MODULE IS ON THIS LINE, and it is
+        // recorded rather than papered over. `cargo mutants` replaces `>` with
+        // `>=`; the whole suite still passes, and it always will, because the
+        // single day count that distinguishes them — exactly `u32::MAX` — is
+        // refused either way and with the identical error: by this guard under
+        // `>=`, and by `Day::from_days`'s own `DayCountOutOfRange` (remapped
+        // just below) under `>`. It is not a missing test. Every constant this
+        // guard could take lies in `MAX_DAY_NUMBER + 1 ..= u32::MAX`, and both
+        // sides of every one of them refuse, so no choice of bound removes it;
+        // the only structure that would is guarding at `MAX_DAY_NUMBER`, which
+        // makes the refusal below unreachable and costs the coverage gate a
+        // line instead. `pull::unit::the_guard_and_the_calendar_refuse_the_
+        // same_boundary_identically` asserts the equivalence as a fact rather
+        // than leaving it as this comment's assertion.
+        if day_number > U32_DAYS_MAX {
+            return Err(SessionError::TimestampOutOfRange { secs: epoch_secs });
+        }
+        // Same const-fn constraint as `Day::from_days`.
         #[expect(
             clippy::cast_possible_truncation,
-            reason = "local was range-checked before the division so \
-                      day_number fits u32; into_day is a remainder mod 86,400. \
-                      Day::from_days refuses anything past year 9,999."
+            reason = "day_number was just compared against U32_DAYS_MAX and \
+                      refused above it, so the cast is exact; into_day is a \
+                      remainder mod 86,400. `the_day_count_that_does_not_fit_\
+                      u32_is_refused_not_truncated` is the test that holds the \
+                      guard up."
         )]
         #[expect(
             clippy::cast_sign_loss,
             reason = "the `local < 0` guard above is what makes both \
                       non-negative: day_number is a truncating division of a \
                       non-negative value and into_day its remainder, so \
-                      neither can be signed here. `a_negative_timestamp_is_\
-                      refused_not_wrapped` is the test that holds the guard up."
+                      neither can be signed here. `the_before_epoch_boundary_\
+                      is_the_ist_instant_not_the_sign` is the test that holds \
+                      the guard up."
         )]
         let (days, second_of_day) = (day_number as u32, into_day as u32);
-        // A day count inside `u32` whose year is past 9999. Reported as an
-        // out-of-range timestamp rather than as a year, because the caller
-        // handed over a second and that is what it can act on.
+        // A day count that fits `u32` but that the calendar still refuses —
+        // either its year is past 9999, or the epoch shift will not fit. Both
+        // are reported as an out-of-range *timestamp* rather than passed
+        // through, because the caller handed over a second and a second is
+        // what it can act on. Both arms are reachable from here: the first at
+        // `epoch_secs = 253_402_281_000`, the second above
+        // `4_294_247_827` days, which is inside the `u32` the guard admits.
         let Ok(day) = Day::from_days(days) else {
             return Err(SessionError::TimestampOutOfRange { secs: epoch_secs });
         };
+        // `SECS_PER_MINUTE`, not a bare `60`. The module header's own argument
+        // about a constant repeated in three filters applies to this one too,
+        // and it was declared here and then not used.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "SECS_PER_MINUTE is the literal 60 widened to i64; the \
+                      cast back is exact and the compile-time assertion below \
+                      is what keeps it exact if the constant ever moves."
+        )]
+        let per_minute = SECS_PER_MINUTE as u32;
         Ok(Self {
             day,
-            minute_of_day: second_of_day / 60,
-            second_of_minute: second_of_day % 60,
+            minute_of_day: second_of_day / per_minute,
+            second_of_minute: second_of_day % per_minute,
         })
     }
 
@@ -641,6 +785,20 @@ impl DropCensus {
     }
 
     /// How many were dropped in total.
+    ///
+    /// # The one place this is not the sum of its reasons
+    ///
+    /// Exactly the sum of the four counters while that sum fits `u32`, and
+    /// **saturated at `u32::MAX` above it**, which is the one arithmetic in
+    /// this file whose answer can be smaller than the truth. It is stated
+    /// rather than hidden: reaching it needs more than 4.29 billion drops in
+    /// one census, four hundred times a full day of index bars across every
+    /// symbol NSE lists, so it is an honest bound rather than a live risk.
+    /// `pull::unit::the_census_total_is_the_sum_of_its_reasons` proves the
+    /// equality at zero, at one of each and at a mixed count;
+    /// `session::tests::the_census_saturates_rather_than_wrapping` proves the
+    /// saturation itself, and lives inside this module because the counters
+    /// are private and no public call can reach `u32::MAX` in finite time.
     #[must_use]
     pub const fn total(&self) -> u32 {
         self.before_open
@@ -715,8 +873,8 @@ impl Window {
     /// It is a method on the window rather than an addition at the call site
     /// for the reason `CLAUDE.md` §6 gives about a parameter: an adjustment
     /// that can be forgotten will be forgotten, and there is no symptom.
-    /// `pull::fetch::the_wire_to_date_is_the_day_after_the_operators_last_day`
-    /// and `pull::fetch::an_inclusive_window_survives_the_vendors_exclusive_
+    /// `pull::unit::the_wire_to_date_is_the_day_after_the_operators_last_day`
+    /// and `pull::unit::an_inclusive_window_survives_the_vendors_exclusive_
     /// to_date` are what hold it up.
     ///
     /// # Errors
@@ -800,5 +958,107 @@ impl Window {
 impl fmt::Display for Window {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}..={}", self.from, self.to)
+    }
+}
+
+/// The two facts about [`DropCensus`] that no external test can reach.
+///
+/// Everything else about this module is proved from outside, in
+/// `crates/pull/tests/unit.rs`, because that is where a caller stands. These
+/// two are here because the counters are private and the only public way to
+/// raise one is [`DropCensus::count`], which would need 4,294,967,295 calls.
+/// A saturating add nobody ever saturates is a claim, not a behaviour.
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    reason = "the same exception every test module in this workspace takes: a \
+              test that cannot panic cannot fail."
+)]
+mod tests {
+    use super::{DropCensus, DropReason};
+
+    /// A counter at the ceiling stops there. It never wraps to a number
+    /// smaller than the truth, which is the one direction a census must never
+    /// be wrong in.
+    #[test]
+    fn the_census_saturates_rather_than_wrapping() {
+        let mut census = DropCensus {
+            before_open: u32::MAX,
+            after_close: 0,
+            before_window: 0,
+            after_window: 0,
+        };
+        census.count(DropReason::BeforeSessionOpen);
+        assert_eq!(
+            census.of(DropReason::BeforeSessionOpen),
+            u32::MAX,
+            "the counter wrapped to zero instead of standing still"
+        );
+        assert_eq!(census.total(), u32::MAX);
+        assert!(!census.is_empty());
+
+        // Every slot saturates, not just the first one.
+        for reason in [
+            DropReason::BeforeSessionOpen,
+            DropReason::AtOrAfterSessionClose,
+            DropReason::BeforeWindow,
+            DropReason::AfterWindow,
+        ] {
+            let mut one = DropCensus::new();
+            let slot = match reason {
+                DropReason::BeforeSessionOpen => &mut one.before_open,
+                DropReason::AtOrAfterSessionClose => &mut one.after_close,
+                DropReason::BeforeWindow => &mut one.before_window,
+                DropReason::AfterWindow => &mut one.after_window,
+            };
+            *slot = u32::MAX;
+            one.count(reason);
+            assert_eq!(one.of(reason), u32::MAX, "{reason} wrapped");
+        }
+    }
+
+    /// `total` is the sum until it cannot be, and then it is the ceiling —
+    /// never a wrapped, smaller number. This is the documented limit on
+    /// [`DropCensus::total`], stated here as an executed fact.
+    #[test]
+    fn the_census_total_saturates_instead_of_wrapping_past_u32() {
+        let census = DropCensus {
+            before_open: u32::MAX,
+            after_close: 1,
+            before_window: 1,
+            after_window: 1,
+        };
+        // The true sum is 4,294,967,298. It does not fit, so the answer is the
+        // ceiling — and emphatically not the wrapped 2.
+        assert_eq!(census.total(), u32::MAX);
+        assert_eq!(census.of(DropReason::AtOrAfterSessionClose), 1);
+
+        // Two large counters, neither of them at the ceiling alone.
+        let half = DropCensus {
+            before_open: 3_000_000_000,
+            after_close: 2_000_000_000,
+            before_window: 0,
+            after_window: 0,
+        };
+        assert_eq!(half.total(), u32::MAX, "5e9 does not fit u32");
+
+        // And the largest census whose total is still exact.
+        let exact = DropCensus {
+            before_open: u32::MAX - 3,
+            after_close: 1,
+            before_window: 1,
+            after_window: 1,
+        };
+        assert_eq!(exact.total(), u32::MAX);
+        assert_eq!(
+            u64::from(exact.before_open)
+                + u64::from(exact.after_close)
+                + u64::from(exact.before_window)
+                + u64::from(exact.after_window),
+            u64::from(u32::MAX),
+            "this case is the boundary: the true sum is exactly u32::MAX"
+        );
     }
 }

@@ -174,6 +174,22 @@ const _: () = assert!(SLOT_COUNT <= MAX_SLOT_COUNT);
 const _: () = assert!(BLOCK_LEN == 4088);
 const _: () = assert!(SLOT_STRIDE >= 16_384);
 
+// 56 x 73 = 4088, stated in both directions. `BLOCK_LEN == 4088` above pins
+// the product; these pin the two factors, so neither can move while the other
+// compensates and leaves the product — and every offset derived from it —
+// looking untouched.
+const _: () = assert!(RECORDS_PER_BLOCK == 73);
+const _: () = assert!(BLOCK_LEN == 56 * 73);
+
+// **A record can never straddle a block**, as a compile error rather than a
+// walk. The last record of a block starts at `(RECORDS_PER_BLOCK - 1) *
+// RECORD_STRIDE` inside it and ends exactly on the block's last byte; with the
+// divisibility asserted above, every earlier record therefore ends strictly
+// inside. `store::geometry::no_record_straddles_a_block` walks 5,000 indices
+// for the same property at runtime — this is its closed form, and it holds
+// before a test is ever run.
+const _: () = assert!((RECORDS_PER_BLOCK - 1) * RECORD_STRIDE + RECORD_STRIDE == BLOCK_LEN);
+
 /// Bit 0 of [`Header::flags`]: per-block checksums are present.
 ///
 /// A file that sets it carries a sidecar of one [`crate::block`] checksum per
@@ -278,6 +294,28 @@ impl Bar {
     /// second encoder in `crates/pull` would be a second definition of the
     /// format, free to drift. `CLAUDE.md` §5's arrow points one way: `pull`
     /// depends on `store`.
+    ///
+    /// # What holds that claim up
+    ///
+    /// The paragraph above was, until D-0039, a claim this crate did not have:
+    /// nothing called this method, and `store::fault` re-implemented the
+    /// encoder privately — the exact second definition the paragraph forbids.
+    /// Replacing the whole body with zeros left all 79 tests green. Three
+    /// tests now hold it up, and they are named here because a comment that
+    /// names no test is the shape the defect took:
+    ///
+    /// - `store::unit::the_record_image_is_the_pinned_bytes_of_a_known_bar`
+    ///   pins all 56 bytes of one record as a literal array. A body that
+    ///   returns zeros — or any other bytes — fails it.
+    /// - `store::unit::the_image_is_little_endian_and_each_field_owns_its_own_offset`
+    ///   holds up the byte order this comment claims, and walks all 448
+    ///   (field, byte) positions so no two fields can swap.
+    /// - `store::unit::decoding_the_image_returns_the_record_byte_for_byte`
+    ///   round-trips every boundary a record has, [`OI_NULL`] included.
+    ///
+    /// And `store::fault::bitflip_detected` builds its record bytes by calling
+    /// this method, so the format has one definition in fact and not only in
+    /// this paragraph.
     #[must_use]
     pub fn image(&self) -> [u8; RECORD_LEN] {
         let mut out = [0u8; RECORD_LEN];

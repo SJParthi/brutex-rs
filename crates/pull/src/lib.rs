@@ -8,6 +8,7 @@
 //! | [`config`] | the untracked path configuration, and the only thing that assembles a parameter path |
 //! | [`secret`] | the one-method secret source, the SSM adapter, and the loud halts |
 //! | [`manifest`] | the per-vendor counter file — layer 13 of `docs/07-o1-architecture.md` |
+//! | [`rate`] | the adaptive AIMD governor — what a vendor actually honours, not what it published |
 //!
 //! # What is deliberately **not** here
 //!
@@ -20,9 +21,17 @@
 //! thin adapter over it; the dependency is taken by the change that first makes
 //! a live call. See `crates/pull/Cargo.toml` and `docs/05-decisions.md` D-0035.
 //!
-//! **No rate governor, no window walk, no calendar filter.** `P-01` through
-//! `P-04` in `docs/04-invariants.md` keep their `—` status; this change moves
-//! `P-05` through `P-08` and adds the manifest rows.
+//! **No trading calendar.** `docs/00-charter.md` records three special-session
+//! shapes and no holiday list, so `P-03` in `docs/04-invariants.md` keeps its
+//! `—` status rather than being satisfied by a weekend rule that would be
+//! wrong — 2025-02-01 was a Saturday and a full 375-bar session.
+//!
+//! **No concurrency wrapper around [`rate`].** [`rate::Governor`] takes
+//! `&mut self` and holds no interior mutability, so one governor cannot be
+//! shared across tasks without a lock, and this crate does not supply one.
+//! `P-01` — the ceiling holding *under any concurrency* — therefore keeps its
+//! `—` status; what is proven today is the single-caller arithmetic, in `P-20`
+//! through `P-35`.
 //!
 //! # The one rule that shapes every line of `config`
 //!
@@ -71,5 +80,9 @@
 
 pub mod config;
 pub mod manifest;
+pub mod rate;
+pub mod regime;
 pub mod secret;
 pub mod session;
+
+pub mod vendor;

@@ -188,6 +188,124 @@ pub const MAX_ENTRIES: u64 = 2_097_152;
 /// the two honest.
 const MAX_ENTRIES_LEN: usize = 2_097_152;
 
+/// How much room a loaded index reserves, as a multiple of the committed entry
+/// count. **Two, and the derivation is the whole point of the constant.**
+///
+/// # What went wrong with one
+///
+/// Until D-0040 the index was reserved to *exactly* `n_valid` and the doc
+/// comment beside it claimed "O(1) **worst case** rather than average". That
+/// claim was true of the lookup path and false of the append path, and no bench
+/// in the repository touched the append path at all — which is why nobody saw
+/// it.
+///
+/// `HashMap::with_capacity(n)` rounds `n` up to `7·2^k`, so for most `n` the
+/// rounding leaves slack and for `n = 7·2^k` **exactly** it leaves none. At
+/// those counts the very next new key rebuilt the whole table. Measured on this
+/// workspace's own harness, `crates/pull/benches/ratio.rs` C-13, appending 256
+/// new months to a freshly loaded census, minimum of twelve reloads,
+/// picoseconds per append:
+///
+/// | census | reserved before | ps/append before | reserved now | ps/append now |
+/// |---|---|---|---|---|
+/// | 1,792 = 7·2⁸ | 1,792 | 228,679 | 3,584 | 93,261 |
+/// | 14,336 = 7·2¹¹ | 14,336 | 1,285,968 | 28,672 | 84,472 |
+/// | 57,344 = 7·2¹³ | 57,344 | 5,100,585 | 114,688 | 95,214 |
+///
+/// The old column multiplies by 22 across a 32× census — and even its 1× base
+/// was already rehashing, so the honest figure is the last row against the
+/// flat cost: **5,100,585 ps against 95,214 ps, 53.6× removed**. The new column
+/// is flat to 1.02×. `CLAUDE.md` §3 rule 4 names **result append** as one of
+/// the operations that may not grow with the data.
+///
+/// The round counts 1,000 / 10,000 / 50,000 stayed under the ceiling in *both*
+/// columns, because `with_capacity` happened to round them up to 1,792 / 14,336
+/// / 57,344 and leave 792 / 4,336 / 7,344 spare slots. A bench that had only
+/// visited round numbers would have reported this defect as absent, which is
+/// why C-13 measures both sets.
+///
+/// # Why the factor is two, derived rather than chosen
+///
+/// `Manifest::walk` inserts `n_keys` distinct keys and
+/// [`ManifestHeader::validate`] has already refused `n_keys > n_valid`, so the
+/// index holds **at most `n_valid`** elements when the load returns. Reserving
+/// `2·n_valid` therefore leaves **at least `n_valid` free slots**, and
+/// [`Manifest::record`] adds at most one element per call. So the number of new
+/// `(instrument, timeframe, month)` keys a session may append before any rehash
+/// is possible is `n_valid` — a pull would have to double a vendor's entire
+/// history in one run.
+///
+/// That bound is scale-free, which an additive headroom would not be: a fixed
+/// "+1,000" is a number nothing in `docs/00-charter.md` supports and it gets
+/// relatively weaker at every scale, and `CLAUDE.md` §3 rule 1 does not admit a
+/// figure with no source.
+///
+/// # Past half the ceiling it stops being a headroom and becomes a proof
+///
+/// [`ManifestHeader::advance`] refuses a counter past [`MAX_ENTRIES`], so a
+/// loaded manifest can accept at most `MAX_ENTRIES − n_valid` further appends
+/// for the rest of its life. [`reservation_for`] caps the reservation at
+/// `MAX_ENTRIES`, so once `n_valid >= MAX_ENTRIES/2` the reservation **is**
+/// `MAX_ENTRIES` — more slots than `advance` will ever let a caller fill. Above
+/// that census no append can rehash at all, unconditionally, and
+/// `pull::unit::the_reservation_is_capped_at_the_design_ceiling` is where that
+/// arithmetic is checked rather than believed.
+///
+/// # What it costs, measured
+///
+/// `size_of::<(EntryKey, Entry)>()` is **136 bytes** on this workspace's
+/// target, printed by the same bench. The *ceiling* is unchanged: a census at
+/// [`MAX_ENTRIES`] reserved `MAX_ENTRIES` before this constant existed and
+/// reserves `MAX_ENTRIES` now — about 574 MB of table either way, the same
+/// number the region-sized reservation was refused for. What doubles is the
+/// middle: a 248,000-entry census (the measured scale in [`MAX_ENTRIES`]'s
+/// note) goes from roughly 72 MB of table to roughly 144 MB.
+///
+/// # What it does NOT buy
+///
+/// An unconditional O(1) worst-case append below half the ceiling. Appending
+/// more than `n_valid` new keys to one loaded manifest rehashes once, at
+/// `O(n_keys)`, and the only reservation that would remove that arm for every
+/// census is [`MAX_ENTRIES`] on every load — 574 MB for a vendor holding three
+/// months. `docs/06-limits.md` §23 records that plainly rather than leaving an
+/// O(1) claim standing over an amortised bound. D-0040.
+pub const APPEND_HEADROOM_FACTOR: usize = 2;
+
+/// How many entries a loaded index reserves room for, given the committed entry
+/// count its header published.
+///
+/// `min(n_valid · APPEND_HEADROOM_FACTOR, MAX_ENTRIES)` — see
+/// [`APPEND_HEADROOM_FACTOR`] for why those are the two numbers. Public because
+/// the alternative is a bound only an allocator can see: `CLAUDE.md` §3 rule 6
+/// is not satisfied by an invariant whose only witness is a comment, and the
+/// cap arm in particular is reachable only at a census of 1,048,576 entries,
+/// which is 67 MB of entry bytes and not a thing a unit test should build.
+///
+/// The `unwrap_or` arm cannot be taken on any target this workspace builds for:
+/// `n_valid` is at most [`MAX_ENTRIES`], which is 2²¹, and a `usize` narrower
+/// than that could not address the region the entries were read from in the
+/// first place. It sits in `Result::unwrap_or`, which is not this repository's
+/// code to measure.
+///
+/// # Examples
+///
+/// ```
+/// # use pull::manifest::{APPEND_HEADROOM_FACTOR, MAX_ENTRIES, reservation_for};
+/// assert_eq!(reservation_for(0), 0);
+/// assert_eq!(reservation_for(1_792), 3_584);
+/// // The cap binds from half the design ceiling upward, and never above it.
+/// assert_eq!(reservation_for(MAX_ENTRIES / 2), MAX_ENTRIES as usize);
+/// assert_eq!(reservation_for(MAX_ENTRIES), MAX_ENTRIES as usize);
+/// assert_eq!(APPEND_HEADROOM_FACTOR, 2);
+/// ```
+#[must_use]
+pub fn reservation_for(n_valid: u64) -> usize {
+    let census = usize::try_from(n_valid).unwrap_or(MAX_ENTRIES_LEN);
+    census
+        .saturating_mul(APPEND_HEADROOM_FACTOR)
+        .min(MAX_ENTRIES_LEN)
+}
+
 /// [`store::format::SLOT_STRIDE`] as a `usize`, for slicing a region.
 const SLOT_STRIDE_LEN: usize = 16_384;
 
@@ -1153,10 +1271,28 @@ impl HeaderRead {
 /// Holds the header — the counters — and an index from key to the newest entry
 /// for that key. The index is reserved from the **committed entry count**,
 /// which is known before the walk begins and which `validate` has already
-/// checked against the region, so it never rehashes and the reservation is
-/// proportional to the census rather than to the file it arrived in:
-/// `docs/07-o1-architecture.md` layer 3, O(1) **worst case** rather than
-/// average. [`Manifest::reserved`] is that number, and M-17 asserts it.
+/// checked against the region, so the reservation is proportional to the census
+/// rather than to the file it arrived in.
+///
+/// # Two paths, two different bounds, said separately
+///
+/// **Lookup — O(1) worst case.** [`Manifest::entry`] is one probe into a table
+/// that the load walk built once and never grew, whatever the census holds.
+/// `docs/07-o1-architecture.md` layer 3. C-12 in `crates/pull/benches/ratio.rs`
+/// measures it at 1×, 10× and 100× the census.
+///
+/// **Append — O(1) worst case for the first `n_valid` new keys, amortised O(1)
+/// after that.** The reservation carries [`APPEND_HEADROOM_FACTOR`]× the
+/// census, so [`Manifest::record`] has at least `n_valid` free slots waiting
+/// and cannot rehash until they are gone; past them one append in a doubling
+/// rebuilds the table at `O(n_keys)`. Until D-0040 this sentence read "it never
+/// rehashes … O(1) worst case", the reservation was exactly `n_valid`, and a
+/// census sitting on a `7·2^k` boundary rehashed on the **first** append —
+/// measured at 22× the cost between a 1,792-entry census and a 57,344-entry
+/// one. `docs/06-limits.md` §23 states what is still not unconditional and what
+/// removing the last arm would cost.
+///
+/// [`Manifest::reserved`] is the reservation, and M-17 and M-19 assert it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
     header: ManifestHeader,
@@ -1290,13 +1426,17 @@ impl Manifest {
         // region's byte length, which is untrusted input. Sizing it from the
         // length made a one-entry census inside a region at the design ceiling
         // allocate 574 MB, because the reservation followed the file rather
-        // than the census. The bound is still known before the loop starts, so
-        // the map is still built once and never grows: layer 3. The `unwrap_or`
-        // arm cannot be reached — `n_valid` is at most `MAX_ENTRIES`, which
-        // fits a `usize` on every target this builds for — and it lives in
-        // `Result::unwrap_or`, which is not this repository's code to measure.
-        let reserve = usize::try_from(header.n_valid).unwrap_or(MAX_ENTRIES_LEN);
-        let mut index: HashMap<EntryKey, Entry> = HashMap::with_capacity(reserve);
+        // than the census.
+        //
+        // The census is then multiplied by `APPEND_HEADROOM_FACTOR` and capped
+        // at the design ceiling, so the walk cannot rehash AND the appends
+        // after it cannot either, for as many new keys as the census already
+        // holds. Reserving exactly `n_valid` left zero free slots at every
+        // count of the form 7·2^k and turned the next append into an O(keys)
+        // rebuild; the numbers that measurement produced are in
+        // `APPEND_HEADROOM_FACTOR`'s note, and so is the derivation of the two.
+        let mut index: HashMap<EntryKey, Entry> =
+            HashMap::with_capacity(reservation_for(header.n_valid));
         let mut n_keys = 0u64;
 
         for (ordinal, chunk) in (0u64..header.n_valid).zip(entries.chunks_exact(IMAGE_LEN)) {
@@ -1372,9 +1512,20 @@ impl Manifest {
     /// `docs/07-o1-architecture.md`: *"Layer 3's guarantee is the absence of a
     /// rehash, so the bound is the reservation itself."* A guarantee about an
     /// allocation that nothing can observe is a guarantee nothing can test, so
-    /// this exposes it: `pull::unit::the_loaded_index_is_reserved_from_the_census`
-    /// asserts that a one-entry census inside a large region reserves for the
-    /// census and not for the region.
+    /// this exposes it, and two tests read it for two different reasons:
+    ///
+    /// * `pull::unit::the_loaded_index_is_reserved_from_the_census` — the
+    ///   reservation follows the census and **not** the region it arrived in.
+    /// * `pull::unit::a_loaded_index_carries_headroom_for_the_appends_after_it`
+    ///   — it is at least [`APPEND_HEADROOM_FACTOR`] × the census (or the
+    ///   design ceiling, whichever is smaller), which is what makes the free
+    ///   slots [`Manifest::record`] relies on a checked number rather than
+    ///   whatever `HashMap`'s rounding happened to leave. That rounding leaves
+    ///   **nothing** at every census of the form `7·2^k`, which is how the
+    ///   append path came to be `O(n_keys)` behind an O(1) comment. D-0040.
+    ///
+    /// This is the table's capacity, not its length: it is always at least
+    /// [`Manifest::keys`] and normally larger.
     #[must_use]
     pub fn reserved(&self) -> usize {
         self.index.capacity()
@@ -1422,6 +1573,35 @@ impl Manifest {
     /// way forward at all. What the writer may not do is append without having
     /// looked at [`Manifest::degraded_reason`], which is why that answer is
     /// carried on the value rather than logged and forgotten.
+    ///
+    /// # What one call costs, stated exactly
+    ///
+    /// Every step here is fixed work — one probe, four counter updates, one
+    /// 64-byte entry image, one 64-byte slot image — **except** the
+    /// `index.insert` that keeps the census current, and that one has a
+    /// condition on it:
+    ///
+    /// * **O(1) worst case for the first `n_valid` calls after a load.**
+    ///   `Manifest::walk` reserved [`APPEND_HEADROOM_FACTOR`]× the census and
+    ///   the walk can leave at most `n_valid` elements in it, so at least
+    ///   `n_valid` slots are free and no call in that run can rebuild the
+    ///   table.
+    /// * **Amortised O(1) after that**, with an `O(n_keys)` worst case: one
+    ///   call in a doubling rebuilds the table and the rest are O(1). Named as
+    ///   amortised rather than dressed as worst case.
+    ///
+    /// **An update to a key already held is not exempt from the second bullet,
+    /// and it is easy to assume it is.** It consumes no slot — the key count
+    /// does not move — but `HashMap::insert` asks the table for one slot
+    /// *before* it looks the key up, so on a table with none left it grows
+    /// anyway. That was written here as "never grows" until the test below
+    /// refused it: `pull::unit::a_loaded_index_carries_headroom_for_the_appends_after_it`
+    /// asserts both halves, the update inside the headroom that does hold and
+    /// the one past it that does not.
+    ///
+    /// A manifest opened at genesis reserves nothing, because there is no
+    /// census to size a reservation from, so its write path is amortised O(1)
+    /// from the first key. `docs/06-limits.md` §17 and §23.
     ///
     /// # Errors
     ///
