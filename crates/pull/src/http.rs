@@ -1126,7 +1126,10 @@ mod tests {
             method: Method::Get,
             range_end: RangeEnd::Inclusive,
             auth: Auth {
-                header: "authorization",
+                // Spelled as `crate::vendor` spells Groww's, capital and all:
+                // this fixture is meant to be that descriptor's shape, and a
+                // lowercase copy would be a second spelling of one name.
+                header: "Authorization",
                 scheme: AuthScheme::Bearer,
             },
             ..spec(PriceScale::Rupees)
@@ -1141,8 +1144,12 @@ mod tests {
             sent.contains("to=2025-07-01"),
             "an inclusive vendor takes the day unchanged: {sent}"
         );
+        // Header names are case-insensitive and the client writes them
+        // lowercased on the wire, so the haystack is folded rather than the
+        // needle being written out in the wire's own casing.
         assert!(
-            sent.contains("authorization: Bearer SUPERSECRET"),
+            sent.to_lowercase()
+                .contains("authorization: bearer supersecret"),
             "the Bearer scheme is a prefix on the value, not a second header: {sent}"
         );
         // A 5xx is not the governor's business and is not a redirect either, so

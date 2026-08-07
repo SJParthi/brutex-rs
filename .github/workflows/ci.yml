@@ -188,6 +188,19 @@ jobs:
           # fixture names and words quoted inside prose. The gate scans comments
           # on purpose, so a word quoted in a doc comment lands here too.
           # `brutex-no-such-dir-ever` is a path chosen to NOT exist.
+          #
+          # The last two lines are the socket and decoder tests in
+          # crates/pull/src/http.rs, and every one of them is a word this
+          # repository chose rather than one a vendor did:
+          #   x            — a JSON string standing where a number belongs
+          #   nz snapshots — fold.rs refusal text asserted back
+          #   decodes unchanged records — expect() messages
+          #   cached       — the SECOND object in the two-object splice fixture
+          #                  (D-0049). Deliberately not `live`, which group 7
+          #                  already carries for a different reason.
+          #   stolen       — the path a test redirect points at, named to read
+          #                  as what following it would have meant (D-0050)
+          #   redirect window_async — substrings a refusal must contain
           scaffold='
           a v one no ok big good invalid genesis manifest write read-only deny
           anything mkdir notutf8 atthebound brutex-pull june july nifty
@@ -195,6 +208,8 @@ jobs:
           real next small bounded three summed everything february
           non-zero non-decreasing held centuries negative per-day per-second
           brutex-no-such-dir-ever
+          x nz snapshots decodes unchanged records
+          cached stolen redirect window_async
           '
 
           # ---- group 6: granularity and session tokens. `Granularity::dir`
@@ -219,15 +234,32 @@ jobs:
           # field names". `FieldNames`/`ResponseShape` in vendor.rs, the
           # column labels fetch.rs quotes back in a refusal, and the file
           # extension archive.rs checks. None is a credential field.
+          #
+          # `data` is an ENVELOPE key — the object a vendor hangs its bars
+          # under, exactly as `payload` above already is, and since D-0049 the
+          # decoder reads only the one the descriptor names. `from` and `to`
+          # are the two query parameters a GET vendor takes its window in
+          # (`Method::Get` in http.rs). All three are wire vocabulary, which is
+          # the category this group exists for.
           record_field='
           open high low close volume timestamp open_interest payload csv
+          data from to
           '
 
           # ---- group 9: an HTTP HEADER NAME, not a value. One broker sends
           # its token in a header called `access-token`; the token itself is
           # read from Parameter Store and never appears in this repository.
           # Read this line twice before adding anything to it.
-          header_name='access-token'
+          #
+          # `x-token` was read twice. It is the header name on the INVENTED
+          # descriptor the http.rs tests are built from — `x-` is the
+          # conventional prefix for a name no registry owns, and no vendor in
+          # crates/pull/src/vendor.rs uses it. The other broker's header is
+          # `Authorization`, which this gate never sees because its capital
+          # letter puts it outside the lower-case pattern being scanned; that
+          # is the scan's shape, not an exemption, and the descriptor spells it
+          # that way because that is the name on the wire.
+          header_name='access-token x-token'
 
           # ---- group 10: bare integers a refusal message must contain, so the
           # test asserts the refused value is IN the message. These are domain
@@ -237,11 +269,35 @@ jobs:
           # perfectly ordinary `<org>` segment, and `253402281000` is twelve
           # digits. It is on this list because it was read, not because a
           # pattern let it past.
-          bound_number='10000 1970 9999 28 29 4294967295 253402281000'
+          bound_number='10000 1970 9999 28 29 4294967295 253402281000
+          0 1e300'
+
+          # ---- group 11: FIELD LABELS IN A `Debug` RENDERING, not values.
+          # `HttpSource`'s Debug impl is hand-written precisely so the token is
+          # never printed, and these two strings are the captions it prints
+          # instead: `base_url` beside the descriptor's URL, and `token` beside
+          # the fixed string `<redacted>`. `token` is on an allowlist in a
+          # credential gate and that is worth stopping on — it is the word
+          # "token", four characters, standing where a value would be if this
+          # impl were derived. That it appears here is the evidence the redact
+          # is in place, not evidence of a leak.
+          debug_label='base_url token'
+
+          # ---- group 12: DATES ON THE WIRE, in the two compact formats.
+          # `DateFormat::{CompactYmd,CompactDmy}` render 2025-07-01 as
+          # `20250701` and `01072025`, and the test that pins all four formats
+          # asserts both. Group 10's note explains why all-digit literals are
+          # scanned rather than waved through, and the `YYYY-MM-DD` exclusion
+          # above is anchored to that one spelling on purpose — so these two
+          # are declared here by hand. Both are the same calendar date this
+          # repository already writes in the clear a dozen times over; neither
+          # names an account, an environment, a vendor or a field.
+          wire_date='20250701 01072025'
 
           allowed="${seg_shape} ${vendor_wire} ${config_fixture}
           ${secret_fixture} ${scaffold} ${timeframe} ${governor}
-          ${record_field} ${header_name} ${bound_number}"
+          ${record_field} ${header_name} ${bound_number}
+          ${debug_label} ${wire_date}"
           bad=0
           while IFS= read -r word; do
             if [ -z "$word" ]; then continue; fi
