@@ -254,7 +254,7 @@ pub fn is_ghost(member: &str) -> bool {
 /// places (`CLAUDE.md` §7), so a third digit is the vendor sending something
 /// this build does not understand, and rounding it here would be a second
 /// snapping site competing with the one at the write boundary.
-fn paisa(text: &str) -> Option<i64> {
+pub(crate) fn paisa(text: &str) -> Option<i64> {
     let (whole, frac) = text.split_once('.').unwrap_or((text, ""));
     if frac.len() > 2 || !frac.bytes().all(|b| b.is_ascii_digit()) {
         return None;

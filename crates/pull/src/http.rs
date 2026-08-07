@@ -42,7 +42,9 @@
 //! number.
 
 use crate::fetch::{BarRequest, BarSource, FetchError, ParallelArrays, RawWindow};
-use crate::vendor::{Auth, AuthScheme, DateFormat, HttpSpec, Method, RangeEnd, ResponseShape};
+use crate::vendor::{
+    Auth, AuthScheme, DateFormat, HttpSpec, Method, PriceScale, RangeEnd, ResponseShape,
+};
 
 /// The most bytes a vendor answer may occupy.
 ///
@@ -185,10 +187,24 @@ pub fn decode_body(body: &str, spec: &HttpSpec) -> Result<RawWindow, FetchError>
         ResponseShape::ParallelArrays { .. } => {
             let f = spec.fields;
             let arrays = ParallelArrays {
-                open: numbers(&root, f.open)?,
-                high: numbers(&root, f.high)?,
-                low: numbers(&root, f.low)?,
-                close: numbers(&root, f.close)?,
+                // PRICES GO THROUGH `prices`, NOT `numbers`, AND THE
+                // DIFFERENCE IS 75 PAISE ON EVERY BAR THAT HAS THEM.
+                //
+                // `numbers` rounds a JSON number to an integer, which is right
+                // for a volume and a timestamp and WRONG for a price. A vendor
+                // quoting rupees sends `24500.75`; rounding that to `24501` and
+                // letting `fetch::to_paisa` multiply by 100 stores ₹24,501.00
+                // and the paise are gone, silently, on every bar.
+                //
+                // `CLAUDE.md` §7 puts the tick grid at TWO decimal places and
+                // the single snap at the write boundary. Rounding to whole
+                // rupees here is a snap at the wrong granularity in the wrong
+                // place. `prices` therefore scales first and rounds once, while
+                // the paise are still in the float.
+                open: prices(&root, f.open, spec.prices)?,
+                high: prices(&root, f.high, spec.prices)?,
+                low: prices(&root, f.low, spec.prices)?,
+                close: prices(&root, f.close, spec.prices)?,
                 volume: numbers(&root, f.volume)?,
                 timestamp: numbers(&root, f.timestamp)?,
                 // OPEN INTEREST IS OPTIONAL AND ITS ABSENCE IS NOT A ZERO.
@@ -216,13 +232,110 @@ pub fn decode_body(body: &str, spec: &HttpSpec) -> Result<RawWindow, FetchError>
     }
 }
 
-/// One named array of numbers out of a JSON body, wherever it sits.
+/// The unit [`decode_body`] leaves prices in, whatever the vendor quoted.
+///
+/// **A caller passing this window to [`crate::fetch::land`] must pass
+/// [`PriceScale::Paisa`], not `spec.prices`.** The conversion has already
+/// happened, and happening twice would multiply every price by 100 again.
+pub const DECODED_PRICE_SCALE: PriceScale = PriceScale::Paisa;
+
+/// One named array of **prices**, converted to exact paisa without a float.
+///
+/// # Two wrong answers preceded this one
+///
+/// The first read a price with `f.round()` and let [`crate::fetch::to_paisa`]
+/// multiply by 100. A vendor quoting `24500.75` therefore stored ₹24,501.00 and
+/// **the 75 paise were gone**, silently, on every bar that had them.
+///
+/// The second scaled before rounding — `24500.75 × 100` — which is *arithmetically*
+/// right and still wrong for this repository: `clippy::float_arithmetic` is
+/// denied workspace-wide, precisely so that `CLAUDE.md` §7's "never a float"
+/// cannot be walked back one expression at a time. The lint was correct. There
+/// is no float in a price here, not even briefly.
+///
+/// # What it does instead
+///
+/// [`crate::csv::paisa`] already turns `"24500.75"` into `2450075` by splitting
+/// on the point and doing integer arithmetic — it is what the local-archive
+/// path has always used, and it is now shared rather than reimplemented. JSON's
+/// number is rendered back to its text with `Display`, which `serde_json` emits
+/// via shortest-round-trip formatting, so a two-decimal price round-trips
+/// character for character.
+///
+/// A vendor sending **more precision than the tick grid holds** — `100.005` —
+/// is refused by name rather than snapped. That matches the CSV path exactly
+/// (`csv::paisa` returns `None` past two decimals) and it is the louder choice:
+/// a third decimal on an NSE price means the descriptor's `PriceScale` is
+/// wrong, and quietly rounding it would hide that.
+///
+/// # Errors
+///
+/// [`FetchError::TransportFailed`] naming the field and the value, for anything
+/// that is not a number or does not land exactly on the paisa grid.
+fn prices(root: &serde_json::Value, name: &str, scale: PriceScale) -> Result<Vec<i64>, FetchError> {
+    array_at(root, name)?
+        .iter()
+        .map(|v| {
+            let refuse = || FetchError::TransportFailed {
+                detail: format!(
+                    "{name:?} holds {v}, which is not a price this build can put \
+                     on the paisa grid"
+                ),
+            };
+            let Some(number) = v.as_number() else {
+                return Err(refuse());
+            };
+            match scale {
+                // Already paisa: an integer count, and nothing to convert.
+                PriceScale::Paisa => number.as_i64().ok_or_else(refuse),
+                // Rupees: the text is the truth, and `csv::paisa` owns the rule.
+                PriceScale::Rupees => crate::csv::paisa(&number.to_string()).ok_or_else(refuse),
+            }
+        })
+        .collect()
+}
+
+/// One named array of counts — volumes, timestamps, open interest.
+///
+/// These are integers in their own right and no scale applies. A vendor writing
+/// `250.0` means two hundred and fifty, so the same text parser is reused and
+/// the hundredths are required to be zero; `250.5` of anything is a shape this
+/// build does not understand and says so.
+///
+/// # Errors
+///
+/// [`FetchError::TransportFailed`] naming the field and the value.
+fn numbers(root: &serde_json::Value, name: &str) -> Result<Vec<i64>, FetchError> {
+    array_at(root, name)?
+        .iter()
+        .map(|v| {
+            if let Some(n) = v.as_i64() {
+                return Ok(n);
+            }
+            let refuse = || FetchError::TransportFailed {
+                detail: format!("{name:?} holds {v}, which is not a whole number"),
+            };
+            let number = v.as_number().ok_or_else(refuse)?;
+            let hundredths = crate::csv::paisa(&number.to_string()).ok_or_else(refuse)?;
+            if hundredths % 100 == 0 {
+                Ok(hundredths / 100)
+            } else {
+                Err(refuse())
+            }
+        })
+        .collect()
+}
+
+/// The array a field names, wherever in the body it sits.
 ///
 /// Searches the top level first, then one level down, because vendors wrap
 /// their payload in a `data` object about as often as they do not. Two levels
 /// and no further: an unbounded search would find a field of the right name in
 /// the wrong place and report success.
-fn numbers(root: &serde_json::Value, name: &str) -> Result<Vec<i64>, FetchError> {
+fn array_at<'a>(
+    root: &'a serde_json::Value,
+    name: &str,
+) -> Result<&'a Vec<serde_json::Value>, FetchError> {
     let found = root.get(name).or_else(|| {
         root.as_object()
             .and_then(|o| o.values().find_map(|v| v.get(name)))
@@ -235,49 +348,7 @@ fn numbers(root: &serde_json::Value, name: &str) -> Result<Vec<i64>, FetchError>
             ),
         });
     };
-    array.iter().map(|v| one_number(v, name)).collect()
-}
-
-/// One JSON number as an exact `i64`, or a refusal.
-///
-/// # `as` was wrong here and clippy is the reason it did not ship
-///
-/// This was `v.as_f64().map(|f| f.round() as i64)`. An `as` cast from `f64` to
-/// `i64` **saturates**: `1e300 as i64` is `i64::MAX`, and `f64::NAN as i64` is
-/// `0`. Both are silent. A vendor answering `1e300` for a price would have been
-/// stored as the largest paisa value that exists, and a `NaN` would have been
-/// stored as **zero** — and `CLAUDE.md` §7 is explicit that `i64::MIN` is the
-/// only null and *zero means zero*. A NaN quietly becoming a real price of ₹0.00
-/// is exactly the class of defect §4 forbids: a fallback that hides a failure.
-///
-/// So the float path refuses anything it cannot represent exactly rather than
-/// coercing it. The integer path is tried first and is what every well-behaved
-/// vendor hits; the float path exists because JSON has one number type and a
-/// vendor may write `1234.0`.
-fn one_number(v: &serde_json::Value, name: &str) -> Result<i64, FetchError> {
-    if let Some(n) = v.as_i64() {
-        return Ok(n);
-    }
-    let refuse = |why: &str| FetchError::TransportFailed {
-        detail: format!("{name:?} holds {v}, which {why}"),
-    };
-    let Some(f) = v.as_f64() else {
-        return Err(refuse("is not a number"));
-    };
-    if !f.is_finite() {
-        return Err(refuse("is not finite"));
-    }
-    let rounded = f.round();
-    // The bound is stated as f64 literals rather than `i64::MAX as f64`, because
-    // `i64::MAX` is not representable in f64 — it rounds UP to 2^63, so a naive
-    // `<= i64::MAX as f64` comparison admits a value one past the end. 2^63 and
-    // -2^63 are both exact in f64, so this comparison is exact.
-    if !(-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&rounded) {
-        return Err(refuse("is outside the range an i64 can hold"));
-    }
-    // Every branch above has proved this cast is exact.
-    #[allow(clippy::cast_possible_truncation)]
-    Ok(rounded as i64)
+    Ok(array)
 }
 
 impl BarSource for HttpSource {
@@ -355,5 +426,250 @@ impl HttpSource {
         }
 
         decode_body(&text, &self.spec)
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    reason = "a test that cannot panic cannot fail, and these lints exist to \
+              keep panics out of the crate rather than out of its tests"
+)]
+mod tests {
+    use super::*;
+    use crate::vendor::{Budget, FieldNames, Pooling, TimestampEncoding};
+
+    /// A descriptor with only the fields the decoder reads, so a test says what
+    /// it is testing. `prices` is the parameter every price case turns on.
+    fn spec(prices: PriceScale) -> HttpSpec {
+        HttpSpec {
+            base_url: "https://vendor.invalid",
+            bars_path: "/bars",
+            method: Method::Post,
+            auth: Auth {
+                header: "x-token",
+                scheme: AuthScheme::Raw,
+            },
+            date_format: DateFormat::DashedYmd,
+            range_end: RangeEnd::Exclusive,
+            response: ResponseShape::ParallelArrays { envelope: None },
+            fields: FieldNames {
+                open: "open",
+                high: "high",
+                low: "low",
+                close: "close",
+                volume: "volume",
+                timestamp: "timestamp",
+                open_interest: None,
+            },
+            timestamps: TimestampEncoding::EpochSecondsUtc,
+            prices,
+            budget: Budget {
+                per_second: None,
+                per_minute: None,
+                per_day: None,
+            },
+            pooling: Pooling::PerVendor,
+        }
+    }
+
+    /// **THE 75 PAISE.** This is the regression test for a defect that reached
+    /// the tree and would have silently rewritten every fractional price in the
+    /// archive.
+    ///
+    /// The decoder read a price with `f.round()` and handed the result to
+    /// `fetch::to_paisa`, which multiplies a rupee figure by 100. So a vendor
+    /// quoting `24500.75` produced `24501` rupees, then `2450100` paisa —
+    /// **₹24,501.00, and the 75 paise were gone.** No error, no counter, no
+    /// drop reason: the bar landed on disk looking exactly like a real one.
+    ///
+    /// `CLAUDE.md` §7 puts the tick grid at two decimals and the single snap at
+    /// the write boundary. Rounding to whole rupees is a snap at the wrong
+    /// granularity, in the wrong place.
+    #[test]
+    fn a_fractional_rupee_price_keeps_its_paise() {
+        let body = r#"{
+            "open":[24500.75],"high":[24500.75],"low":[24500.75],
+            "close":[24500.75],"volume":[250],"timestamp":[1751337900]
+        }"#;
+        let window = decode_body(body, &spec(PriceScale::Rupees)).expect("decodes");
+        let row = &window.rows[0];
+        assert_eq!(
+            row.open, 2_450_075,
+            "24500.75 rupees is 2450075 paisa. 2450100 would be the bug: the \
+             price rounded to a whole rupee before the scale was applied."
+        );
+        assert_eq!(
+            (row.high, row.low, row.close),
+            (2_450_075, 2_450_075, 2_450_075)
+        );
+        assert_eq!(row.volume, 250, "a volume is a count and is not scaled");
+    }
+
+    /// Every price the paisa grid can hold, held exactly.
+    #[test]
+    fn every_price_on_the_paisa_grid_survives_intact() {
+        for (sent, want) in [
+            ("0", 0_i64),      // zero means zero — never a null
+            ("0.01", 1),       // one paisa survives
+            ("0.1", 10),       // one tenth is TEN paisa, not one
+            ("100.4", 10_040), // a single decimal pads on the RIGHT
+            ("24500.75", 2_450_075),
+            ("99999.99", 9_999_999),
+        ] {
+            let body = format!(
+                "{{\"open\":[{sent}],\"high\":[{sent}],\"low\":[{sent}],\
+                  \"close\":[{sent}],\"volume\":[1],\"timestamp\":[1751337900]}}"
+            );
+            let window = decode_body(&body, &spec(PriceScale::Rupees)).expect("decodes");
+            assert_eq!(window.rows[0].open, want, "{sent} rupees is {want} paisa");
+        }
+    }
+
+    /// A price finer than the tick grid is **refused, not rounded**.
+    ///
+    /// `CLAUDE.md` §7 fixes the grid at two decimals. A third decimal on an NSE
+    /// price does not mean "round me" — it means the descriptor's `PriceScale`
+    /// is wrong, or the field is not a price at all. Snapping would hide that.
+    /// `crate::csv::paisa` has always refused it on the archive path, and this
+    /// path now shares that one function, so the two cannot disagree.
+    #[test]
+    fn a_price_finer_than_the_tick_grid_is_refused_rather_than_rounded() {
+        for sent in ["100.005", "100.12345", "1e300"] {
+            let body = format!(
+                "{{\"open\":[{sent}],\"high\":[1],\"low\":[1],\"close\":[1],\
+                  \"volume\":[1],\"timestamp\":[1]}}"
+            );
+            let Err(FetchError::TransportFailed { detail }) =
+                decode_body(&body, &spec(PriceScale::Rupees))
+            else {
+                panic!("{sent} is off the paisa grid: refuse it, do not snap it")
+            };
+            assert!(
+                detail.contains("open"),
+                "the refusal names the field: {detail}"
+            );
+        }
+    }
+
+    /// A vendor already quoting paisa is taken as is and never scaled twice.
+    #[test]
+    fn a_paisa_vendor_is_not_scaled_again() {
+        let body = r#"{"open":[2450075],"high":[2450075],"low":[2450075],
+                       "close":[2450075],"volume":[1],"timestamp":[1751337900]}"#;
+        let window = decode_body(body, &spec(PriceScale::Paisa)).expect("decodes");
+        assert_eq!(window.rows[0].open, 2_450_075, "already paisa, unchanged");
+    }
+
+    /// `NaN` must never become a price, and `1e300` must never become
+    /// `i64::MAX`. Both were silent under the `as` cast this replaced.
+    #[test]
+    fn a_price_that_cannot_be_represented_is_refused_rather_than_coerced() {
+        for bad in ["1e300", "-1e300"] {
+            let body = format!(
+                "{{\"open\":[{bad}],\"high\":[1],\"low\":[1],\"close\":[1],\
+                  \"volume\":[1],\"timestamp\":[1]}}"
+            );
+            let refused = decode_body(&body, &spec(PriceScale::Rupees));
+            assert!(
+                matches!(refused, Err(FetchError::TransportFailed { .. })),
+                "{bad} must be refused, not saturated to i64::MAX"
+            );
+        }
+        // serde_json parses a bare `NaN` as invalid JSON, so the reachable
+        // not-a-number case is a string where a number belongs.
+        let body = r#"{"open":["x"],"high":[1],"low":[1],"close":[1],
+                       "volume":[1],"timestamp":[1]}"#;
+        assert!(matches!(
+            decode_body(body, &spec(PriceScale::Rupees)),
+            Err(FetchError::TransportFailed { .. })
+        ));
+    }
+
+    /// The seven-array length check is the trap `zip` would have hidden: a
+    /// short array must refuse the whole window, not yield a short one.
+    #[test]
+    fn arrays_that_disagree_in_length_refuse_the_whole_window() {
+        let body = r#"{"open":[1,2],"high":[1,2],"low":[1,2],"close":[1,2],
+                       "volume":[1],"timestamp":[1,2]}"#;
+        assert!(matches!(
+            decode_body(body, &spec(PriceScale::Rupees)),
+            Err(FetchError::LengthDisagreement { .. })
+        ));
+    }
+
+    /// A body that is not JSON, and one missing a declared field, are both
+    /// named rather than defaulted.
+    #[test]
+    fn a_malformed_or_incomplete_body_is_refused_by_name() {
+        assert!(matches!(
+            decode_body("not json", &spec(PriceScale::Rupees)),
+            Err(FetchError::TransportFailed { .. })
+        ));
+        let missing = r#"{"open":[1],"high":[1],"low":[1],"close":[1],"volume":[1]}"#;
+        let Err(FetchError::TransportFailed { detail }) =
+            decode_body(missing, &spec(PriceScale::Rupees))
+        else {
+            panic!("a missing timestamp array must refuse")
+        };
+        assert!(
+            detail.contains("timestamp"),
+            "the refusal names it: {detail}"
+        );
+    }
+
+    /// The arrays may sit one level down, under an envelope key.
+    #[test]
+    fn arrays_one_level_below_the_root_are_found() {
+        let body = r#"{"data":{"open":[100.5],"high":[100.5],"low":[100.5],
+                       "close":[100.5],"volume":[7],"timestamp":[1751337900]}}"#;
+        let window = decode_body(body, &spec(PriceScale::Rupees)).expect("decodes");
+        assert_eq!(window.rows[0].open, 10_050);
+    }
+
+    /// The blocking seam refuses by name rather than silently blocking, and
+    /// the credential never appears in a `Debug` rendering.
+    #[test]
+    fn the_sync_seam_refuses_and_the_token_is_never_printed() {
+        let source = HttpSource::new(spec(PriceScale::Rupees), "SUPERSECRET".to_owned())
+            .expect("a client builds");
+        let shown = format!("{source:?}");
+        assert!(!shown.contains("SUPERSECRET"), "the token leaked: {shown}");
+        assert!(shown.contains("<redacted>"), "and it says so: {shown}");
+        assert_eq!(source.url(), "https://vendor.invalid/bars");
+    }
+
+    /// `wire_end` is the one conversion site for a non-inclusive `toDate`.
+    #[test]
+    fn the_wire_end_is_the_day_after_only_for_an_exclusive_vendor() {
+        let last = crate::session::Day::new(2025, 7, 31).expect("a real day");
+        assert_eq!(
+            HttpSource::wire_end(last, RangeEnd::Exclusive, DateFormat::DashedYmd)
+                .expect("has a successor"),
+            "2025-08-01",
+            "exclusive means the day AFTER goes on the wire"
+        );
+        assert_eq!(
+            HttpSource::wire_end(last, RangeEnd::Inclusive, DateFormat::DashedYmd)
+                .expect("unchanged"),
+            "2025-07-31"
+        );
+    }
+
+    /// Every date format the descriptor can declare is written, and written
+    /// zero-padded, so a one-digit month cannot reach a vendor as `2025-7-1`.
+    #[test]
+    fn every_declared_date_format_is_written_zero_padded() {
+        let day = crate::session::Day::new(2025, 7, 1).expect("a real day");
+        for (format, want) in [
+            (DateFormat::DashedYmd, "2025-07-01"),
+            (DateFormat::CompactYmd, "20250701"),
+            (DateFormat::SlashedDmy, "01/07/2025"),
+            (DateFormat::CompactDmy, "01072025"),
+        ] {
+            assert_eq!(HttpSource::on_the_wire(day, format), want);
+        }
     }
 }
