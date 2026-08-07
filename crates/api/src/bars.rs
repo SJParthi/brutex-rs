@@ -140,7 +140,19 @@ pub fn open(
                   fail to open a file this repository wrote."
     )]
     let symbol_id = brutex_core::universe::fnv1a(symbol) as u32;
-    BarFile::open_or_create(store_root, path, symbol_id).map_err(|why| why.to_string())
+    // `open_existing`, NEVER `open_or_create`. This is a GET.
+    //
+    // The read-write door creates what it cannot find — six directories, a
+    // 32 KiB initialised bar file and a `.lock` — so this handler used to
+    // manufacture a month for any symbol a caller typed into the query string,
+    // and then report that month as empty. The file it described was the file
+    // the request had just made.
+    //
+    // The disk was the smaller cost. The larger one is that creating on read
+    // collapses "there is no such month" into "this month holds nothing", which
+    // are different answers to an operator, and it made the missing-month arm
+    // below unreachable. A `Missing` refusal now names the path it looked for.
+    BarFile::open_existing(store_root, path, symbol_id).map_err(|why| why.to_string())
 }
 
 /// One page of bars, read by index.
@@ -357,6 +369,67 @@ mod tests {
     }
 
     /// No page this server emits carries a script, and this one is no exception.
+    /// **A `GET` NEVER CREATES A MONTH.**
+    ///
+    /// `open` used to call `BarFile::open_or_create`, the store's read-write
+    /// door, so this handler manufactured whatever tuple arrived in the query
+    /// string: six directories, a 32 KiB initialised bar file and a `.lock`
+    /// beside it. It then rendered "this month is empty" about the file the
+    /// request had just created. Reproduced live before the fix against a
+    /// symbol that has never traded.
+    ///
+    /// The assertion that matters is the second one. It is not enough to check
+    /// that the call refused — `open_or_create` also refuses eventually, on the
+    /// symbol-id or timeframe cross-check, *after* the file is on disk. So this
+    /// walks the tree and requires it to be empty, which is the only form of the
+    /// claim a creating opener cannot satisfy.
+    #[test]
+    fn asking_for_a_month_that_was_never_written_creates_nothing() {
+        fn walk(dir: &std::path::Path, into: &mut Vec<String>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, into);
+                }
+                into.push(path.display().to_string());
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "brutex-bars-readonly-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("a scratch root");
+
+        let month = YearMonth::new(2025, 7).expect("a real month");
+        let outcome = open(&root, Vendor::Dhan, "NSE", "INDEX", "NOTAREALSYMBOL", month);
+
+        let why = outcome.expect_err(
+            "a month nobody has ever written must refuse, not be conjured into \
+             existence so it can be reported empty",
+        );
+        assert!(
+            why.contains("NOTAREALSYMBOL"),
+            "the refusal must name the path it looked for, so an operator can \
+             see WHICH month is absent: {why}"
+        );
+
+        let mut found = Vec::new();
+        walk(&root, &mut found);
+        assert!(
+            found.is_empty(),
+            "a read-only GET wrote {} entries to the store: {found:#?}",
+            found.len()
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn the_price_table_carries_no_script() {
         let html = table(&[Bar {

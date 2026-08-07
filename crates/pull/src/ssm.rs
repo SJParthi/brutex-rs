@@ -610,6 +610,72 @@ mod tests {
         assert!(canon.contains("content-type;host;x-amz-date;x-amz-security-token;x-amz-target"));
     }
 
+    /// Every signed header is one the request actually sends, and the converse.
+    ///
+    /// The test above ends one step short of the fault. It proves the *canonical
+    /// request* names `x-amz-security-token` — and its own comment says a signed
+    /// header that was not sent "is the commonest `SigV4` mistake". It then never
+    /// looks at what `get_parameter` transmits, which was four fixed headers
+    /// regardless. So the comment identified the exact defect sitting forty lines
+    /// away, and the assertion could not see it.
+    ///
+    /// This closes the loop from the other end: take the signed-header list and
+    /// require that something sends each name.
+    #[test]
+    fn every_signed_header_is_one_the_request_actually_sends() {
+        // Set unconditionally by `get_parameter`, plus `host`, which the HTTP
+        // client derives from the URL. Anything beyond these must come from
+        // `wire_headers`, or it is signed and never transmitted.
+        const FIXED: [&str; 4] = ["content-type", "x-amz-date", "x-amz-target", "host"];
+
+        for token in [None, Some("SESSIONTOKEN".to_owned())] {
+            let identity = AwsIdentity {
+                session_token: token.clone(),
+                ..identity()
+            };
+            let signable = Signable {
+                host: "ssm.ap-south-1.amazonaws.com",
+                region: "ap-south-1",
+                stamp: "20260807T120000Z",
+                body: "{}",
+                session_token: token.as_deref(),
+            };
+            let sent: Vec<&str> = wire_headers(&identity).iter().map(|(n, _)| *n).collect();
+            let signed: Vec<&str> = signable.signed_headers().split(';').collect();
+
+            for name in &signed {
+                assert!(
+                    FIXED.contains(name) || sent.contains(name),
+                    "{name:?} is signed but nothing puts it on the wire, so AWS \
+                     rebuilds a different canonical request and refuses a valid \
+                     credential. Session token present: {}",
+                    token.is_some()
+                );
+            }
+            // The converse, because an UNSIGNED header that is sent breaks the
+            // signature in exactly the same way and reads identically at AWS.
+            for name in &sent {
+                assert!(
+                    signed.contains(name),
+                    "{name:?} is sent but not signed, which fails the same way"
+                );
+            }
+            // The token itself must be the value, not a placeholder or a debug
+            // rendering of the Option.
+            if let Some(expected) = token.as_deref() {
+                assert_eq!(
+                    wire_headers(&identity)
+                        .iter()
+                        .find(|(n, _)| *n == "x-amz-security-token")
+                        .map(|(_, v)| *v),
+                    Some(expected)
+                );
+            } else {
+                assert!(sent.is_empty(), "a long-lived key sends no extra header");
+            }
+        }
+    }
+
     /// The header carries the key id, the scope and the signature, and **never
     /// the secret**.
     #[test]
@@ -844,6 +910,30 @@ mod shared_file_tests {
     }
 }
 
+/// The credential-dependent headers this request puts on the wire.
+///
+/// Returned as data rather than applied in place so a test can hold it beside
+/// [`Signable::signed_headers`] and prove the two agree. They must: AWS rebuilds
+/// the canonical request from what it *receives*, so a name that is signed and
+/// not sent — or sent and not signed — produces `SignatureDoesNotMatch` on a
+/// credential that is perfectly valid.
+///
+/// That is precisely what happened. `signed_headers` added
+/// `x-amz-security-token` whenever a session token was present and the request
+/// set four fixed headers regardless, so every Parameter Store read under a
+/// temporary credential was refused. It survived because this machine holds a
+/// long-lived key pair with no session token, making the arm unreachable, and
+/// every test stopped at `Signable` — the half that was already correct.
+///
+/// The condition below reads `identity.session_token`, the same field
+/// `Signable` carries, so the two cannot drift.
+fn wire_headers(identity: &AwsIdentity) -> Vec<(&'static str, &str)> {
+    match identity.session_token.as_deref() {
+        Some(token) => vec![("x-amz-security-token", token)],
+        None => Vec::new(),
+    }
+}
+
 /// One live `GetParameter` call, signed and sent.
 ///
 /// # This is the function that makes it real
@@ -896,20 +986,39 @@ pub async fn get_parameter(
             SsmError::unreachable(format!("the HTTPS client could not be built: {why}"))
         })?;
 
-    let answer = client
+    let mut request = client
         .post(format!("https://{host}/"))
         .header("content-type", CONTENT_TYPE)
         .header("x-amz-target", TARGET)
         .header("x-amz-date", stamp)
-        .header("authorization", authorization)
-        .body(body)
-        .send()
-        .await
-        .map_err(|why| {
-            // `why` is reqwest's own words and never carries a header this code
-            // set, so neither secret can reach this string.
-            SsmError::unreachable(format!("{host} was not reached: {why}"))
-        })?;
+        .header("authorization", authorization);
+
+    // A temporary credential MUST transmit the header its own signature covers.
+    //
+    // `signed_headers` and `canonical_request` both add `x-amz-security-token`
+    // when a session token is present, so the signature is computed over it.
+    // Sending four headers regardless meant AWS rebuilt a canonical request
+    // without that line, derived a different signature, and refused every read
+    // with `SignatureDoesNotMatch` — for a credential that was perfectly valid.
+    //
+    // It has never been seen because this machine's credential is a long-lived
+    // key pair with no session token, so the arm is unreachable here and every
+    // test that exercised it stopped at `Signable`, which is the half that was
+    // already right. It breaks the first time the pull runs under an assumed
+    // role, an SSO profile, or anything on EC2 or ECS.
+    //
+    // The condition is `identity.session_token`, matching `Signable`'s field
+    // exactly, so the two cannot drift into disagreeing about whether the
+    // header exists.
+    for (name, value) in wire_headers(identity) {
+        request = request.header(name, value);
+    }
+
+    let answer = request.body(body).send().await.map_err(|why| {
+        // `why` is reqwest's own words and never carries a header this code
+        // set, so neither secret can reach this string.
+        SsmError::unreachable(format!("{host} was not reached: {why}"))
+    })?;
 
     let status = answer.status();
     let text = answer

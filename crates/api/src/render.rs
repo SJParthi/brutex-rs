@@ -2245,16 +2245,34 @@ pub fn bars_page(view: &BarsView<'_>) -> String {
 /// [`crate::catalog::PAGE_ROWS`] is one constant: two copies drift, and a pager
 /// that disagrees with its table about where a page ends is a page an operator
 /// cannot trust.
+///
+/// # The separator is chosen, not assumed
+///
+/// `base` may already carry a query string: `/bars` keeps every narrowing in
+/// the URL so a page of prices stays linkable, and hands this function
+/// `/bars?symbol=…&segment=…&vendor=…&month=…`. Appending a second `?` produced
+/// `…&month=2025-07?page=1`, and since [`crate::server::param`] splits on `&`
+/// alone, `month` came back as `2025-07?page=1`, failed to parse, and every
+/// previous/next click on `/bars` returned 400 — the page's only control, dead
+/// for any month over one page.
+///
+/// It was not caught because the pager had 100% region coverage from four
+/// callers that all passed a bare path. Coverage measures which lines ran, not
+/// which inputs were tried.
 fn pager(base: &str, page: usize, last_page: usize) -> String {
     if last_page == 0 {
         return String::new();
     }
+    // A base that already narrows continues with `&`; a bare path starts its
+    // query with `?`. Decided once here rather than at each of the two links,
+    // so they cannot disagree.
+    let sep = if base.contains('?') { '&' } else { '?' };
     let mut out = String::with_capacity(256);
     out.push_str("<nav class=\"pager\">");
     if page > 0 {
         let _ = write!(
             out,
-            "<a href=\"{base}?page={}\">&larr; previous</a>",
+            "<a href=\"{base}{sep}page={}\">&larr; previous</a>",
             page.saturating_sub(1)
         );
     }
@@ -2267,7 +2285,7 @@ fn pager(base: &str, page: usize, last_page: usize) -> String {
     if page < last_page {
         let _ = write!(
             out,
-            "<a href=\"{base}?page={}\">next &rarr;</a>",
+            "<a href=\"{base}{sep}page={}\">next &rarr;</a>",
             page.saturating_add(1)
         );
     }
@@ -3542,6 +3560,44 @@ mod tests {
         let last = pager("/store", 2, 2);
         assert!(last.contains("/store?page=1"), "{last}");
         assert!(!last.contains("next"), "{last}");
+
+        // A base that ALREADY narrows continues its query with `&`.
+        //
+        // `/bars` keeps the symbol, segment, vendor and month in the URL so a
+        // page of prices stays linkable, and every one of the four callers
+        // above passes a bare path — which is why this function held 100%
+        // region coverage while emitting two `?` in one href for the only
+        // caller that mattered. `server::param` splits on `&` alone, so the
+        // last parameter came back with `?page=1` welded onto it and every
+        // previous/next click on `/bars` returned 400.
+        let narrowed = "/bars?symbol=NIFTY&segment=INDEX&vendor=dhan&month=2025-07";
+        let paged = pager(narrowed, 1, 2);
+        assert!(
+            paged.contains(&format!("{narrowed}&page=0")),
+            "previous must continue the existing query: {paged}"
+        );
+        assert!(
+            paged.contains(&format!("{narrowed}&page=2")),
+            "and so must next: {paged}"
+        );
+
+        // The whole-output assertion, because `contains` alone cannot prove a
+        // BAD href is absent — only that a good one is present. One `?` per
+        // href and no more, whatever the base.
+        for rendered in [&paged, &first, &middle] {
+            for href in rendered.split("href=\"").skip(1) {
+                let url = href.split('"').next().expect("a closing quote");
+                assert_eq!(
+                    url.matches('?').count(),
+                    1,
+                    "exactly one query separator per href, found {url:?}"
+                );
+                assert!(
+                    !url.contains("07?page") && !url.contains("=0?") && !url.contains("=1?"),
+                    "a second `?` welded onto a parameter value: {url:?}"
+                );
+            }
+        }
     }
 
     #[test]

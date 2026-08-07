@@ -16,6 +16,7 @@
 //! |---|---|
 //! | [`BarFile::open_or_create`] on a **new** month | the whole 32768-byte header region, and the file's *name* in its directory — both `fsync`ed, the directory one included |
 //! | [`BarFile::open_or_create`] on an **existing** month | nothing new; it only reads |
+//! | [`BarFile::open_existing`] | nothing, ever — it creates no directory, no bar file and no lock, and a month that is absent is [`StoreError::Missing`] naming the path |
 //! | [`BarFile::append`] returning [`Appended::Committed`] | every appended record **and** the header slot that publishes them, in that order, with an `fsync` after each |
 //! | [`BarFile::append`] returning [`Appended::AlreadyPresent`] | nothing was written; the batch was already the file's tail, byte for byte |
 //! | [`BarFile::read_record`] | nothing; it writes nothing |
@@ -47,6 +48,13 @@
 //! before the bar file is even measured and held for the life of the
 //! [`BarFile`]. A second [`BarFile`] on the same month is refused by name with
 //! [`StoreError::Locked`] rather than allowed to interleave commits.
+//!
+//! [`BarFile::open_existing`] takes that lock **shared** instead, so any number
+//! of readers coexist and no reader blocks another, while a writer holding it
+//! exclusively still refuses them all. A reader also never *creates* the lock
+//! file: a bar file with no lock beside it has had no writer since it was
+//! written, so there is nothing to wait for, and conjuring the file into being
+//! to hold a lock on it would be the very write that door exists to avoid.
 //!
 //! **What the lock does not protect against, stated rather than implied away:**
 //!
@@ -525,7 +533,7 @@ pub struct BarFile {
     /// releases the month, so the field is live for its whole life and is
     /// touched exactly once, by the compiler-generated drop. Declared last so
     /// the records are closed before the lock is released.
-    _lock: File,
+    _lock: Option<File>,
 }
 
 impl BarFile {
@@ -588,6 +596,132 @@ impl BarFile {
             len = fault(bars.metadata(), &bars_path, Action::Measure)?.len();
         }
 
+        let header = read_header(&bars, &bars_path, len)?;
+        let layout = refused(Layout::for_version(header.format_version), &bars_path)?;
+        let extra = layout.ragged_tail_bytes(len);
+        if extra != 0 {
+            return Err(StoreError::RaggedTail {
+                path: bars_path,
+                len,
+                extra,
+            });
+        }
+        if header.symbol_id != symbol_id {
+            return Err(StoreError::SymbolMismatch {
+                path: bars_path,
+                stored: header.symbol_id,
+                asked: symbol_id,
+            });
+        }
+        if header.timeframe_secs != timeframe_secs {
+            return Err(StoreError::TimeframeMismatch {
+                path: bars_path,
+                stored: header.timeframe_secs,
+                asked: timeframe_secs,
+            });
+        }
+        Ok(Self {
+            bars,
+            bars_path,
+            layout,
+            header,
+            _lock: Some(lock),
+        })
+    }
+
+    /// Open a month that already exists, **without creating anything**.
+    ///
+    /// # Why this exists
+    ///
+    /// [`Self::open_or_create`] was this module's only door, so every reader
+    /// went through the writer's path and got the writer's side effects. A
+    /// read-only HTTP page — `GET /bars` — therefore *created* whatever tuple a
+    /// caller typed into the query string: six directories, a 32 KiB bar file
+    /// with a freshly initialised header, and a `.lock` beside it. Then it
+    /// rendered "this month is empty" about the file the request had just made.
+    /// Reproduced live against a symbol that has never existed.
+    ///
+    /// The disk cost was the smaller half. The load-bearing damage was that
+    /// `open_or_create` had erased the distinction the page was trying to
+    /// report: "there is no such month" and "there is a month and it holds
+    /// nothing" arrived as the same answer, so the missing-file arm was
+    /// unreachable and the honest message could never be shown. That is
+    /// `CLAUDE.md` §4 — a fallback that hides a failure — reached by accident
+    /// rather than by design.
+    ///
+    /// # What it does differently
+    ///
+    /// No `create_dir_all`, no `create(true)`, no `initialise`. A month that is
+    /// not there returns [`StoreError::Missing`] naming the path it looked for,
+    /// which is what the caller wanted to say all along. The lock is taken
+    /// **shared**, so any number of readers coexist and a reader never blocks
+    /// another reader — but a writer holding the exclusive lock still refuses
+    /// them, which is the property that matters.
+    ///
+    /// Every validation after the open is the same one `open_or_create`
+    /// performs, and both call [`Self::validated`] so they cannot drift into
+    /// disagreeing about what a well-formed month is.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotABarPath`] for a non-bar path, [`StoreError::Missing`]
+    /// when the month does not exist, [`StoreError::Locked`] when a writer holds
+    /// it, and whatever [`Self::validated`] refuses.
+    pub fn open_existing(
+        root: &Path,
+        path: StorePath<'_>,
+        symbol_id: u32,
+    ) -> Result<Self, StoreError> {
+        if path.file() != FileKind::Bars {
+            return Err(StoreError::NotABarPath { found: path.file() });
+        }
+        let bars_path = path.to_path_buf(root);
+        let lock_path = path.with_file(FileKind::Lock).to_path_buf(root);
+
+        // Read-only and no `create`, so a missing month is `ENOENT` and
+        // `classify` turns it into `Missing` naming this exact path.
+        let bars = fault(File::open(&bars_path), &bars_path, Action::Open)?;
+
+        // The lock is opened read-only and never created. A bar file with no
+        // lock beside it has had no writer since it was made, so there is
+        // nothing to wait for and `None` is the honest answer; inventing the
+        // file to hold a lock on would be the very write this function exists
+        // to avoid.
+        let lock = match File::open(&lock_path) {
+            Ok(handle) => {
+                if let Err(refusal) = handle.try_lock_shared() {
+                    return Err(lock_fault(&lock_path, refusal));
+                }
+                Some(handle)
+            }
+            Err(why) if why.kind() == io::ErrorKind::NotFound => None,
+            Err(why) => return Err(classify(&lock_path, Action::Open, &why)),
+        };
+
+        let len = fault(bars.metadata(), &bars_path, Action::Measure)?.len();
+        Self::validated(
+            bars,
+            bars_path,
+            lock,
+            len,
+            symbol_id,
+            path.timeframe().secs(),
+        )
+    }
+
+    /// The checks both doors perform, once.
+    ///
+    /// Split out so the read-only and read-write paths cannot drift about what
+    /// a well-formed month is — a reader that accepted a file the writer would
+    /// have refused is a reader that serves bytes nobody agreed were bars.
+    fn validated(
+        bars: File,
+        bars_path: PathBuf,
+        lock: Option<File>,
+        len: u64,
+        symbol_id: u32,
+        timeframe_secs: u32,
+    ) -> Result<Self, StoreError> {
         let header = read_header(&bars, &bars_path, len)?;
         let layout = refused(Layout::for_version(header.format_version), &bars_path)?;
         let extra = layout.ragged_tail_bytes(len);
