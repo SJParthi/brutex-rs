@@ -1338,11 +1338,7 @@ fn pull_forms(view: &PullView<'_>) -> String {
     let _ = write!(
         out,
         "{}",
-        field(
-            "Local vendor folder (optional)",
-            "<input type=\"text\" name=\"folder\" \
-             placeholder=\"/Users/you/Downloads/GDFL/GFDLNFO_TICK_01072025/Futures/-III\">",
-        )
+        field("Local vendor folder (optional)", &folder_input(),)
     );
     out.push_str("<button type=\"submit\">Start spot pull</button>");
     out.push_str("</form>");
@@ -2069,6 +2065,123 @@ pub fn audit_page(view: &AuditView<'_>) -> String {
     body.push_str(&notes_block(view.notes));
     body.push_str(FOOT);
     body
+}
+
+/// The folder field, with every archive folder found on disk offered as a
+/// choice rather than as a path to be typed.
+///
+/// # Why a datalist and not a dropdown
+///
+/// A `<select>` would refuse a folder this build did not find, and a text box
+/// alone made an operator type
+/// `/Users/you/Downloads/GDFL/GFDLNFO_TICK_01072025/Futures/-III` by hand and
+/// get one character wrong. `<datalist>` is both: **click a suggestion, or type
+/// anything.** It is markup, so it needs no JavaScript — `CLAUDE.md` §2 does
+/// not permit a `.js` file and CI gate 1 enforces that.
+///
+/// # What it looks for, and what it refuses to do
+///
+/// Two roots, both fixed: `~/Downloads` and `~/.brutex/vendor-data`. It
+/// descends **six levels at most** and offers only directories that already
+/// hold a `.csv`, so an operator is never offered a folder that will refuse.
+///
+/// Six, not three, and the number was measured rather than chosen: the
+/// operator's own data sits at
+/// `Downloads/GDFL/GFDLNFO_TICK_01072025/Futures/-III`, which is five levels
+/// below `~`. A depth of three found `Downloads` and `Downloads/GDFL` and
+/// stopped two levels short of every folder he would actually pick — a
+/// suggestion list that offers only the folders nobody wants is worse than none.
+///
+/// It does **not** search the whole home directory. An unbounded walk is an
+/// unbounded wait — `docs/07-o1-architecture.md` law 5 — and a suggestion list
+/// is a convenience, not an index. [`MAX_FOLDER_SUGGESTIONS`] caps it, and the
+/// cap is stated on the page rather than silently truncating: a list that
+/// quietly stops is a list that appears to have found everything.
+fn folder_input() -> String {
+    let mut found: Vec<String> = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = std::path::PathBuf::from(home);
+        for root in [
+            home.join("Downloads"),
+            home.join(".brutex").join("vendor-data"),
+        ] {
+            collect_csv_dirs(&root, 6, &mut found);
+        }
+    }
+    found.sort();
+    found.dedup();
+    let capped = found.len() > MAX_FOLDER_SUGGESTIONS;
+    found.truncate(MAX_FOLDER_SUGGESTIONS);
+
+    let mut out = String::with_capacity(1024);
+    out.push_str(
+        "<input type=\"text\" name=\"folder\" list=\"folders\" \
+         placeholder=\"click to choose, or type a path\">",
+    );
+    out.push_str("<datalist id=\"folders\">");
+    for f in &found {
+        let _ = write!(out, "<option value=\"{}\">", escape(f));
+    }
+    out.push_str("</datalist>");
+    let _ = write!(
+        out,
+        "<p class=\"fine\">{} folder(s) holding CSVs found under \
+         <code>~/Downloads</code> and <code>~/.brutex/vendor-data</code>{}. \
+         The list is a convenience, not an index — type any path you like.</p>",
+        found.len(),
+        if capped {
+            format!(", capped at {MAX_FOLDER_SUGGESTIONS}")
+        } else {
+            String::new()
+        }
+    );
+    out
+}
+
+/// The most folders the picker will offer.
+///
+/// Bounded because the list is rendered into every page load. A cap that is
+/// stated is a cap; a cap that silently truncates is a lie about completeness.
+const MAX_FOLDER_SUGGESTIONS: usize = 60;
+
+/// Directories at or under `dir` that directly contain a `.csv`.
+///
+/// Depth-limited and allocation-bounded. `depth` counts down, so the recursion
+/// cannot outlive the number it was given — there is no cycle check because
+/// there is no cycle a bounded depth can complete.
+fn collect_csv_dirs(dir: &std::path::Path, depth: usize, out: &mut Vec<String>) {
+    if depth == 0 || out.len() >= MAX_FOLDER_SUGGESTIONS || !dir.is_dir() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut has_csv = false;
+    let mut children: Vec<std::path::PathBuf> = Vec::new();
+    for e in entries.flatten() {
+        let p = e.path();
+        // The macOS shadow tree is not data — the same rule `pull::csv::is_ghost`
+        // applies, for the same reason: those entries end in `.csv` and are
+        // binary, so a folder full of them would be offered as a real choice.
+        let name = p.file_name().map(|n| n.to_string_lossy().into_owned());
+        if name
+            .as_deref()
+            .is_some_and(|n| n.starts_with('.') || n == "__MACOSX")
+        {
+            continue;
+        }
+        if p.is_dir() {
+            children.push(p);
+        } else if p.extension().is_some_and(|x| x == "csv") {
+            has_csv = true;
+        }
+    }
+    if has_csv {
+        out.push(dir.to_string_lossy().into_owned());
+    }
+    for c in children {
+        collect_csv_dirs(&c, depth - 1, out);
+    }
 }
 
 #[cfg(test)]
