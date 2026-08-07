@@ -29,6 +29,7 @@ enforces it.
 | Crate | Owns | May depend on | Exists |
 |---|---|---|---|
 | `core` | types, error enums, the condition bit table, pure rules, the calendar | nothing | ✓ |
+| `greeks` | Black-Scholes-Merton in `f64`: the five greeks, implied volatility, the strike ladder | **nothing** | ✓ |
 | `store` | the fixed-stride bar file: open, read, append, verify | `core` | ✓ |
 | `vocab` | mask type, mask operations, the frequent-frontier structure | `core` | — |
 | `indicators` | bars in, condition bits out | `core`, `store` | — |
@@ -39,10 +40,18 @@ enforces it.
 | `web` | browser UI, compiled to `wasm32-unknown-unknown` | **`core` only** | — |
 | `cli` | operator entry point | everything | — |
 
-**Five of the ten exist today**: `core`, `store`, `pull`, `api`, `costs`. The
-`Exists` column is read off `Cargo.toml`'s `members` list, which names a
-directory only once that directory is there — see the comment in that file. A
-row with `—` is a crate this document has planned and no code has yet.
+**Six of the eleven exist today**: `core`, `greeks`, `store`, `pull`, `api`,
+`costs`. The `Exists` column is read off `Cargo.toml`'s `members` list, which
+names a directory only once that directory is there — see the comment in that
+file. A row with `—` is a crate this document has planned and no code has yet.
+
+**This table was merged from two branches that each rewrote it.** `feat/pull`
+added the `Exists` column and the `costs` row; `feat/greeks` added the `greeks`
+row against the older four-column shape. Neither was wrong and the union is the
+answer — the same resolution the `D-0037` identifier collision and the
+`06-limits.md` §18 collision needed in the same merge. Three collisions, one
+cause: **a branch that reads only its own copy of a shared append-only
+document.**
 
 ---
 
@@ -80,6 +89,27 @@ calendar (`session::Day`), the inclusive window and the vendor's non-inclusive
 (`manifest::Manifest`). Re-deriving any of them inside `api` would be a second
 Gregorian rule and a second answer to what goes on the wire. The graph is still
 acyclic — `pull` does not depend on `api` — and the build order is unchanged.
+
+`greeks` is a **leaf with no arrow into it and none out of it**, which is why
+it is not drawn in the diagram above. It is not part of the sweep. It is shared
+with the `tickvault` repository, which takes it by git URL, so it declares zero
+dependencies for the same reason `core` does — and unlike `core`, its public
+surface mentions no type from this workspace at all, only `f64` and plain enums
+it owns. **Both halves of that are enforced by CI gate 9b**, in the same shape
+as gate 9 for `core` and gate 7 for `web`; before D-0046 they were advertised in
+six places and enforced in none. It is also the one place in this repository
+where a float is the correct type: `CLAUDE.md` §7 keeps statistical values at
+full precision and reserves `i64` paisa for prices, and this crate never sees a
+paisa. Its `rust-version` is written literally rather than inherited, because
+the MSRV of a shared leaf crate is a property of the crate and not of the
+workspace hosting it. See `docs/05-decisions.md` D-0046.
+
+**`CLAUDE.md` §5 does not list it.** That is a real discrepancy and §10 makes
+`CLAUDE.md` the winner, so this row is the document running ahead of session
+law rather than the other way round. `greeks` adds no arrow to §5's graph, so
+it violates nothing in it; bringing §5 into line is an operator decision, and
+it is **still open** — see D-0046, "One discrepancy an operator has to settle",
+which carries the one-line repair.
 
 ---
 

@@ -1681,3 +1681,418 @@ D-0045 owns `docs/**` only. Both of these are in `crates/**`:
   *"`docs/04-invariants.md` C-11"*. C-11 is a `crates/pull` manifest invariant
   (`pull::bench::census_beats_the_scan_it_replaces`). The correct id is **C-14**,
   which is what `crates/api/benches/ratio.rs` itself prints.
+## 29. `crates/greeks` — what is bounded, what is measured, and what is neither
+
+Added by D-0046. **Renumbered from §18 to §29 on merge**: `feat/greeks` numbered it when this file ended at §17, and `feat/pull` had meanwhile appended §18 through §28. Same collision as the D-0037 one, one document over — and the same cause: a number chosen on an unmerged branch is provisional until it merges.
+
+### The solver is not O(1), and the crate says so in its own documentation
+
+`CLAUDE.md` §3 rule 4 is about per-operation cost. Inverting the
+Black-Scholes price in volatility is a root find. What it has instead is a
+ceiling that is **arithmetic**:
+
+```text
+MAX_ITERATIONS = BRACKET_EVALUATIONS + NEWTON_STEPS + BISECTION_STEPS
+                 + FINAL_EVALUATION
+               = 2 + 8 + 64 + 1
+               = 75
+```
+
+The bisection performs exactly 64 halvings of `[1e-6, 5]` with no early exit,
+no tolerance test and no stagnation detection. `(5 − 1e-6)/2^64 ≈ 2.7e-19` is
+narrower than one unit in the last place of any volatility in the band, so a
+fixed count is sufficient rather than merely safe — and its cost does not
+depend on any input value, because it does not read the input to decide when
+to stop.
+
+**This said 72 until D-0046, and 72 was wrong by three.** The two evaluations
+that establish the bracket and the one at the answer were never counted, while
+the constant's own documentation called itself "the largest total number of
+model evaluations one solve can cost". A refused solve costs 75 as well. The
+test named for the bound read the `iterations` field, which was
+`spent + BISECTION_STEPS` by construction and therefore could not observe the
+gap; `greeks::solver::the_reported_cost_is_every_model_evaluation` now counts
+at `Checked::greeks`, the one function every evaluation passes through.
+
+**Measured on an 819-point grid of moneyness × maturity × volatility — by the
+calibration harness, whose rescuer was Brent and whose bisection exited early.
+This is NOT a measurement of the shipped solver.** It is why the shipped shape
+was chosen. The shipped solver uses a fixed 64-halving bisection and is
+measured at a worst total of **75**, which is also its arithmetic ceiling. The
+table below counts *search* evaluations only, which is what that harness
+counted; add three for the bracket and the answer to compare it with 75.
+
+| Newton cap | by Newton | rescued | worst total | median |
+|---|---|---|---|---|
+| 0 — bracketed only | 0 | 523 | 55 | 17 |
+| **8 — the cap shipped** | 232 | 291 | **63** | 19 |
+| 500 | 432 | 100 | 444 | 11 |
+
+Newton alone reached **427** iterations with a fixed tolerance and **444** with
+stagnation detection, at `K/S = 1.10, T = 2h`; median 7–8, p90 ≈ 71, p99
+351–394. Worst among points resolvable to fourteen digits: **131**.
+
+**Said plainly because it argues against the shipped shape:** at a cap of 8 the
+Newton pre-pass did not beat the bracketed method alone on that grid — 63
+against 55 worst, 19 against 17 median. It is kept for the common case, which
+converges in three or four steps and never reaches the bisection.
+
+### `exp` and `ln` are NOT measured for constant time
+
+The closed form has no loop and no input-dependent branch other than the one
+choosing a call from a put. That is a statement about the **code**, not about
+the **cost**: whether the platform's `exp`, `ln` and `sqrt` take the same time
+for every argument is not measured here, and this crate carries no bench that
+would measure it. Any claim that one greek evaluation is constant-time is
+therefore an **EXTRAPOLATION** from the shape of the source.
+
+What *is* asserted as a number is the solver's iteration count, which is an
+integer and does not move with a scheduler —
+`greeks::solver::the_iteration_count_never_exceeds_the_arithmetic_bound`.
+
+### `f64` runs out before the model does
+
+Measured floor — the smallest relative radius around the true volatility on
+which the computed price is still strictly ordered on both sides — against the
+textbook `ulp(price)/vega` estimate:
+
+| case | `ulp/vega` estimate | **measured floor** |
+|---|---|---|
+| at the money, 7 days | 1.60e-16 | **1.67e-14** |
+| at the money, 1 day | 2.11e-16 | 3.76e-14 |
+| at the money, 1 hour | 1.29e-16 | 2.73e-13 |
+| 1.25 S, 7 days | 8.32e-19 | 1.84e-13 |
+| 0.75 S, any maturity | 1.3e-1 | **inf — no volatility recoverable** |
+
+Over an 819-point grid: **223 points resolvable to fourteen digits, 321
+resolvable but coarser, 275 not resolvable at all.**
+
+**Fourteen significant digits is at the very edge of `f64` Black-Scholes even
+at the money.** A vendor printing seventeen digits of implied volatility is
+printing the shortest round-trip form of an `f64`; it is **not** evidence of
+fourteen correct digits.
+
+### The `Indeterminate` numerator was wrong, and "two orders of magnitude" was too
+
+The paragraph that used to sit here called the `ulp(price)/vega` estimate
+"optimistic by two orders of magnitude". **Both halves of that were wrong, and
+D-0046 replaces them.**
+
+`ulp(price)` is not the granularity of a model price at all. The price is
+`forward·N(d1) − discounted_strike·N(d2)`: each product carries a unit in the
+last place of *its own* magnitude, and each `N` carries the CDF's `2.22e-16`
+absolute error multiplied by the leg in front of it. So the granularity is set
+by the legs. Measured on a one-day NIFTY call two percent in the money at 5%
+volatility: price `507.76`, `ulp(price) = 1.13e-13`, real granularity
+`1.14e-11` — a factor of **100.8**, not the "two orders of magnitude at the
+money" the old text quoted for a different quantity. Deep out of the money the
+factor is unbounded: the price falls below the granularity of the terms that
+produced it entirely, and no ratio describes that.
+
+What the wrong numerator cost, measured over an NSE envelope — spot 25,851.19,
+the 50-point ladder ±20 rungs, maturities from one 1-minute bar to one year, σ
+5%–60%, r = 9.46%, premiums at or above one ₹0.05 tick, **8,759 quotable
+points**:
+
+| numerator | accepted | wrong >1e-3 | wrong >1e-2 | worst relative σ error |
+|---|---|---|---|---|
+| `ulp(price)` — shipped first | 8,096 | **15** | **5** | **5.5e-2** |
+| `max(forward, K·e^-rT)` | 8,072 | 0 | 0 | 3.3e-4 |
+| **`forward + K·e^-rT` — shipped now** | 8,068 | **0** | **0** | **2.2e-4** |
+
+Every one of the 15 was returned as `Ok` with an `uncertainty` inside the
+`1e-3` bound; the worst came back 5.14% wrong reporting `7.76e-4`. Two named
+degenerate cases fell out of the same expression and are fixed by the same
+line: a subnormal quote underflowed the numerator to exactly `0.0` — over a
+sweep of 3,388 sub-`1e-10` quotes that reach the guard, **440** were accepted
+reporting perfect certainty, the worst repricing **`1.49e25`** relative away
+from its own quote — and a quote below `1e-290` was accepted at
+`uncertainty = 3.5e-19` while repricing **1,183×** away. Both are now refused.
+The expression divides before it multiplies, and
+`price_scale / vega ≥ 1/4` for any inputs, so it cannot underflow.
+
+`GreeksError::Indeterminate` still screens on a first-order estimate, so its
+criterion remains **necessary and not sufficient** — it cannot see that the
+computed price is not strictly monotone in σ. Passing it does not prove the
+answer is good to `MAX_RELATIVE_UNCERTAINTY`; failing it proves the answer is
+worthless. What has changed is that the bound is now *met* by the answers it
+accepts: worst relative volatility error `2.2e-4` on the NSE envelope and
+`2.3e-6` on the crate's own grid, against a stated `1e-3`.
+
+**And the test could not have caught it.** `price → IV → price` is satisfied
+identically wherever the computed price is flat in `f64`, which is exactly the
+regime the guard exists for: at the failing point the price round trip measures
+`0e0` while the volatility is 5.14% wrong. `crates/greeks`'s grid also stepped
+straight over the regime — moneyness rungs 0.80/0.95/1.00/1.05/1.25 and
+sub-0.02-year maturities of only 1/8760 and 1/365. Both are repaired:
+`greeks::solver::a_volatility_round_trips_through_the_solver_and_back` asserts
+the volatility, and the grid gains 0.98/1.02 rungs and 2- and 5-day maturities.
+Under the old numerator that grid accepts 1,137 answers with a worst of
+`1.31e-3`, so the new test fails on the old code.
+
+### Bit-for-bit only within one target
+
+`CLAUDE.md` §3 rule 5 asks for byte-identical reruns. **Within one target this
+crate delivers it**; across two targets it does not, and the difference is
+measured rather than reasoned about.
+
+`exp` and `ln` are not correctly rounded in any mainstream libm and IEEE-754
+does not require them to be. Verified on this machine: the release LLVM IR
+emits `@llvm.exp.f64` ×10 and `@llvm.log.f64` ×2 and the aarch64 assembly emits
+`bl _exp` ×9 and `bl _log` ×1 — calls into the platform's libm, not code in
+this crate. `sqrt` is the hardware `fsqrt` and *is* correctly rounded, so it
+contributes nothing; there are zero fused multiply-adds and zero fast-math
+flags in the emitted code.
+
+Measured natively, by running the crate's arithmetic twice on this machine —
+once through Apple's libm and once through the pure-Rust `libm` crate, which is
+what `wasm32-unknown-unknown` links through `compiler-builtins`. The copy used
+was first validated bit-for-bit against the shipped crate over 12,096
+comparisons.
+
+| | measured |
+|---|---|
+| `exp` disagrees between the two | **1,866 of 20,000** probed arguments; first at `exp(-59.916)`, 1 ulp |
+| `ln` disagrees | **971 of 20,000** |
+| model price | **63 of 1,344** grid rows differ, worst relative **1.23e-12** |
+| implied volatility | **140 of 1,344** differ, worst relative **4.22e-14** |
+| error variant, `method`, `iterations` | **zero** changes on this grid |
+
+A ±1-ulp perturbation of every `exp` and `ln` result — an upper bound on what a
+*conforming* libm may do, and **not** a model of a real one, since no real
+implementation is biased in one direction everywhere — moves prices by up to
+`6.44e-10` relative and changes the **refusal kind** on up to 1,151 of 1,344
+rows. **No discrete flip was observed between the two real libms and none is
+claimed.** The mechanism is demonstrated; the occurrence is not.
+
+CI runs `ubuntu-24.04` on x86_64 with glibc's libm while development is aarch64
+macOS with Apple's, so two libms are already in play in this project. **No
+measurement was taken on glibc** — this machine has no x86_64 toolchain — and
+nothing here should be read as one.
+
+**The discrete outputs are target-dependent too, and that is the sharper
+hazard.** Which `GreeksError` variant is returned, which `Method` finished, and
+the `iterations` count are all decided by floating-point comparisons on
+quantities carrying the libm's last bits — `uncertainty > MAX_RELATIVE_UNCERTAINTY`,
+`price <= intrinsic`, `vega <= 0.0`, `(MIN..=MAX).contains(&next)` and
+`step.abs() <= NEWTON_STEP_TOLERANCE`. A trailing-digit difference is a
+rounding note; a caller that logs "the vendor quote was below intrinsic" on one
+machine and "indeterminate" on another has no reproducible audit trail at all.
+Under the ±1-ulp perturbation that is what happens on up to 1,151 of 1,344
+rows.
+
+**The rule this implies:** a greek, an implied volatility, a `Method` or an
+`iterations` count from this crate must never enter the blake3 run identity of
+`CLAUDE.md` §3 rule 3 and must never be compared byte-for-byte across machines;
+a consumer that branches on `GreeksError` variant or records `method` must
+treat that as a property of the machine it ran on. Nothing in this repository
+does any of it today. Invariant G-10 is narrowed to what its test proves.
+
+One side effect worth recording: the repaired `Indeterminate` numerator also
+tightens cross-libm agreement, because the points it now refuses are the
+ill-conditioned ones. Under the ±1-ulp perturbation the worst
+implied-volatility divergence falls from `9.80e-4` to `4.40e-6`.
+
+### Hart 5666 caps at about eight relative digits
+
+Shipped because it is 145× faster than the reference. Measured: **2.22e-16**
+absolute everywhere, **8.911872737504238e-9** relative at `x = −7.78`. Every
+price this crate produces inherits that. Abramowitz & Stegun 7.1.26 was
+rejected outright — 6.97e-8 absolute and a relative error of **1.01** in the
+tail, which is no relative accuracy at all.
+
+### The anchor is not an anchor, and this is the honest reading of it
+
+Three claims made in the first version of this section, and in the first draft
+of the ledger entry that is now D-0046, were withdrawn by D-0046 after
+measurement. All three overstated what one strike can carry.
+
+**1. "Four of the eight published numbers are inputs to the fit." It is six.**
+`root_years()` consumes both deltas through `published_d1()`; `close_one_side()`
+consumes vega once per side and theta once per side. Delta ×2 + vega ×2 + theta
+×2 = six. Those six land at `1e-15`–`1e-14` against a `1e-9` tolerance because
+a bisection inverted its own equation.
+
+**2. "The two gammas are the prediction, and reproducing them is the thing
+this file actually proves." They are not a prediction.** With `q = 0` the
+fitted spot is `S = vega·100/(n(d1)·√T)`, so the fitted gamma reduces to
+`n(d1)^2 / (100·vega·sigma)` — no `S`, no `K`, no `T`, no `r`. That is the same
+scale-free identity `vega·gamma·sigma == n(d1)^2` used, *with the published
+gammas as inputs*, to decide the volatility transposition. One equation
+asserted twice. Measured through the shipped `Contract::greeks`: forcing `r`
+from −50% to +200% and scaling `T` by 0.25× to 10× leaves both gammas identical
+to fifteen printed digits, and the two residuals the anchor prints
+(`1.561e-7`, `3.423e-6`) are the two the transposition test produces.
+
+**3. No single contract reproduces the chain at all.** Matching both published
+deltas exactly forces `d1 = 0.097184 / 0.082008`, which forces the model's vega
+*ratio* to `n(d1c)/n(d1p) = 0.998641`. That quantity contains no `S`, `K`, `T`
+or `r`, so nothing can move it. Dhan publishes `12.2025/12.18593 = 1.001360`.
+Minimax over the four scale-fixing fields at `q = 0`, all four residuals
+balanced on the bound: **884× the vendor's own `5e-6` display half-ulp.** The
+reported "agreement" exists because *two mutually inconsistent contracts* were
+fitted to one strike; the 0.2722% spot residual between them is the honest
+headline, and it is the one residual invariant to the day divisor — identical
+to nine decimals for every divisor from 252 to 500.
+
+A genuinely independent anchor needs a field the fit does not consume: the
+premium `C − P`, or a second strike from the same chain at the same instant.
+Neither was captured.
+
+### The day divisor: 252 is excluded, 365 is not selected
+
+The criterion — the two sides of one strike must agree on `r` — is *affine* in
+the divisor, because the `e^{rT}` in `r·K·e^{-rT}` cancels against `K`'s
+construction. So the side-to-side rate spread is a straight line in `D` with
+exactly one root. Measured through the shipped crate:
+
+| `D` | 252 | 360 | 365 | 365.25 | 366 | **370.0757** | 372 | 375 | 400 |
+|---|---|---|---|---|---|---|---|---|---|
+| spread, points | −23.2598 | −1.9848 | −0.9999 | −0.9506 | −0.8029 | **2.8e-15** | +0.3791 | +0.9700 | +5.8948 |
+
+At `D* = 370.075666` both sides give `r = 10.019595%` exactly. The criterion's
+own ranking is therefore `370.08 > 375 > 365 > 366 > … > 252`. It excludes a
+trading-day divisor by a factor of 23, which is the fact the crate's unit table
+rests on, and it does **not** pick a calendar one.
+
+Two consequences were recorded as facts and were not:
+
+- The **0.9999-point "rate residual"** was pinned as a property of the sample.
+  It is an artifact of assuming `D = 365`; at the criterion's root it is zero.
+- **Nothing in the anchor pinned 365.** Replaying every divisor-dependent
+  assertion at `D = 375` instead of 365, **every one of them still passed** —
+  the eight greek comparisons, both rho signs, the spot spread (0.2722%, which
+  does not move), the rate spread (0.9700, inside the pinned `[0.85, 1.15]`)
+  and the rate midpoint (10.0756%, inside the pinned `[9, 11]`). `D = 375` is
+  exactly the number of one-minute
+  bars in an NSE session (09:15–15:30), so it is a realistic wrong choice a
+  future editor could make, and no test would have caught it.
+
+Repaired by `greeks::vendor_anchor::the_rate_criterion_has_its_root_at_370_and_365_is_a_convention_near_it`,
+which asserts the root's location and the spread's monotonicity in `D`, and by
+`…the_trading_day_divisor_is_excluded_and_the_calendar_one_is_not_selected`,
+which asserts both what survives and that 375 beats 365.
+
+### The carry is assumed, not measured
+
+`the_delta_difference_needs_no_carry_once_the_two_volatilities_are_right`
+contained no volatility and tested no carry: `published_d1()` reads only the
+two deltas, so its assertion was `N(N^-1(x)) + N(N^-1(y)) == x + y`, which
+holds for any deltas, any volatilities and any `q`. Measured end to end
+through the shipped crate, refitting the same eight published fields:
+
+| `q` | fitted `T` | fitted `r`, call / put | worst published residual |
+|---|---|---|---|
+| 0% | 5.158352 cal days | 9.4619% / 10.4618% | 3.423e-6 |
+| 1% | 4.085107 cal days | 2.2634% / 20.2018% | 3.643e-6 |
+| 2% | 3.428167 cal days | −2.8682% / 27.9462% | 3.792e-6 |
+
+All three reproduce every published field, both gammas included, inside the
+vendor's `5e-6` display precision. `q = 0` is **consistent** with the sample
+and is not implied by it, and the `T = 5.158 ± 0.079` day interval is a
+rounding-box width conditional on `q = 0` and on the transposition — not an
+identification result. The test is renamed to what it proves and
+`…the_carry_is_consistent_with_zero_and_the_sample_cannot_pin_it` is what
+actually probes `q`.
+
+The `q = −46%` figure the first version printed for "what a single volatility
+would need" was never computed by anything. It is **−42.54%**, and the test now
+takes it.
+
+### What the Dhan sample cannot settle
+
+The captured chain pins `T` — conditional on `q = 0` and on the transposition —
+and does **not** pin `r`. Over the rounding box of the six printed fields —
+200,000 draws, uniform half-ulp on each, deterministic generator:
+
+| quantity | p2.5 | median | p97.5 | width |
+|---|---|---|---|---|
+| `T`, calendar days | 5.0796 | **5.1583** | 5.2376 | 0.158 |
+| `S` | 25654.8 | 25851.2 | 26050.8 | 396 |
+| `r`, call side | 8.9173% | **9.4618%** | 10.0025% | **1.085 pts** |
+| `r`, put side | 9.8966% | **10.4619%** | 11.0326% | 1.136 pts |
+
+and the two sides differ by 1.00 points, which lies outside both intervals. The
+problem is well-conditioned in `T` and ill-conditioned in `r`, structurally:
+`r` enters theta only through `r·K·e^-rT·N(d2)` while `T` enters through
+`S·n(d1)·sigma/(2·sqrt(T))`, which is most of it. One-at-a-time sensitivity to
+the last printed digit says the same thing — a half-ulp on either delta moves
+`T` by 0.046 days and `r` by 0.32 points, while half-ulps on vega and theta
+move `r` by **0.0000**.
+
+A joint four-parameter chi-square over all eight published fields, each with
+its `5e-6` display precision as its sigma, gives **chi²/dof = 7.0e5 at best**
+across all eight configurations tested. **No single `(S, K, T, r)` reproduces
+all eight fields within their printed precision.** Best-fit residual pulls run
+to −1249 on the call delta.
+
+Publishing the spot would not fix it: a 1% error in `S` moves `r` by only about
+0.2 points, measured. What would settle it, in order of leverage:
+
+1. **The premiums.** `C − P = S·e^-qT − K·e^-rT` is model-free and linear in
+   `r`. Measured leverage at this maturity: one rupee of `C − P` is worth
+   **0.27 percentage points** of `r`.
+2. **The capture and expiry timestamps.** 5.158 calendar days ending 15:30 IST
+   lands at 21:06, outside session hours; 3.561 trading days lands inside one.
+   Both are arithmetically available and the sample cannot choose.
+3. **A second strike from the same chain at the same instant.** `T` and `r` are
+   common across strikes, so two strikes over-determine both — and would expose
+   the volatility transposition directly.
+
+### UNVERIFIED
+
+- Whether Dhan's `r` is a market rate or a hardcoded constant near 10%.
+- **The day divisor, and the day count behind it.** 252 is excluded at 23.3:1.
+  365 is **not** selected — the criterion's root is 370.08 and it prefers 375.
+- **The carry.** `q = 0` is assumed; `q = 1%` and `q = 2%` fit the same eight
+  fields at `T = 4.085` and `3.428` days.
+- Whether the vendor prices spot BSM or forward Black-76. Every conclusion
+  above survives either, but the forward reading would shift `T` by about 4%.
+- The NIFTY and BANKNIFTY strike intervals. Nothing in `docs/00-charter.md`
+  states them, so `Moneyness::from_ladder` takes the interval as an argument
+  and assumes nothing.
+- **Whether this crate's output is reproducible on x86_64 glibc.** Two libms
+  were compared, both reachable from this machine. glibc's was not one of them,
+  and no claim is made about it.
+
+### Mutation testing: 320 killed, 2 alive, and both are named
+
+`cargo mutants --package greeks`, on the tree that ships: **335 mutants, 320
+caught, 2 missed, 0 timed out, 13 unviable.** Eleven of the thirteen unviable
+replace a function body with `Default::default()` for a type that has no
+`Default`; the other two turn `+` into `-` inside `MAX_ITERATIONS`'s own
+definition, where `2 − 8` does not const-evaluate. None of them compiles and
+none is a survivor.
+
+The first pass missed **eleven**, and every one of them was a real hole:
+
+| what survived | what it exposed |
+|---|---|
+| `>` → `>=` on four separate bounds | no test stood on the inclusive edge of any bound. Each bound was proved to refuse the value past it and never proved to accept the value on it |
+| `*` → `/` inside rho, twice | the central-difference check skipped a greek whose *analytic* value was below the stencil's noise floor — so a defect that made rho small made itself unresolvable and escaped. The gate now uses the larger of the analytic and the numeric value |
+| six arithmetic mutations in the Brenner-Subrahmanyam seed | a seed only changes how long the search takes, never what it returns, so nothing that asserts an answer can see it being wrong. The seed is now a named function with its own test |
+| `+=` → `*=` on the iteration counter | `iterations <= MAX_ITERATIONS` is satisfied by zero. The floor is now asserted as well as the ceiling |
+
+**The two that remain are not holes, and this is the honest reading of them:**
+
+1. `solver.rs` — `uncertainty > MAX_RELATIVE_UNCERTAINTY` against `>=`. The two
+   differ only when the computed uncertainty is *exactly* `1e-3`. That value is
+   a quotient of a price, a vega and a volatility, all derived through a root
+   find; no input can be chosen to produce the exact bit pattern, so no test
+   can distinguish the two.
+2. `solver.rs` — `price(middle) < price` against `<=` inside the bisection. The
+   two differ only when the model price at a midpoint equals the target
+   exactly, and at that point **both** choices keep the root inside the
+   bracket. The final answers can differ by at most the final bracket width,
+   `2.7e-19`, which is below one unit in the last place of any volatility the
+   function returns.
+
+`CLAUDE.md` §9 asks for no surviving mutant on a touched module. Two survive,
+both on a comparison whose boundary is unreachable, and neither corresponds to
+a behaviour a caller could observe. Recording them here is the alternative to
+either deleting the check or claiming a clean sweep that was not taken.
+
+Two more were removed rather than tested, in `normal.rs`: `x > 0.0` appeared
+twice where `x` can never be zero — once past the saturating tail, once where
+`upper` is exactly `0.5` at zero and both arms return the same number. Both are
+now written as a question about the **sign**, which has no boundary at all.
