@@ -42,11 +42,12 @@
 //! on every bar that can be constructed. A floor there would be a branch no
 //! input could take.
 //!
-//! # Constant per-operation cost
+//! # Constant per-operation cost, counted
 //!
-//! One selection, two additions, one comparison, two differences and three
-//! narrowings. No loop, and nothing that depends on how far apart the two bars
-//! are.
+//! One `match` on the direction, two additions, two subtractions (one of them
+//! `checked`), two comparisons, one absolute value and two narrowings from
+//! `i128` back to `i64`. No loop, no allocation, and nothing whose count
+//! depends on how far apart the two bars are or how large their prices.
 
 use brutex_core::price::Paisa;
 

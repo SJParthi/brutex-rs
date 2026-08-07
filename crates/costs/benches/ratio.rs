@@ -36,6 +36,19 @@
 //!   and December must cost what January costs. If the month index started to
 //!   matter, something is walking the calendar.
 //!
+//! # Stage three: the round trip
+//!
+//! The charge stack is a straight-line integer sequence with no loop at all, so
+//! the claim is the strongest of the three and the falsification is the
+//! bluntest: **the size of the trade must not cost anything.** A thousand lots
+//! is one multiplication away from one lot, and a premium of ₹1,00,000 is the
+//! same divisions as a premium of ₹0.05. If either started to cost, something
+//! in the stack is iterating over the position instead of scaling it.
+//!
+//! The refusal is measured too, for the reason C-K-04 exists: a stack that got
+//! fast by pricing an unverified window at today's rate would pass every ratio
+//! here and be the exact defect the crate exists to prevent.
+//!
 //! There is no benchmarking framework, for the reason `crates/store` gives:
 //! it would be a dependency. Every ratio below is integer arithmetic.
 
@@ -52,11 +65,14 @@ use brutex_core::price::Paisa;
 use brutex_core::symbol::Symbol;
 use costs::day::TradeDay;
 use costs::expiry::{next_monthly_expiry, next_weekly_expiry};
+use costs::fill::{Bar, Direction, Fills, worst_case_fills};
 use costs::lot::{LotSize, contract_quantity, lot_size_on, notional};
 use costs::moneyness::{MoneynessSteps, moneyness_steps};
-use costs::rate::BpsX100;
+use costs::rate::{BpsX100, Broker};
 use costs::regime::{exchange_charge_rate, stt_exercise_rate, stt_options_rate};
+use costs::scope::Segment;
 use costs::strike::{StrikeStep, at_the_money, strike_at, strike_step_on};
+use costs::trip::{Charges, Contract, Leg, Outcome, Rates, RoundTrip, charge_stack, price};
 use costs::venue::{SweptSlot, swept_slot};
 
 /// A ratio above this is a failure. Thousandths, so the comparison is integer.
@@ -416,6 +432,220 @@ fn the_stage_two_pre_history_windows_still_refuse() -> bool {
     ok
 }
 
+/// A flat fill bar, or a loud failure.
+fn flat_bar(price_paisa: i64) -> Option<Bar> {
+    match Bar::flat(Paisa::from_raw(price_paisa)) {
+        Ok(bar) => Some(bar),
+        Err(reason) => {
+            println!("  BENCH SETUP FAILED for a bar at {price_paisa}: {reason}");
+            None
+        }
+    }
+}
+
+/// The worst-case fills of a flat-bar long round trip, or a loud failure.
+fn flat_fills(entry: i64, exit: i64) -> Option<Fills> {
+    let (Some(entry_bar), Some(exit_bar)) = (flat_bar(entry), flat_bar(exit)) else {
+        return None;
+    };
+    match worst_case_fills(entry_bar, exit_bar, Direction::Long) {
+        Ok(fills) => Some(fills),
+        Err(reason) => {
+            println!("  BENCH SETUP FAILED for the fills: {reason}");
+            None
+        }
+    }
+}
+
+/// The NSE rate set on a day inside every verified window, or a loud failure.
+fn nse_rates() -> Option<Rates> {
+    let when = day(2026, 5, 15)?;
+    match Rates::resolve(Broker::Groww, Exchange::Nse, when) {
+        Ok(rates) => Some(rates),
+        Err(reason) => {
+            println!("  BENCH SETUP FAILED for the rate set: {reason}");
+            None
+        }
+    }
+}
+
+/// C-K-10 — the charge stack costs the same however big the trade is.
+///
+/// The whole stage-three claim in one measurement. Twelve multiplications and
+/// twenty-two divisions, whatever the quantity and whatever the premium. If a
+/// thousand lots cost more than one lot, something is accumulating per lot; if
+/// a large premium costs more than a small one, something is accumulating per
+/// rupee.
+fn the_trade_size_does_not_change_the_charge_stack_cost() -> bool {
+    let (Some(fills), Some(rates)) = (flat_fills(100_00, 120_00), nse_rates()) else {
+        return false;
+    };
+
+    let time = |quantity: i64| {
+        cost_ps(|| {
+            charge_stack(
+                black_box(fills),
+                black_box(quantity),
+                black_box(Direction::Long),
+                black_box(&rates),
+            )
+        })
+    };
+    let base = time(65);
+    let mut ok = true;
+    ok &= ratio("C-K-10 stack, 1 lot vs 1,000 lots", base, time(65_000));
+    ok &= ratio(
+        "C-K-10 stack, 1 lot vs 1,000,000 lots",
+        base,
+        time(65_000_000),
+    );
+
+    // And the premium magnitude: a five-paisa option against a lakh-rupee one.
+    let priced = |entry: i64, exit: i64| {
+        let Some(at) = flat_fills(entry, exit) else {
+            return 0;
+        };
+        cost_ps(|| {
+            charge_stack(
+                black_box(at),
+                black_box(65),
+                black_box(Direction::Long),
+                black_box(&rates),
+            )
+        })
+    };
+    let cheap = priced(5, 10);
+    ok &= ratio(
+        "C-K-10 stack, a 5-paisa premium vs a 1-lakh premium",
+        cheap,
+        priced(1_00_000_00, 1_00_001_00),
+    );
+    // A loss costs what a profit costs: the sign is a branch, not a loop.
+    ok &= ratio(
+        "C-K-10 stack, a winning trip vs a losing one",
+        base,
+        priced(120_00, 100_00),
+    );
+    ok
+}
+
+/// C-K-11 — the whole entry point costs the same whatever it is asked.
+///
+/// [`price`] is [`charge_stack`] plus one dated lot lookup and two dated rate
+/// lookups. Every one of those is a fixed-length array walk, so the total must
+/// not track the trade's size, its date, or which underlying it is on.
+fn the_entry_point_costs_the_same_whatever_it_is_asked() -> bool {
+    let (Some(nifty), Some(banknifty)) = (slot("NIFTY"), slot("BANKNIFTY")) else {
+        return false;
+    };
+    let (Some(early), Some(late)) = (day(2024, 10, 1), day(2026, 5, 15)) else {
+        return false;
+    };
+    let (Some(entry_bar), Some(exit_bar)) = (flat_bar(100_00), flat_bar(120_00)) else {
+        return false;
+    };
+
+    let build = |underlying: SweptSlot, on: TradeDay, segment: Segment, quantity: i64| {
+        match RoundTrip::new(
+            Contract::new(underlying, segment),
+            Direction::Long,
+            Broker::Groww,
+            Outcome::NormalClose,
+            Leg::new(on, entry_bar),
+            Leg::new(on, exit_bar),
+            quantity,
+        ) {
+            Ok(trip) => Some(trip),
+            Err(reason) => {
+                println!("  BENCH SETUP FAILED for a round trip: {reason}");
+                None
+            }
+        }
+    };
+
+    let (Some(small), Some(large), Some(old), Some(other), Some(free)) = (
+        build(nifty, late, Segment::IndexOption, 65),
+        build(nifty, late, Segment::IndexOption, 65_000_000),
+        build(nifty, early, Segment::IndexOption, 65),
+        build(banknifty, late, Segment::IndexOption, 65),
+        build(nifty, late, Segment::IndexSpot, 65),
+    ) else {
+        return false;
+    };
+
+    let time = |trip: &RoundTrip| cost_ps(|| price(black_box(trip)));
+    let base = time(&small);
+    let mut ok = true;
+    ok &= ratio("C-K-11 price, 1 lot vs 1,000,000 lots", base, time(&large));
+    ok &= ratio(
+        "C-K-11 price, the first verified day vs the last regime",
+        base,
+        time(&old),
+    );
+    ok &= ratio("C-K-11 price, NIFTY vs BANKNIFTY", base, time(&other));
+    // A signal-only trip resolves no rate, so it must not cost MORE. It may
+    // legitimately cost less; the ceiling is what is being defended.
+    ok &= ratio(
+        "C-K-11 price, a cost-bearing trip vs a signal-only one",
+        base,
+        time(&free),
+    );
+    ok
+}
+
+/// C-K-12 — stage three's refusals are refusals, not merely fast ones.
+///
+/// The companion to C-K-04 and C-K-09, and the one that matters most: a round
+/// trip whose entry day lands in the unverified exchange-charge window must
+/// produce **no charges at all**, not a plausible number computed at today's
+/// rate. A stack that got fast by doing that would pass every ratio above.
+fn the_stage_three_refusals_are_still_refusals() -> bool {
+    let (Some(nifty), Some(refused_day), Some(priced_day)) =
+        (slot("NIFTY"), day(2024, 9, 30), day(2024, 10, 1))
+    else {
+        return false;
+    };
+    let (Some(entry_bar), Some(exit_bar)) = (flat_bar(100_00), flat_bar(120_00)) else {
+        return false;
+    };
+    let build = |on: TradeDay, segment: Segment| {
+        RoundTrip::new(
+            Contract::new(nifty, segment),
+            Direction::Long,
+            Broker::Groww,
+            Outcome::NormalClose,
+            Leg::new(on, entry_bar),
+            Leg::new(on, exit_bar),
+            25,
+        )
+    };
+    let (Ok(unverified), Ok(verified), Ok(signal_only)) = (
+        build(refused_day, Segment::IndexOption),
+        build(priced_day, Segment::IndexOption),
+        build(refused_day, Segment::IndexSpot),
+    ) else {
+        println!("  BENCH SETUP FAILED: a round trip would not build");
+        return false;
+    };
+
+    let refuses = price(&unverified).is_err();
+    let charged = price(&verified).map(|found| found.total_charges().raw()) == Ok(5_400);
+    // The signal-only arm resolves no rate, so it prices in the same window.
+    let free = price(&signal_only).map(Charges::total_charges) == Ok(Paisa::ZERO);
+    let ok = refuses && charged && free;
+    println!(
+        "  {:<52} refuses={refuses} prices={charged} signal-only={free}  {}",
+        "C-K-12 the unverified window refuses the whole trip",
+        if ok { "ok" } else { "BREACH" }
+    );
+
+    // And the refusal costs what pricing costs: an expensive refusal is one
+    // callers learn to avoid asking for.
+    let base = cost_ps(|| price(black_box(&verified)));
+    let at = cost_ps(|| price(black_box(&unverified)));
+    ok & ratio("C-K-12 a priced trip vs a refused one", base, at)
+}
+
 fn main() {
     println!("crates/costs — gate 8, per-lookup cost");
     println!(
@@ -434,6 +664,9 @@ fn main() {
     ok &= the_lot_count_does_not_change_the_quantity_cost();
     ok &= the_calendar_position_does_not_change_the_expiry_cost();
     ok &= the_stage_two_pre_history_windows_still_refuse();
+    ok &= the_trade_size_does_not_change_the_charge_stack_cost();
+    ok &= the_entry_point_costs_the_same_whatever_it_is_asked();
+    ok &= the_stage_three_refusals_are_still_refusals();
 
     if ok {
         println!("  every ratio held.");

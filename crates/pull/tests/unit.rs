@@ -4762,3 +4762,299 @@ fn the_guard_and_the_calendar_refuse_the_same_boundary_identically() {
         );
     }
 }
+
+// ───────────────────────────── the vendor fetch ─────────────────────────────
+
+/// The UTC epoch second of an IST wall-clock time on a day.
+///
+/// Computed from the calendar rather than written as a literal: a hardcoded
+/// epoch second is a number nobody can check by reading, and the first draft
+/// of these tests had one that was wrong by most of a day.
+fn ist(day: pull::session::Day, hour: i64, minute: i64, second: i64) -> i64 {
+    i64::from(day.days_from_epoch()) * 86_400 - pull::session::IST_OFFSET_SECS
+        + hour * 3_600
+        + minute * 60
+        + second
+}
+
+/// The `zip` trap, refused whole rather than truncated.
+///
+/// A vendor returning 375 opens and 374 volumes would, under `zip`, yield 374
+/// perfectly valid-looking bars and a manifest recording a complete window.
+/// That is data loss with a green checkmark and nothing downstream can detect
+/// it, because there is no later point at which the missing row is noticeable.
+#[test]
+fn seven_arrays_that_disagree_refuse_the_whole_window() {
+    use pull::fetch::{FetchError, ParallelArrays, RawWindow};
+
+    let short = ParallelArrays {
+        open: vec![100, 101, 102],
+        high: vec![100, 101, 102],
+        low: vec![100, 101, 102],
+        close: vec![100, 101, 102],
+        volume: vec![10, 11],
+        timestamp: vec![0, 60, 120],
+        open_interest: Vec::new(),
+    };
+    let why = RawWindow::decode(&short).expect_err("the arrays disagree");
+    assert_eq!(
+        why,
+        FetchError::LengthDisagreement {
+            open: 3,
+            high: 3,
+            low: 3,
+            close: 3,
+            volume: 2,
+            timestamp: 3,
+            open_interest: 0,
+        },
+        "every length is named, so an operator sees WHICH field was truncated"
+    );
+
+    let text = why.to_string();
+    assert!(
+        text.contains("volume 2") && text.contains("open 3"),
+        "the message carries the disagreement — got {text:?}"
+    );
+}
+
+/// Open interest absent and open interest zero are different facts.
+#[test]
+fn absent_open_interest_is_the_null_sentinel_and_zero_is_zero() {
+    use pull::fetch::{ParallelArrays, RawWindow};
+
+    let without = ParallelArrays {
+        open: vec![100],
+        high: vec![100],
+        low: vec![100],
+        close: vec![100],
+        volume: vec![1],
+        timestamp: vec![0],
+        open_interest: Vec::new(),
+    };
+    let with_zero = ParallelArrays {
+        open_interest: vec![0],
+        ..without.clone()
+    };
+
+    let a = RawWindow::decode(&without).expect("a legal window");
+    let b = RawWindow::decode(&with_zero).expect("a legal window");
+
+    assert_eq!(
+        a.rows.first().expect("one row").open_interest,
+        None,
+        "the vendor did not send the field"
+    );
+    assert_eq!(
+        b.rows.first().expect("one row").open_interest,
+        Some(0),
+        "the vendor measured zero, which is a measurement"
+    );
+}
+
+/// W1: a vendor stamping IST wall-clock seconds is not read as UTC.
+///
+/// This is the fault that STORED a wrong answer rather than refusing — 45 bars
+/// at times the exchange never traded, passing every validation. The encoding
+/// is now dispatched from the vendor descriptor, so the two readings of the
+/// same integer land on different instants and a test can see the difference.
+#[test]
+fn the_timestamp_encoding_is_dispatched_never_assumed() {
+    use pull::fetch::{BarRequest, RawRow, RawWindow, land};
+    use pull::session::{Cadence, Day, Window};
+    use pull::vendor::{PriceScale, TimestampEncoding};
+
+    // 2026-08-07 09:15:00 IST is 03:45:00 UTC.
+    let day_of = pull::session::Day::new(2026, 8, 7).expect("a real date");
+    let utc_open = ist(day_of, 9, 15, 0);
+    let row = RawRow {
+        timestamp: utc_open,
+        open: 100,
+        high: 100,
+        low: 100,
+        close: 100,
+        volume: 1,
+        open_interest: None,
+    };
+    let raw = RawWindow { rows: vec![row] };
+    let day = Day::new(2026, 8, 7).expect("a real date");
+    let request = BarRequest {
+        window: Window::new(day, day).expect("one day"),
+        cadence: Cadence::Minute,
+    };
+
+    let as_utc = land(
+        &raw,
+        &request,
+        TimestampEncoding::EpochSecondsUtc,
+        PriceScale::Paisa,
+    )
+    .expect("a legal window");
+
+    let as_ist = land(
+        &raw,
+        &request,
+        TimestampEncoding::IstDateTimeText,
+        PriceScale::Paisa,
+    )
+    .expect("a legal window");
+
+    assert_ne!(
+        as_utc.bars.first().map(|b| b.ts_micros),
+        as_ist.bars.first().map(|b| b.ts_micros),
+        "the same integer under two encodings must NOT land on the same \
+         instant — if it does, the dispatch is decorative and W1 is back"
+    );
+    assert_eq!(
+        as_utc.bars.len() + as_utc.census.total() as usize,
+        1,
+        "every row is either a bar or a counted drop, never neither"
+    );
+}
+
+/// Rupees become paisa exactly, and a price that would overflow refuses.
+#[test]
+fn a_rupee_price_becomes_paisa_and_an_overflow_refuses() {
+    use pull::fetch::{BarRequest, FetchError, RawRow, RawWindow, land};
+    use pull::session::{Cadence, Day, Window};
+    use pull::vendor::{PriceScale, TimestampEncoding};
+
+    let day = Day::new(2026, 8, 7).expect("a real date");
+    let request = BarRequest {
+        window: Window::new(day, day).expect("one day"),
+        cadence: Cadence::Minute,
+    };
+    let at = ist(day, 9, 15, 0);
+
+    let cheap = RawWindow {
+        rows: vec![RawRow {
+            timestamp: at,
+            open: 250,
+            high: 250,
+            low: 250,
+            close: 250,
+            volume: 1,
+            open_interest: None,
+        }],
+    };
+    let landed = land(
+        &cheap,
+        &request,
+        TimestampEncoding::EpochSecondsUtc,
+        PriceScale::Rupees,
+    )
+    .expect("a legal window");
+    assert_eq!(
+        landed.bars.first().map(|b| b.open),
+        Some(25_000),
+        "250 rupees is 25,000 paisa — multiplied once, never rounded here"
+    );
+
+    let huge = RawWindow {
+        rows: vec![RawRow {
+            timestamp: at,
+            open: i64::MAX,
+            high: i64::MAX,
+            low: i64::MAX,
+            close: i64::MAX,
+            volume: 1,
+            open_interest: None,
+        }],
+    };
+    let why = land(
+        &huge,
+        &request,
+        TimestampEncoding::EpochSecondsUtc,
+        PriceScale::Rupees,
+    )
+    .expect_err("i64::MAX rupees cannot become paisa");
+    assert!(
+        matches!(why, FetchError::PriceRefused { field: "open", .. }),
+        "refused by field name, not silently wrapped — got {why:?}"
+    );
+}
+
+/// The vendor's exclusive range end is converted at exactly one site.
+#[test]
+fn the_wire_end_honours_the_vendors_inclusivity() {
+    use pull::fetch::wire_end;
+    use pull::session::Day;
+    use pull::vendor::RangeEnd;
+
+    let last = Day::new(2026, 8, 5).expect("a real date");
+
+    assert_eq!(
+        wire_end(last, RangeEnd::Inclusive).expect("no successor needed"),
+        last,
+        "an inclusive vendor takes the operator's date unchanged"
+    );
+    assert_eq!(
+        wire_end(last, RangeEnd::Exclusive).expect("the day after exists"),
+        Day::new(2026, 8, 6).expect("a real date"),
+        "an exclusive vendor takes the day AFTER — the correction the operator \
+         never has to know about, made in one place so it cannot drift"
+    );
+
+    let end_of_time = Day::new(9999, 12, 31).expect("a real date");
+    assert!(
+        wire_end(end_of_time, RangeEnd::Exclusive).is_err(),
+        "past 9999-12-31 there is no successor, and it refuses rather than wrapping"
+    );
+}
+
+/// Every row is accounted for: a bar, or a drop with a named reason.
+#[test]
+fn every_row_is_either_a_bar_or_a_counted_drop() {
+    use pull::fetch::{BarRequest, RawRow, RawWindow, land};
+    use pull::session::{Cadence, Day, Window};
+    use pull::vendor::{PriceScale, TimestampEncoding};
+
+    let day = Day::new(2026, 8, 7).expect("a real date");
+    let request = BarRequest {
+        window: Window::new(day, day).expect("one day"),
+        cadence: Cadence::Minute,
+    };
+
+    // 09:14:59 IST (out), 09:15:00 (in), 15:29:59 (in), 15:30:00 (out) —
+    // both sides of both boundaries, plus a bar on the day before the window.
+    // Both sides of both session boundaries, plus a bar on the day before.
+    let secs = [
+        ist(day, 9, 14, 59),
+        ist(day, 9, 15, 0),
+        ist(day, 15, 29, 59),
+        ist(day, 15, 30, 0),
+        ist(day, 9, 15, 0) - 86_400,
+    ];
+    let rows = secs
+        .iter()
+        .map(|&t| RawRow {
+            timestamp: t,
+            open: 100,
+            high: 100,
+            low: 100,
+            close: 100,
+            volume: 1,
+            open_interest: None,
+        })
+        .collect();
+
+    let landed = land(
+        &RawWindow { rows },
+        &request,
+        TimestampEncoding::EpochSecondsUtc,
+        PriceScale::Paisa,
+    )
+    .expect("a legal window");
+
+    assert_eq!(
+        landed.bars.len() + landed.census.total() as usize,
+        secs.len(),
+        "rows in equals bars out plus drops counted — a row that vanished \
+         without a reason is indistinguishable from one the vendor never sent"
+    );
+    assert!(!landed.bars.is_empty(), "the in-session bars survived");
+    assert!(
+        !landed.census.is_empty(),
+        "the out-of-session ones were counted"
+    );
+}

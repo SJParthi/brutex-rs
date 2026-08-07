@@ -30,11 +30,15 @@
 //! direction, by at most one rupee per statutory levy and one paisa per leg per
 //! non-statutory one. `docs/06-limits.md` §27.
 //!
-//! # Constant per-operation cost
+//! # Constant per-operation cost, counted
 //!
-//! Every function here is a fixed sequence: at most one multiplication, two
-//! divisions and one comparison, then one narrowing. There is no loop, no
-//! allocation and no branch whose count depends on the magnitude of an input.
+//! Every **primitive** here is a fixed sequence: at most one multiplication,
+//! two divisions (`div_euclid` and `rem_euclid`), one comparison, one
+//! conditional `+ 1`, and one narrowing. [`levy_ceiling`] is `scaled` then
+//! [`ceil_to_paisa`]; [`statutory_levy`] is `scaled`, [`floor_to_paisa`] and
+//! [`ceil_to_rupee`], so it costs two multiplications, three divisions and two
+//! narrowings. There is no loop, no allocation and no branch whose count
+//! depends on the magnitude of an input.
 //!
 //! # No floats, and no wrapping
 //!

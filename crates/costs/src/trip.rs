@@ -36,29 +36,43 @@
 //!    [`crate::error::Refusal`] out whole, with its window, its citation gap and
 //!    its remedy intact.
 //!
-//! # Constant per-operation cost
+//! # Constant per-operation cost, counted
 //!
-//! [`charge_stack`] is a **straight-line integer sequence**. Counted exactly,
-//! for every input:
+//! [`charge_stack`] is a **straight-line integer sequence**. The count is
+//! written out per stage rather than as a total, so that it can be checked by
+//! reading rather than believed:
 //!
-//! | | Count |
-//! |---|---|
-//! | multiplications | 12 |
-//! | divisions (`div_euclid` / `rem_euclid` pairs) | 22 |
-//! | additions and subtractions | 26 |
-//! | comparisons | 9 |
-//! | narrowings from `i128` to `i64` | 12 |
+//! | Stage | × | ÷ | ± | guarded |
+//! |---|---|---|---|---|
+//! | the two notionals and the slippage line | 3 | 0 | 1 | 3 |
+//! | the transaction tax — one [`crate::money::statutory_levy`] | 2 | 3 | ≤1 | 2 |
+//! | three per-leg levies on two legs — six [`crate::money::levy_ceiling`] | 6 | 12 | ≤6 | 6 |
+//! | their three two-leg sums | 0 | 0 | 3 | 3 |
+//! | the stamp duty — one `statutory_levy` | 2 | 3 | ≤1 | 2 |
+//! | the GST base, then the GST — one `statutory_levy` | 2 | 3 | ≤4 | 3 |
+//! | the gross, the total and the net | 0 | 0 | 7 | 2 |
+//! | the two internal-law checks | 0 | 0 | 7 | 0 |
+//! | **whole stack** | **15** | **21** | **≤30** | **21** |
 //!
-//! There is **no loop, no recursion, no allocation and no collection**. The
-//! only branches are the `match` on [`Direction`], the `match` on
-//! [`crate::scope::Segment`], the outcome guard, and the overflow guards — none
-//! of which is taken a number of times that depends on a price, a quantity, a
-//! rate or a date. A thousand lots costs exactly what one lot costs, and
-//! `crates/costs/benches/ratio.rs` measures that rather than asserting it.
+//! `÷` counts each `div_euclid` and each `rem_euclid` separately. `guarded`
+//! counts every operation that refuses rather than wraps — a `checked_mul`, a
+//! `checked_sub`, or a narrowing from `i128` back to `i64`. There are 13
+//! comparisons: one on the quantity, one on the direction, nine on a ceiling's
+//! remainder, and two on the internal laws.
 //!
-//! [`price`] adds a fixed amount on top: one dated lot lookup and two dated
-//! rate lookups, each of which is a fixed-length array walk with a compile-time
-//! trip count (stage one and stage two's claim, unchanged).
+//! **The counts do not move with the input.** They are the same for one lot and
+//! for a million, for a five-paisa premium and for a lakh-rupee one, for a
+//! winning trip and for a losing one. There is **no loop, no recursion, no
+//! allocation and no collection** anywhere in the stack; the `≤` on the
+//! additions is one conditional `+ 1` per ceiling, taken on a remainder rather
+//! than on a magnitude.
+//!
+//! `crates/costs/benches/ratio.rs` C-K-10 measures it rather than asserting it.
+//!
+//! [`price`] adds a fixed amount on top: two dated rate lookups (and, through
+//! [`RoundTrip::in_lots`], one dated lot lookup), each of which is a
+//! fixed-length array walk with a compile-time trip count — stage one and stage
+//! two's claim, unchanged. C-K-11 measures that too.
 //!
 //! # What is deliberately not here
 //!
@@ -79,7 +93,7 @@ use brutex_core::instrument::Exchange;
 use brutex_core::price::Paisa;
 
 use crate::day::TradeDay;
-use crate::error::CostError;
+use crate::error::{CostError, Refusal};
 use crate::fill::{Bar, Direction, Fills, worst_case_fills};
 use crate::lot::{contract_quantity, lot_size_on};
 use crate::money::{levy_ceiling, narrow, statutory_levy};
@@ -233,6 +247,9 @@ pub struct Rates {
     stt: BpsX100,
     exchange: BpsX100,
     ipft: BpsX100,
+    sebi: BpsX100,
+    stamp: BpsX100,
+    gst: BpsX100,
 }
 
 impl Rates {
@@ -263,6 +280,43 @@ impl Rates {
             stt,
             exchange,
             ipft,
+            // The flat three are read straight from `crate::rate` and are not
+            // parameters. The stamp duty in particular is fetched through
+            // `stamp_duty(OrderSide::Buy)`, so "which leg" is a value rather
+            // than a convention a caller has to remember.
+            sebi: SEBI_TURNOVER_FEE,
+            stamp: stamp_duty(OrderSide::Buy),
+            gst: GST_ON_FEE_BASE,
+        }
+    }
+
+    /// A rate set with **every** rate supplied, including the flat three.
+    ///
+    /// Test-only, and deliberately: the flat rates are flat because getting
+    /// them wrong is one of the ways an Indian cost stack goes wrong, and
+    /// nothing outside this crate can reach this. It exists so that the
+    /// overflow guard on every levy in [`charge_stack`] is a **tested** path
+    /// rather than one asserted to be unreachable — the shipped SEBI fee,
+    /// stamp duty and GST rate are all far too small to overflow anything, and
+    /// an untested guard is indistinguishable from a missing one.
+    #[cfg(test)]
+    pub(crate) const fn with_all(
+        broker: Broker,
+        stt: BpsX100,
+        exchange: BpsX100,
+        ipft: BpsX100,
+        sebi: BpsX100,
+        stamp: BpsX100,
+        gst: BpsX100,
+    ) -> Self {
+        Self {
+            brokerage_round_trip: Paisa::from_raw(brokerage_per_order(broker).raw() * 2),
+            stt,
+            exchange,
+            ipft,
+            sebi,
+            stamp,
+            gst,
         }
     }
 
@@ -297,15 +351,11 @@ impl Rates {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn resolve(broker: Broker, exchange: Exchange, day: TradeDay) -> Result<Self, CostError> {
-        // Both lookups are taken, and whichever refused is carried out whole.
-        // The STT table has no unverified row today; the exchange charge's
-        // pre-2024-10-01 window does, and the refusal names which charge it is
-        // about, so one arm can serve both without losing the reason.
+        // Both lookups are taken and whichever refused is carried out whole.
+        // The refusal names which charge it is about, so one path serves both
+        // without losing the reason.
         let (stt, exchange_rate) =
-            match (stt_options_rate(day), exchange_charge_rate(exchange, day)) {
-                (Ok(tax), Ok(charge)) => (tax, charge),
-                (Err(refusal), _) | (_, Err(refusal)) => return Err(refusal.into()),
-            };
+            dated_pair(stt_options_rate(day), exchange_charge_rate(exchange, day))?;
         Ok(Self::new(broker, stt, exchange_rate, ipft(exchange)))
     }
 
@@ -333,23 +383,38 @@ impl Rates {
         self.ipft
     }
 
-    /// The SEBI turnover fee rate. Flat, and not a parameter.
+    /// The SEBI turnover fee rate. Flat, and not a parameter of [`Self::new`].
     #[must_use]
     pub const fn sebi(self) -> BpsX100 {
-        SEBI_TURNOVER_FEE
+        self.sebi
     }
 
-    /// The stamp duty rate on the **buy** leg. Flat, and not a parameter.
+    /// The stamp duty rate on the **buy** leg. Flat, and not a parameter of
+    /// [`Self::new`].
     #[must_use]
     pub const fn stamp(self) -> BpsX100 {
-        stamp_duty(OrderSide::Buy)
+        self.stamp
     }
 
-    /// The GST rate on the services base. Flat, and not a parameter.
+    /// The GST rate on the services base. Flat, and not a parameter of
+    /// [`Self::new`].
     #[must_use]
     pub const fn gst(self) -> BpsX100 {
-        GST_ON_FEE_BASE
+        self.gst
     }
+}
+
+/// The two dated rates, or the first refusal of the two.
+///
+/// A function taking two `Result`s rather than two `?`s written inline, so that
+/// **both** refusal paths are reachable from a test. The transaction-tax table
+/// has no unverified row today; its guard is still exercised, against a refusal
+/// built for the purpose, so the day it gains one nothing here is untried.
+fn dated_pair(
+    stt: Result<BpsX100, Refusal>,
+    exchange: Result<BpsX100, Refusal>,
+) -> Result<(BpsX100, BpsX100), Refusal> {
+    Ok((stt?, exchange?))
 }
 
 // ---------------------------------------------------------------------------
@@ -2171,6 +2236,182 @@ mod tests {
                 operation: "the total charges"
             })
         );
+    }
+
+    #[test]
+    fn every_flat_levy_overflow_site_is_refused_by_name_and_never_wrapped() {
+        // The SEBI fee, the stamp duty and the GST rate are FLAT and small, so
+        // no notional inside i64 can overflow them. Their guards are still
+        // real code, and an untested guard is indistinguishable from a missing
+        // one — so they are exercised against rates only this crate can mint.
+        let big = flat_fills(1_000_000_000, 1_000_000_000, Direction::Long);
+        let quiet = BpsX100::ZERO;
+        let loud = BpsX100::new(1_000_000_000);
+
+        // The SEBI fee, reached only because the transaction tax and the
+        // exchange charge succeeded first — so the order is asserted too.
+        assert_eq!(
+            charge_stack(
+                big,
+                1_000_000_000,
+                Direction::Long,
+                &Rates::with_all(Broker::Groww, quiet, quiet, quiet, loud, quiet, quiet),
+            ),
+            Err(CostError::Overflow {
+                operation: "ceiling a levy to the paisa"
+            })
+        );
+
+        // The stamp duty, reached after all three per-leg levies succeeded.
+        assert_eq!(
+            charge_stack(
+                big,
+                1_000_000_000,
+                Direction::Long,
+                &Rates::with_all(Broker::Groww, quiet, quiet, quiet, quiet, loud, quiet),
+            ),
+            Err(CostError::Overflow {
+                operation: "flooring a statutory levy to the paisa"
+            })
+        );
+
+        // GST, reached last: the base is a real 2e15 built from a large
+        // exchange charge, and the levy on it is what leaves i64.
+        assert_eq!(
+            charge_stack(
+                flat_fills(1_000_000_000, 1_000_000_000, Direction::Long),
+                1_000_000,
+                Direction::Long,
+                &Rates::with_all(
+                    Broker::Groww,
+                    quiet,
+                    BpsX100::new(crate::rate::RATE_SCALE),
+                    quiet,
+                    quiet,
+                    quiet,
+                    BpsX100::new(100_000_000_000),
+                ),
+            ),
+            Err(CostError::Overflow {
+                operation: "flooring a statutory levy to the paisa"
+            })
+        );
+
+        // And `with_all` really is `new` when handed the shipped flat rates —
+        // so the test-only constructor cannot drift from the public one.
+        let shipped = Rates::with_all(
+            Broker::Groww,
+            BpsX100::new(15_000),
+            NSE_EXCHANGE_CHARGE,
+            ipft(Exchange::Nse),
+            SEBI_TURNOVER_FEE,
+            stamp_duty(OrderSide::Buy),
+            GST_ON_FEE_BASE,
+        );
+        assert_eq!(
+            shipped,
+            Rates::new(
+                Broker::Groww,
+                BpsX100::new(15_000),
+                NSE_EXCHANGE_CHARGE,
+                ipft(Exchange::Nse)
+            )
+        );
+    }
+
+    #[test]
+    fn the_sell_leg_of_a_per_leg_levy_is_guarded_independently_of_the_buy_leg() {
+        // A one-tick entry bar and an enormous exit bar: the buy leg's levy is
+        // a thousand paisa and the sell leg's leaves i64. If the two legs
+        // shared a guard, this would be indistinguishable from the buy leg's
+        // own overflow, which is a different defect with a different cause.
+        let lopsided = worst_case_fills(
+            Bar::flat(TICK_HELPER).expect("legal"),
+            Bar::flat(Paisa::from_raw(i64::MAX / 4)).expect("legal"),
+            Direction::Long,
+        )
+        .expect("in range");
+        let quiet = BpsX100::ZERO;
+        let rates = Rates::with_all(
+            Broker::Groww,
+            quiet,
+            BpsX100::new(1_000_000_000),
+            quiet,
+            quiet,
+            quiet,
+            quiet,
+        );
+        // The buy leg on its own is fine at this rate.
+        assert_eq!(
+            levy_ceiling(Paisa::from_raw(10), BpsX100::new(1_000_000_000))
+                .expect("in range")
+                .raw(),
+            1_000
+        );
+        assert_eq!(
+            charge_stack(lopsided, 1, Direction::Long, &rates),
+            Err(CostError::Overflow {
+                operation: "ceiling a levy to the paisa"
+            })
+        );
+    }
+
+    #[test]
+    fn a_signal_only_round_trip_guards_its_arithmetic_too() {
+        // Cost-free removes the charges, not the overflow guards: the notional
+        // is still computed, and a quantity that leaves i64 is still refused.
+        let trip = RoundTrip::new(
+            Contract::new(slot("NIFTY"), Segment::IndexSpot),
+            Direction::Long,
+            Broker::Groww,
+            Outcome::NormalClose,
+            leg(example_day(), 1_000_000_000),
+            leg(example_day(), 1_000_000_000),
+            1_000_000_000_000,
+        )
+        .expect("well formed");
+        assert_eq!(
+            price(&trip),
+            Err(CostError::Overflow {
+                operation: "the buy notional"
+            })
+        );
+    }
+
+    #[test]
+    fn the_dated_pair_carries_whichever_of_the_two_lookups_refused() {
+        // The transaction-tax table has no unverified row today, so its guard
+        // cannot be reached through a date. It is reached here directly,
+        // against a refusal built for the purpose, so that the day the table
+        // gains one there is nothing untried on the path.
+        let tax_refusal = Refusal::new(
+            "securities transaction tax (options sell premium)",
+            None,
+            example_day(),
+            TradeDay::MIN,
+            None,
+            "a window this table does not carry today",
+        );
+        let charge_refusal = exchange_charge_rate(Exchange::Nse, day(2024, 9, 30))
+            .expect_err("the pre-boundary window refuses");
+        let rate = stt_options_rate(example_day()).expect("verified");
+
+        assert_eq!(
+            dated_pair(Err(tax_refusal), Ok(rate)),
+            Err(tax_refusal),
+            "the tax's refusal must be the one carried"
+        );
+        assert_eq!(
+            dated_pair(Ok(rate), Err(charge_refusal)),
+            Err(charge_refusal),
+            "the exchange charge's refusal must be the one carried"
+        );
+        // The tax is checked FIRST, so it wins when both refuse.
+        assert_eq!(
+            dated_pair(Err(tax_refusal), Err(charge_refusal)),
+            Err(tax_refusal)
+        );
+        assert_eq!(dated_pair(Ok(rate), Ok(rate)), Ok((rate, rate)));
     }
 
     /// One tick, as a `Paisa`. Written once so the overflow table above reads.
