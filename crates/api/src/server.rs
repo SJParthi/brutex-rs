@@ -2990,6 +2990,74 @@ mod tests {
         .await;
     }
 
+    /// Two defects that SHIPPED, and the assertions that keep them out.
+    ///
+    /// **Neither was found by reading the code.** Both came out of an
+    /// adversarial sweep that drove the page in a real browser, and both were
+    /// invisible from the Rust side: the code was right, the HTML it produced
+    /// was not. That is the general shape of a renderer bug and the reason this
+    /// test asserts about *markup* rather than about functions.
+    #[test]
+    fn the_pickers_do_not_block_submission_and_do_not_close_on_their_own_chrome() {
+        let dir = agreeing("pickerhtml");
+        let site = site("pickerhtml", &dir);
+        let html = pull_html(&site, day(2026, 8, 7));
+
+        // 1. `required` ON A ZERO-SIZED RADIO INSIDE A `display:none` POPOVER.
+        //
+        // Every day/month/year radio is `width:0;height:0;opacity:0` inside a
+        // `.cal` that is hidden until the popover opens. A browser that finds
+        // an unsatisfied `required` control tries to FOCUS it, to anchor the
+        // validation bubble somewhere. It cannot focus a zero-sized control in
+        // a hidden subtree — so Chrome logs
+        //
+        //     An invalid form control with name='to_d' is not focusable.
+        //
+        // to a console nobody is watching, REFUSES TO SUBMIT, and shows the
+        // operator nothing. The button looked dead. Reproduced live:
+        // `form.reportValidity()` returned false with that message and no
+        // visible UI. Exactly the silent failure `CLAUDE.md` §4 bans.
+        //
+        // Presence is the server's job and always was:
+        // `ingest::parse_day_field` returns `Refusal::FieldMissing`, which the
+        // result page renders with the field named.
+        for group in ["from_y", "from_m", "from_d", "to_y", "to_m", "to_d"] {
+            let needle = format!("name=\"{group}\"");
+            for (i, _) in html.match_indices(&needle) {
+                let end = html[i..].find('>').map_or(html.len(), |e| i + e);
+                assert!(
+                    !html[i..end].contains("required"),
+                    "{group} is `required` and unfocusable: the browser cannot \
+                     report the error, so it blocks submission in silence"
+                );
+            }
+        }
+
+        // 2. THE PICKER WRAPPED IN A `<label>` WITH NO `for`.
+        //
+        // HTML makes such a label's control the first labelable descendant —
+        // the popover checkbox — and a label forwards every click that did not
+        // land on *interactive content*. The weekday headers, the explanatory
+        // paragraph, the grid gutters and the greyed impossible days are none
+        // of those, so clicking any of them CLOSED THE CALENDAR. The sharpest
+        // case: an impossible day carries `pointer-events:none`, so the click
+        // fell through to the grid and shut the picker — the one interaction
+        // that should most obviously do nothing.
+        //
+        // `render::field_unlabelled` emits a `<div>`; the picker carries its
+        // own explicit `<label for="o-…">`, so no association is lost.
+        for (i, _) in html.match_indices("class=\"pick ") {
+            let before = &html[..i];
+            let opened = before.rfind("<label").map_or(0, |p| p + 1);
+            let closed = before.rfind("</label>").map_or(0, |p| p + 1);
+            assert!(
+                closed >= opened,
+                "a picker sits inside an open <label>: clicking the calendar's \
+                 own chrome toggles that label's control and shuts it"
+            );
+        }
+    }
+
     #[test]
     fn the_ingest_page_counts_its_targets_and_never_draws_a_bar_over_nothing() {
         let dir = agreeing("pullpage");
@@ -3040,6 +3108,7 @@ mod tests {
             assert_eq!(ids.len(), total, "two pickers share an id: {ids:?}");
             assert_eq!(total, 5, "one popover latch per date field");
         }
+
         assert_eq!(
             html.matches("type=\"date\"").count(),
             0,

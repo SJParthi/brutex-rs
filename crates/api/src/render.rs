@@ -1220,6 +1220,38 @@ fn field(label: &str, control: &str) -> String {
     )
 }
 
+/// A labelled control that must **not** be wrapped in a `<label>`.
+///
+/// # Why this exists, and what it fixes
+///
+/// [`field`] wraps its control in `<label class="field">` with no `for`. For a
+/// lone `<input>` or `<select>` that is correct and convenient: the labelled
+/// control is the one inside, so clicking the caption focuses it.
+///
+/// For a date picker it is a **defect**. With `for` absent, HTML makes the
+/// labelled control the *first labelable descendant in tree order* — which is
+/// the picker's popover checkbox. And a `<label>` forwards a click to its
+/// labelled control unless that click targeted **interactive content**. The
+/// weekday header `<span>Mo</span>`, the explanatory `<p>`, the grid gutters
+/// and the popover's own padding are none of those, so clicking any of them
+/// toggled the checkbox and **slammed the calendar shut**. The sharpest case:
+/// a greyed impossible day carries `pointer-events:none`, so the click fell
+/// through to the grid behind it and closed the picker rather than being
+/// ignored — the one interaction that should most obviously do nothing.
+///
+/// It also made the markup invalid twice over: a `<label>`'s content model
+/// forbids descendant `<label>` elements *and* forbids labelable descendants
+/// other than its own labelled control, and each picker nests 56 of each.
+///
+/// Nothing is lost by using a `<div>`: the picker already supplies its own
+/// `<label class="readout" for="o-…">`, which is a real, explicit association.
+fn field_unlabelled(label: &str, control: &str) -> String {
+    format!(
+        "<div class=\"field\"><span>{}</span>{control}</div>",
+        escape(label)
+    )
+}
+
 /// A date field, as a clickable month grid capped at `max`.
 ///
 /// # Three shapes tried, and why this is the third
@@ -1390,8 +1422,8 @@ fn pull_forms(view: &PullView<'_>) -> String {
     let _ = write!(
         out,
         "<div class=\"pair\">{}{}</div>",
-        field("From (inclusive)", &date_input("s", "from", today)),
-        field("To (inclusive)", &date_input("s", "to", today)),
+        field_unlabelled("From (inclusive)", &date_input("s", "from", today)),
+        field_unlabelled("To (inclusive)", &date_input("s", "to", today)),
     );
     // THE LOCAL-ARCHIVE FIELD. Half the vendors are not APIs — TrueData and
     // GDFL sell folders of CSVs — and that half needs no socket, no token and
@@ -1437,13 +1469,13 @@ fn pull_forms(view: &PullView<'_>) -> String {
             "Series",
             &format!("<select name=\"series\" required>{series}</select>")
         ),
-        field("Expiry", &date_input("f", "expiry", expiry_max)),
+        field_unlabelled("Expiry", &date_input("f", "expiry", expiry_max)),
     );
     let _ = write!(
         out,
         "<div class=\"pair\">{}{}</div>",
-        field("From (inclusive)", &date_input("f", "from", expiry_max)),
-        field("To (inclusive)", &date_input("f", "to", expiry_max)),
+        field_unlabelled("From (inclusive)", &date_input("f", "from", expiry_max)),
+        field_unlabelled("To (inclusive)", &date_input("f", "to", expiry_max)),
     );
     out.push_str("<button type=\"submit\">Start expired-series pull</button>");
     out.push_str("</form>");

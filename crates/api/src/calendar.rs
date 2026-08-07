@@ -122,6 +122,31 @@ pub fn picker(name: &str, id: &str, max: Day) -> String {
     let cap = cap_class(max);
 
     let _ = write!(out, "<div class=\"pick {cap}\">");
+
+    // ── THE RADIOS BELOW ARE NOT `required`, AND THAT IS A BUG FIX ──────────
+    //
+    // They were, and it made the ingest form IMPOSSIBLE TO SUBMIT while
+    // looking like nothing was wrong. Every one of them is
+    // `position:absolute; width:0; height:0; opacity:0` (see `CAL_STYLE`) and
+    // sits inside a `.cal` that is `display:none` until the popover is opened.
+    // When a browser finds an unsatisfied `required` control it tries to focus
+    // it to anchor the validation bubble; a zero-sized control inside a hidden
+    // subtree cannot be focused, so Chrome logs
+    //
+    //     An invalid form control with name='to_d' is not focusable.
+    //
+    // to a console the operator is not looking at, **refuses to submit, and
+    // shows nothing.** The button appears dead. Reproduced in a live browser:
+    // `form.reportValidity()` returned `false` with the message above and no
+    // visible UI. This is precisely `CLAUDE.md` §4's banned shape — a failure
+    // that is neither loud nor named.
+    //
+    // Presence is enforced where it was always actually enforced: the server.
+    // `api::ingest::parse_day_field` returns `Refusal::FieldMissing` when all
+    // three parts are absent, and the refusal is rendered on the result page
+    // with the field named. An attribute is a courtesy; a parser is the rule —
+    // and here the courtesy was silently overruling the rule.
+    //
     // The popover's latch. A checkbox is the only element in HTML that
     // remembers a two-state click without a script, and `:checked ~ .cal` is
     // what turns that memory into a visible panel.
@@ -143,7 +168,7 @@ pub fn picker(name: &str, id: &str, max: Day) -> String {
         let _ = write!(
             out,
             "<input type=\"radio\" name=\"{name}_y\" id=\"{id}y{year}\" value=\"{year}\" \
-             class=\"y{year}\" required>\
+             class=\"y{year}\">\
              <label for=\"{id}y{year}\">{year}</label>"
         );
     }
@@ -158,7 +183,7 @@ pub fn picker(name: &str, id: &str, max: Day) -> String {
         let _ = write!(
             out,
             "<input type=\"radio\" name=\"{name}_m\" id=\"{id}m{month}\" value=\"{month}\" \
-             class=\"m{month}\" required>\
+             class=\"m{month}\">\
              <label for=\"{id}m{month}\">{label}</label>"
         );
     }
@@ -174,7 +199,7 @@ pub fn picker(name: &str, id: &str, max: Day) -> String {
         let _ = write!(
             out,
             "<input type=\"radio\" name=\"{name}_d\" id=\"{id}d{day}\" value=\"{day}\" \
-             class=\"d{day}\" required>\
+             class=\"d{day}\">\
              <label for=\"{id}d{day}\" class=\"c{day}\">{day}</label>"
         );
     }
