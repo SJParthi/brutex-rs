@@ -451,139 +451,6 @@ jobs:
           fi
           echo "OK — greeks depends on nothing and names no workspace type."
 
-      - name: Gate 10 — every invariant names a test that exists
-        run: |
-          set -euo pipefail
-          # docs/04-invariants.md asserts: "A consistency check in CI fails if
-          # a row's test does not exist." Until this gate existed that sentence
-          # was false, which is precisely the decay the file was written to
-          # prevent -- a row pointing at nothing is what turns the file into a
-          # wish list.
-          #
-          # THIS GATE HAD A HOLE AND PRINTED "0 missing" THROUGH IT for its
-          # whole life. Three defects, every one of them silent:
-          #
-          #  1. THE SKIP WAS UNAUDITED. The rule was "skip a row whose status
-          #     cell is —", justified by the legend's meaning of that glyph:
-          #     "not yet reachable (the crate does not exist)". The gate never
-          #     checked the crate. So a row could name a test that exists in no
-          #     file, wear a —, and pass. TEN rows did, in four crates that are
-          #     tracked TODAY: S-02, S-05, S-10, P-01, P-02, P-03, P-04, X-01,
-          #     X-02, X-13. Measured, not inferred -- the old gate printed
-          #     "checked 139 named test(s); 0 missing" on the same tree that
-          #     holds them. The status glyph is now documentation. The fact
-          #     that decides is whether crates/<crate>/Cargo.toml is TRACKED,
-          #     which is the thing the legend was talking about all along.
-          #  2. THE CRATE SEGMENT WAS THROWN AWAY. `crate::module::name` was
-          #     reduced to `name` and searched for across every .rs file in the
-          #     workspace, so `engine::proptest::antimonotone` would have been
-          #     satisfied by an `fn antimonotone` in crates/store. The search is
-          #     now confined to the crate the row names.
-          #  3. `xargs -r grep -q` RETURNS 123 WHEN ANY BATCH MISSES. xargs
-          #     exits 123 if any invocation exits 1..125, and `grep -q` exits 1
-          #     on the batches that do not contain the match -- so as soon as
-          #     the workspace outgrows one ARG_MAX batch, a test that DOES
-          #     exist is reported missing. A red build for a reason that is not
-          #     true is how a gate gets ignored. One fixed-string lookup into a
-          #     table built once replaces it.
-          #
-          # WHAT IT STILL CANNOT SEE:
-          #   * That the named function is a TEST. `#[test]` is not required,
-          #     because a `harness = false` bench function carries no attribute
-          #     and C-01 through C-13 are proven by exactly those. So a row can
-          #     be satisfied by an ordinary function of the right name in the
-          #     right crate.
-          #   * That the test proves the invariant. Nothing mechanical can.
-          #   * The module segment. `store::unit::x` and `store::fault::x` are
-          #     the same question to this gate.
-          #   * A row whose "Proven by" cell is prose, a const assertion or a
-          #     CI gate rather than a `crate::module::name` token. Those rows
-          #     are not checked and never were.
-          #
-          # NO UNTRUSTED INPUT REACHES THIS STEP: `git ls-files`, the document,
-          # and the static patterns below. Gate 1c's discipline.
-          f=docs/04-invariants.md
-          work=$(mktemp -d)
-
-          # ROWS ARE EXEMPTED ONLY HERE, never by a glyph in the document --
-          # that is the whole repair. One row id per line, with the reason
-          # beside it, gate 1d's mechanism: adding a line is a visible diff and
-          # the moment to ask whether the test should just be written.
-          # IT IS DELIBERATELY EMPTY. The ten rows above are reported by name
-          # in the log of this step; pinning them here on the way in would turn
-          # ten findings into one line nobody reads.
-          allow_pending=''
-
-          # (crate, fn) for every tracked crate, built once.
-          fns="$work/fns"; : > "$fns"
-          for c in $(git ls-files 'crates/*/Cargo.toml' \
-                     | sed 's|^crates/||; s|/Cargo.toml$||'); do
-            { git ls-files "crates/$c/*.rs" \
-              | xargs -r grep -ohE '\bfn [a-z_][a-z_0-9]*' \
-              | sed "s|^fn |${c} |" >> "$fns"; } || true
-          done
-          sort -u -o "$fns" "$fns"
-
-          rows=0; checked=0; missing=0; pending=0; exempt=0
-          while IFS= read -r line; do
-            case "$line" in \|*) ;; *) continue ;; esac
-            rows=$((rows + 1))
-            id=$(printf '%s\n' "$line" | awk -F'|' '{print $2}' | tr -d ' ')
-            for t in $( { printf '%s\n' "$line" \
-                          | grep -oE '`[a-z_]+::[a-z_]+::[a-z_0-9]+`' | tr -d '`' || true; } ); do
-              c="${t%%::*}"; fn="${t##*::}"
-              # The ONLY reason a row is not checked: the crate it names is not
-              # a tracked member of this workspace. That is what the legend's
-              # "—" was always supposed to mean, now read off the tree.
-              if ! git ls-files --error-unmatch "crates/${c}/Cargo.toml" >/dev/null 2>&1; then
-                pending=$((pending + 1))
-                continue
-              fi
-              if [ -n "$( { printf '%s\n' "$allow_pending" \
-                            | awk -v I="$id" '$1==I{print "y"; exit}'; } )" ]; then
-                exempt=$((exempt + 1))
-                printf 'EXEMPT (allowlisted) %s — %s\n' "$id" "$t"
-                continue
-              fi
-              checked=$((checked + 1))
-              if ! grep -qxF "${c} ${fn}" "$fns"; then
-                printf 'INVARIANT POINTS AT A TEST THAT DOES NOT EXIST: %s (%s)\n' "$t" "$id"
-                missing=$((missing + 1))
-              fi
-            done
-          done < "$f"
-
-          echo "read ${rows} table row(s) in ${f}"
-          echo "  ${checked} named test(s) checked against a tracked crate"
-          echo "  ${pending} skipped — the crate they name is not a workspace member"
-          echo "  ${exempt} exempted by the allowlist in this file"
-          echo "  ${missing} missing"
-          # A pattern that stops matching is the failure mode gate 8 shipped
-          # with: it reported success while measuring nothing.
-          if [ "$checked" -eq 0 ]; then
-            echo "GATE 10 CHECKED NOTHING. Either every crate vanished or the row"
-            echo "pattern stopped matching. A silent zero is not a pass."
-            exit 1
-          fi
-
-          bad=0
-          [ "$missing" -eq 0 ] || bad=1
-          for i in $( { printf '%s\n' "$allow_pending" | awk 'NF{print $1}'; } ); do
-            if ! grep -qE "^\| *${i} *\|" "$f"; then
-              printf 'STALE ALLOWLIST ENTRY — %s is not a row in %s\n' "$i" "$f"
-              bad=1
-            fi
-          done
-
-          if [ "$bad" -ne 0 ]; then
-            echo
-            echo "Either write the test, or record abandoning the invariant in"
-            echo "docs/05-decisions.md. Rows are never deleted to go green, and"
-            echo "a status glyph no longer silences one."
-            exit 1
-          fi
-          echo "OK — every invariant in a tracked crate names a test that exists."
-
       - name: Gate 7 — the browser crate depends on core alone
         run: |
           set -euo pipefail
@@ -598,495 +465,6 @@ jobs:
             exit 1
           fi
           echo "OK."
-
-      - name: Gate 11 — banned constructs on the O(1) paths
-        run: |
-          set -euo pipefail
-          # WHY THIS EXISTS. Gate 8 measures a ratio at 1x/10x/100x, which
-          # catches a bound that has ALREADY broken on a path someone thought
-          # to write a bench for. The audit that produced this gate found four
-          # O(1) defects that no gate could see, because each was a *source
-          # construct* that is superlinear by nature and none of them had a
-          # bench: a map reserved to exactly its load so the next insert
-          # rehashed (2.4 ms at 50k entries), a page render that sorted the
-          # whole universe per request, an encoder nothing called, and a
-          # coverage gate that claimed 100% while exiting 1. Gate 8 says "this
-          # path got slower". Gate 11 says "this construct may not appear".
-          #
-          # WHAT IT SCANS. Tracked `crates/*/src/**.rs` only, and inside each
-          # file only the region BEFORE the first `#[cfg(test)]`. Test code and
-          # benches are exempt on purpose: a test asserting that a refusal
-          # happens legitimately unwraps, sorts and panics.
-          #
-          # NO UNTRUSTED INPUT REACHES THIS STEP. The inputs are `git ls-files`
-          # and the static patterns below, the same discipline gate 1c states.
-          # Nothing from the event payload is expanded. `git ls-files` also
-          # means an UNTRACKED file is invisible — which is right for CI, where
-          # the checkout holds only tracked files, but means a local run can
-          # disagree with CI until the file is added.
-          #
-          # WHAT IT CANNOT SEE, stated plainly because a gate that oversells
-          # itself is worse than no gate:
-          #   * Indirection. `.sort()` behind a trait, a `HashMap` arrived at
-          #     by `.collect()`, a float behind a type alias or a generic
-          #     `T: Float` — all invisible. This is a TEXT scan, not a type
-          #     check. It refuses the spelling, not the behaviour.
-          #   * Macro-generated code. Expanded after this gate has run.
-          #   * `/* ... */` block comments are NOT stripped; only whole lines
-          #     whose first non-blank characters are `//` (which covers `///`
-          #     and `//!`). A banned token inside a block comment or inside a
-          #     string literal is a false positive, and the allowlist is the
-          #     escape hatch for it.
-          #   * "Per-request" is not decidable from text. Rule 4 refuses every
-          #     sort in non-test source and leans on the allowlist to record,
-          #     one file at a time, WHY a given sort is bounded. The reasons
-          #     are written beside the entries and are the reviewable part.
-          #   * A second `#[cfg(test)]` in a file would silently shrink the
-          #     scanned region, so that is a hard failure rather than a guess.
-          #
-          # THE ESCAPE HATCH IS HERE, NEVER IN THE CODE. No magic comment, no
-          # `// gate-11-ok` scattered through crates/. Each entry is
-          # `path max_occurrences`, and the count is pinned at what the file
-          # measures TODAY — so a legitimate existing use stays green while the
-          # NEXT one is a red build and a visible diff on this file. That is
-          # gate 1d's mechanism: adding a line here is the moment to ask
-          # whether the construct is really justified.
-
-          # ---- rule 1. No allowlist. docs/07 layer 4 is unconditional. ------
-          allow_search=''
-
-          # ---- rule 2. CLAUDE.md section 7: paisa i64, never a float. -------
-          # price.rs carries the ONE sanctioned float boundary — the file says
-          # so itself: "the ONLY function in the workspace permitted to do
-          # floating-point arithmetic". The vendor sends rupees as an IEEE
-          # double and something has to accept it; everything downstream of
-          # that `Ok` is an integer forever. vendor.rs::parse_strike is the
-          # other end of the same boundary and hands its f64 straight to it.
-          # NOTE for whoever builds the engine: CLAUDE.md section 7 also lets
-          # Sharpe, p-values and ratios keep full precision. There is no entry
-          # for them because no such code exists yet. When it lands it needs a
-          # line here, and that line is the review.
-          allow_float='
-          crates/core/src/price.rs 4
-          crates/core/src/vendor.rs 1
-          '
-
-          # ---- rule 3. docs/07 law 2: pre-size every map. -------------------
-          # Only HashMap/HashSet. A BTreeMap has no `with_capacity` — capacity
-          # is not a concept for a B-tree — so including it would put three
-          # un-fixable entries in the allowlist and teach a reader to ignore
-          # it. A BTreeMap being O(log n) is a real but DIFFERENT complaint,
-          # and this is not the instrument for it.
-          # manifest.rs::genesis reserves nothing because nothing is known yet
-          # to reserve from; the doc comment argues it and points at
-          # docs/06-limits.md §17. Layer 3's guarantee is about the LOADED
-          # index, which is the one a query touches, and that one is reserved.
-          allow_unsized='
-          crates/pull/src/manifest.rs 1
-          '
-
-          # ---- rule 4. docs/07 layer 12: bounded page, never O(universe). ---
-          # Each of these was traced to its callers before it was written down:
-          #   census.rs   grid_instruments — filters to Segment::Index AND
-          #               Kind::Index first, so it sorts the index series,
-          #               bounded by CLAUDE.md section 1, not by the universe.
-          #   master.rs   skipped_by_reason — sorts DECLINE REASONS, bounded by
-          #               the Skip vocabulary. Reached from `universe()`.
-          #   merge.rs    single_vendor_members — O(universe log universe), and
-          #               allowed only because `universe()` runs once into an
-          #               Arc<Site> (D-0039), not per request. If that parse
-          #               ever moves back into a handler this entry is wrong
-          #               and must be deleted, not re-pinned.
-          #   manifest.rs newest-generation pick — bounded by MAX_SLOTS, 2.
-          allow_sort='
-          crates/api/src/census.rs 1
-          crates/api/src/master.rs 1
-          crates/api/src/merge.rs 1
-          crates/pull/src/manifest.rs 1
-          '
-
-          work=$(mktemp -d)
-          corpus="$work/corpus"
-          : > "$corpus"
-
-          walked=0; kept=0; dropped=0; ambiguous=0
-          while IFS= read -r f; do
-            [ -n "$f" ] || continue
-            walked=$((walked + 1))
-            # `grep -c` exits 1 on no match, and with pipefail that would kill
-            # the gate exactly when a file is clean — the bug gate 5 records.
-            n=$( { grep -c '#\[cfg(test)\]' "$f" || true; } | tr -d ' ')
-            # `wc -l` COUNTS NEWLINES, NOT LINES, so a file whose last line is
-            # unterminated is reported one short — and a one-line file reports
-            # ZERO, which set `end=0` and skipped the file entirely. Caught by
-            # feeding this gate a one-line violation with no trailing newline:
-            # it exited 0. `cargo fmt` would reject such a file, but gate 6a
-            # lives in a later job that this one gates, so relying on it would
-            # make gate 11 blind exactly while it runs first.
-            tot=$(awk 'END{print NR}' "$f")
-            if [ "$n" -gt 1 ]; then
-              printf 'AMBIGUOUS TEST BOUNDARY  %s  (%s attributes)\n' "$f" "$n"
-              ambiguous=$((ambiguous + 1))
-              continue
-            fi
-            if [ "$n" -eq 1 ]; then
-              end=$(( $(grep -n '#\[cfg(test)\]' "$f" | head -1 | cut -d: -f1) - 1 ))
-            else
-              end="$tot"
-            fi
-            kept=$((kept + end)); dropped=$((dropped + tot - end))
-            awk -v F="$f" -v E="$end" '
-              NR<=E { l=$0; sub(/^[ \t]+/,"",l); if (l ~ /^\/\//) next; print F":"NR":"$0 }
-            ' "$f" >> "$corpus"
-          done < <(git ls-files 'crates/*.rs' \
-                   | grep '/src/' | grep -vE '/(tests|benches)/' || true)
-
-          # A gate must say what it walked. A glob that matches nothing is the
-          # failure mode gate 8 shipped with for the whole life of the
-          # repository, and it reported success the entire time.
-          echo "walked ${walked} non-test source file(s) under crates/*/src/"
-          echo "  ${kept} line(s) in scope, ${dropped} after a #[cfg(test)]"
-          echo "  $(awk 'END{print NR}' "$corpus") line(s) after comment stripping"
-          if [ "$walked" -eq 0 ]; then
-            echo "GATE 11 WALKED NOTHING. A gate that scans no file is not a gate."
-            exit 1
-          fi
-          if [ "$ambiguous" -ne 0 ]; then
-            echo
-            echo "The test boundary is the region BEFORE the first #[cfg(test)]."
-            echo "A file with two of them has no such region and would be"
-            echo "scanned only as far as the first, silently. One trailing test"
-            echo "module per file."
-            exit 1
-          fi
-
-          bad=0
-
-          check() {
-            rule="$1"; pattern="$2"; allow="$3"; law="$4"
-            hits=$( { grep -E "$pattern" "$corpus" || true; } )
-            n=$( { printf '%s' "$hits" | grep -c . || true; } | tr -d ' ')
-            echo
-            echo "rule ${rule}: ${n} occurrence(s) — ${law}"
-            for f in $( { printf '%s\n' "$hits" | grep . | cut -d: -f1 | sort -u; } || true ); do
-              c=$( { printf '%s\n' "$hits" | grep -c "^${f}:" || true; } | tr -d ' ')
-              a=$( { printf '%s\n' "$allow" | awk -v F="$f" '$1==F{print $2; exit}'; } || true)
-              [ -n "$a" ] || a=0
-              if [ "$c" -gt "$a" ]; then
-                printf '  REFUSED  %s — %s occurrence(s), %s allowed\n' "$f" "$c" "$a"
-                { printf '%s\n' "$hits" | grep "^${f}:" \
-                    | awk -F: '{printf "           %s:%s\n", $1, $2}' | head -8; } || true
-                bad=1
-              else
-                printf '  allowed  %s — %s of %s\n' "$f" "$c" "$a"
-              fi
-            done
-            # An entry naming a file that no longer exists makes this gate read
-            # stronger than it is, so it is a failure and not a note. An entry
-            # whose file no longer matches is only loose, and says so.
-            for p in $( { printf '%s\n' "$allow" | awk 'NF{print $1}'; } || true ); do
-              if ! git ls-files --error-unmatch "$p" >/dev/null 2>&1; then
-                printf '  STALE ALLOWLIST ENTRY — %s is not a tracked file\n' "$p"
-                bad=1
-              elif ! printf '%s\n' "$hits" | grep -q "^${p}:"; then
-                printf '  ::warning title=Gate 11 allowlist is loose::'
-                printf '%s no longer matches rule %s — tighten it\n' "$p" "$rule"
-              fi
-            done
-            :
-          }
-
-          check 1 '\.binary_search' \
-                "$allow_search" \
-                'docs/07 layer 4 — never binary_search'
-
-          check 2 '\b(f32|f64)\b' \
-                "$allow_float" \
-                'CLAUDE.md section 7 — prices are paisa i64, never a float'
-
-          check 3 '\b(HashMap|HashSet)::(new|default)\(\)' \
-                "$allow_unsized" \
-                'docs/07 law 2 — pre-size every map'
-
-          check 4 '\.sort(_[a-z_]+)?\(' \
-                "$allow_sort" \
-                'docs/07 layer 12 — bounded page, never O(universe)'
-
-          check 5 '(^|[^A-Za-z0-9_])(panic!|todo!|unimplemented!)|\.unwrap\(\)|\.expect\(' \
-                '' \
-                'CLAUDE.md section 4 — degrade loudly or refuse, never die'
-
-          # Rule 5's construct is ALREADY denied by clippy at the workspace
-          # root, and gate 6b runs clippy with -D warnings — so the grep above
-          # is expected to find nothing, and finding nothing is not evidence
-          # this gate works. What clippy cannot defend is clippy: the lint
-          # table is an ordinary tracked file, and deleting one line from it
-          # silently disarms the deny across the whole workspace with every
-          # other gate still green. These two steps guard the guard.
-          echo
-          echo "rule 5b: the lint table that denies rule 5 workspace-wide"
-          for lint in unwrap_used expect_used panic todo unimplemented; do
-            if ! grep -qE "^${lint}[[:space:]]*=[[:space:]]*\"deny\"" Cargo.toml; then
-              printf '  REFUSED  Cargo.toml no longer denies clippy::%s\n' "$lint"
-              bad=1
-            else
-              printf '  present  clippy::%s = deny\n' "$lint"
-            fi
-          done
-
-          # And the second way to disarm it: a local allow. In a test module
-          # that is legitimate and this gate never looks there; in shipping
-          # code it is a panic nobody can see from the lint table.
-          echo
-          echo "rule 5c: nothing disarms those lints outside a test module"
-          dis=$( { grep -E 'allow\([^)]*clippy::(unwrap_used|expect_used|panic|todo|unimplemented)' \
-                   "$corpus" || true; } )
-          if [ -n "$dis" ]; then
-            printf '%s\n' "$dis" | awk -F: '{printf "  REFUSED  %s:%s\n", $1, $2}'
-            bad=1
-          else
-            echo "  none"
-          fi
-
-          echo
-          if [ "$bad" -ne 0 ]; then
-            echo "GATE 11 FAILED."
-            echo
-            echo "Either the construct goes, or its file earns a line in the"
-            echo "allowlist above WITH the reason it is bounded. A count is"
-            echo "raised only by someone who can say why. See CLAUDE.md"
-            echo "section 3 rule 4 and docs/07-o1-architecture.md."
-            exit 1
-          fi
-          echo "OK — no banned construct outside the allowlist."
-
-      - name: Gate 12 — every O(1) claim names the test that proves it
-        run: |
-          set -euo pipefail
-          # WHY THIS EXISTS. The audit that produced this gate found FIVE
-          # documented claims that the code did not have: a coverage row
-          # asserting 100% while the step exited 1, an "authoritative encoder"
-          # nothing called, an append documented "O(1) worst case" that spiked
-          # to 2.4 ms on a census sitting at 7·2^k, a render documented "never
-          # O(universe)" that was exactly that, and seven invariant rows naming
-          # tests that existed in no file. Every one of them was A COMMENT
-          # ASSERTING A PROPERTY THE CODE DID NOT HAVE, and nothing in CI could
-          # see any of them. Gate 8 measures a bound that already broke on a
-          # path someone thought to bench. Gate 11 refuses a construct by its
-          # spelling. Neither reads what the author CLAIMED.
-          #
-          # THE RULE. A doc block under crates/ that makes a cost claim must,
-          # inside that same block, either name its proof or say UNVERIFIED.
-          # UNVERIFIED exists so that an honest admission is always CHEAPER
-          # than a false claim -- if it were not, the false claim is what gets
-          # written. That is the same reason docs/06-limits.md exists.
-          #
-          # WHAT COUNTS AS NAMING THE PROOF, in the order it is tried:
-          #   1. `crate::module::name` that resolves to an `fn name` under
-          #      crates/<crate>/. Gate 10's technique, with gate 10's fix: the
-          #      crate segment is CHECKED, not thrown away, so a same-named
-          #      function in another crate does not satisfy the claim.
-          #   2. A tracked `crates/**/tests/*.rs` or `crates/**/benches/*.rs`
-          #      path. This is the form the benches already use.
-          #   3. An invariant row id -- `C-12`, `M-17`, `S-11` -- that EXISTS
-          #      in docs/04-invariants.md AND whose own "Proven by" cell names
-          #      a test that resolves by rule 1. This is the form the code
-          #      already writes, and it chains: a row gate 10 would refuse
-          #      cannot launder a claim through this gate either.
-          # A src path is NOT proof. Naming the file the claim is written in
-          # proves nothing, and that is the whole defect class.
-          #
-          # NO UNTRUSTED INPUT REACHES THIS STEP. The inputs are `git ls-files`,
-          # docs/04-invariants.md and the static patterns below -- the
-          # discipline gate 1c states. Nothing from the event payload is
-          # expanded.
-          #
-          # WHAT IT CANNOT SEE, said plainly:
-          #   * Whether the claim is TRUE. It checks that a proof is named and
-          #     that the named thing exists. A test can be named that does not
-          #     test the claim, and this gate will believe it. It converts an
-          #     unfalsifiable comment into a falsifiable one; it does not
-          #     falsify it.
-          #   * A claim in an ordinary `//` comment, or in a string, or in a
-          #     `/* */` block. Only `///` and `//!` runs are blocks here.
-          #   * A NEGATIVE claim. "It is O(log n) wearing an O(1) label, and it
-          #     is not constant" is the most honest sentence in this repository
-          #     and this gate refuses it, because no text rule separates "is
-          #     O(1)" from "is not O(1)" without being gamed by the second
-          #     spelling of the first. The escape is the allowlist below, and
-          #     the cheaper fix is to name the test that proves the bound the
-          #     code DOES have.
-          #   * `flat` is an ordinary English word. A short, explicit list of
-          #     nouns is excluded from the trigger -- a flat struct, a flat
-          #     table, a flat bar are not cost claims. That list is in this
-          #     file, so widening it is a visible diff. It is a heuristic and
-          #     it will be wrong in both directions eventually.
-          #   * Macro-generated docs, and anything untracked: the input is
-          #     `git ls-files`, so a local run and CI disagree until `git add`.
-          #
-          # THE ESCAPE HATCH IS HERE, NEVER IN THE CODE. `path max_blocks`,
-          # gate 1d's and gate 11's mechanism. IT IS DELIBERATELY EMPTY. Every
-          # unproven claim on the tree today is reported by name in the log,
-          # and pinning them here on the way in would have converted twelve
-          # findings into one line nobody reads.
-          allow_claim='
-          '
-
-          inv=docs/04-invariants.md
-          work=$(mktemp -d)
-
-          # (crate, fn) for every tracked crate, built once. A fixed-string
-          # lookup afterwards, so `store::proptest::roundtrip` is not satisfied
-          # by an `fn roundtrip` in crates/api.
-          fns="$work/fns"; : > "$fns"
-          for c in $(git ls-files 'crates/*/Cargo.toml' \
-                     | sed 's|^crates/||; s|/Cargo.toml$||'); do
-            { git ls-files "crates/$c/*.rs" \
-              | xargs -r grep -ohE '\bfn [a-z_][a-z_0-9]*' \
-              | sed "s|^fn |${c} |" >> "$fns"; } || true
-          done
-          sort -u -o "$fns" "$fns"
-
-          # A block is a maximal run of consecutive `///` or `//!` lines. Any
-          # other line ends it. One tab-separated record per block, so the
-          # whole block can be searched as one string -- "within its own doc
-          # block" is the unit the rule is stated in.
-          blocks="$work/blocks"; : > "$blocks"
-          walked=0
-          while IFS= read -r f; do
-            [ -n "$f" ] || continue
-            walked=$((walked + 1))
-            awk -v F="$f" '
-              function flush() {
-                if (n > 0) printf "%s\t%d\t%s\n", F, start, text
-                n = 0; text = ""
-              }
-              { l = $0; sub(/^[ \t]+/, "", l); gsub(/\t/, " ", l)
-                if (l ~ /^\/\/[\/!]/) {
-                  sub(/^\/\/[\/!]/, "", l)
-                  if (n == 0) start = NR
-                  n++; text = text " " l
-                } else flush() }
-              END { flush() }
-            ' "$f" >> "$blocks"
-          done < <(git ls-files 'crates/*.rs')
-
-          nb=$(awk 'END{print NR}' "$blocks")
-          echo "walked ${walked} tracked .rs file(s) under crates/"
-          echo "  $(awk 'END{print NR}' "$fns") (crate, fn) pair(s) to resolve against"
-          echo "  ${nb} doc block(s)"
-          # A glob that matches nothing is the failure mode gate 8 shipped with
-          # for the whole life of the repository, reporting success throughout.
-          if [ "$walked" -eq 0 ] || [ "$nb" -eq 0 ]; then
-            echo "GATE 12 WALKED NOTHING. A gate that reads no doc block is not a gate."
-            exit 1
-          fi
-
-          trigger='[Oo]\(1\)|constant[ -]time|never scans?|worst[ -]case|\bflat\b'
-          notclaim='(struct|table|bar|file|field|list|array|layout|namespace)s?'
-
-          refused="$work/refused"; : > "$refused"
-          claimed=0; by_test=0; by_path=0; by_row=0; by_unverified=0
-
-          # Echoes the KIND of proof found, or nothing. Always returns 0: a
-          # bare `[ ... ] && break` as the last command of a loop makes the
-          # enclosing `if` exit 1, and under `set -e` that kills the gate on
-          # the ordinary path. Gate 5 records the same class of bug.
-          prove() {
-            text="$1"
-            for t in $( { printf '%s' "$text" \
-                          | grep -oE '\b[a-z_]+::[a-z_]+::[a-z_0-9]+\b' || true; } ); do
-              if grep -qxF "${t%%::*} ${t##*::}" "$fns"; then echo test; return 0; fi
-            done
-            for p in $( { printf '%s' "$text" \
-                          | grep -oE 'crates/[A-Za-z0-9_./-]*/(tests|benches)/[A-Za-z0-9_.-]+\.rs' \
-                          || true; } ); do
-              if git ls-files --error-unmatch "$p" >/dev/null 2>&1; then echo path; return 0; fi
-            done
-            for r in $( { printf '%s' "$text" | grep -oE '\b[A-Z]-[0-9][0-9]\b' || true; } ); do
-              row=$( { grep -E "^\| *${r} *\|" "$inv" || true; } | head -1)
-              [ -n "$row" ] || continue
-              for t in $( { printf '%s' "$row" \
-                            | grep -oE '`[a-z_]+::[a-z_]+::[a-z_0-9]+`' | tr -d '`' || true; } ); do
-                if grep -qxF "${t%%::*} ${t##*::}" "$fns"; then echo row; return 0; fi
-              done
-            done
-            return 0
-          }
-
-          tab=$(printf '\t')
-          while IFS="$tab" read -r f ln text; do
-            [ -n "${text-}" ] || continue
-            # `flat` is stripped of its non-cost senses BEFORE the trigger runs,
-            # so the exclusion cannot accidentally swallow a real claim in the
-            # same block -- only the words it names.
-            scrub=$(printf '%s' "$text" | sed -E "s/[Ff]lat +${notclaim}//g")
-            printf '%s' "$scrub" | grep -qE "$trigger" || continue
-            claimed=$((claimed + 1))
-            if printf '%s' "$text" | grep -q 'UNVERIFIED'; then
-              by_unverified=$((by_unverified + 1))
-              continue
-            fi
-            case "$(prove "$text")" in
-              test) by_test=$((by_test + 1)) ;;
-              path) by_path=$((by_path + 1)) ;;
-              row)  by_row=$((by_row + 1)) ;;
-              *)    printf '%s:%s\n' "$f" "$ln" >> "$refused" ;;
-            esac
-          done < "$blocks"
-
-          echo "  ${claimed} block(s) make a cost claim"
-          echo "    ${by_test} name a test that exists"
-          echo "    ${by_row} name an invariant row whose test exists"
-          echo "    ${by_path} name a tracked test or bench file"
-          echo "    ${by_unverified} say UNVERIFIED"
-          echo "    $(awk 'END{print NR}' "$refused") name nothing"
-          if [ "$claimed" -eq 0 ]; then
-            echo
-            echo "GATE 12 FOUND NO CLAIM AT ALL in ${nb} doc blocks. Either every"
-            echo "comment stopped saying O(1) in the same commit, or the trigger"
-            echo "stopped matching. Both need a human; a silent zero does not."
-            exit 1
-          fi
-
-          bad=0
-          echo
-          for f in $( { cut -d: -f1 "$refused" | sort -u; } ); do
-            c=$( { grep -c "^${f}:" "$refused" || true; } | tr -d ' ')
-            a=$( { printf '%s\n' "$allow_claim" | awk -v F="$f" '$1==F{print $2; exit}'; } || true)
-            [ -n "$a" ] || a=0
-            if [ "$c" -gt "$a" ]; then
-              printf '  REFUSED  %s — %s unproven claim(s), %s allowed\n' "$f" "$c" "$a"
-              { grep "^${f}:" "$refused" | sed 's/^/             doc block at /' | head -8; } || true
-              bad=1
-            else
-              printf '  allowed  %s — %s of %s\n' "$f" "$c" "$a"
-            fi
-          done
-          # Same two self-audits gate 11 carries. An entry naming a file that
-          # is gone makes this gate read stronger than it is, so it is a
-          # failure; an entry that no longer matches is only loose, and says so.
-          for p in $( { printf '%s\n' "$allow_claim" | awk 'NF{print $1}'; } ); do
-            if ! git ls-files --error-unmatch "$p" >/dev/null 2>&1; then
-              printf '  STALE ALLOWLIST ENTRY — %s is not a tracked file\n' "$p"
-              bad=1
-            elif ! grep -q "^${p}:" "$refused"; then
-              printf '  ::warning title=Gate 12 allowlist is loose::'
-              printf '%s claims nothing unproven any more — drop the entry\n' "$p"
-            fi
-          done
-
-          echo
-          if [ "$bad" -ne 0 ]; then
-            echo "GATE 12 FAILED."
-            echo
-            echo 'A cost claim with no proof beside it is the defect this gate'
-            echo 'was written for. Name the test — crate::module::name, an'
-            echo 'invariant row id, or the bench file — or write UNVERIFIED and'
-            echo 'record it in docs/06-limits.md. CLAUDE.md section 3 rule 6.'
-            exit 1
-          fi
-          echo "OK — every cost claim names its proof or says UNVERIFIED."
 
       - name: Gate 13 — no foreign runtime, not even through a dependency
         run: |
@@ -1583,6 +961,789 @@ jobs:
           fi
           echo "OK — the banned token appears in no tracked file."
 
+      - name: Gate 16 — every crate root forbids unsafe outright
+        run: |
+          set -euo pipefail
+          # WHY THIS EXISTS. Gate 5 counts `allow(unsafe_code)` occurrences and
+          # caps them at three. It never checks that anything is FORBIDDEN. On
+          # a tree where no crate carries the attribute at all it counts zero
+          # exceptions and prints the cleanest possible log for the weakest
+          # possible state — and a new crate arrives with neither attribute by
+          # default, which is exactly the moment nobody is looking. crates/costs
+          # is being written as this gate is.
+          #
+          # DENY IS A DEFAULT; FORBID IS A WALL. The root manifest's
+          # `[workspace.lints.rust] unsafe_code = "deny"` is real and it is
+          # checked below — but a deny is a lint LEVEL, and one
+          # `#[allow(unsafe_code)]` on one function switches it off for that
+          # function with nothing red anywhere. `#![forbid(unsafe_code)]` is
+          # not a level: an inner allow under a forbid is a hard compile error,
+          # not a lint that can be downgraded. The two are complements, and the
+          # gate needs both because either alone is one edit from gone.
+          #
+          # THE THIRD HOLE, WHICH IS THE QUIET ONE. `[workspace.lints]` applies
+          # to exactly NOTHING in a member that does not write `[lints]
+          # workspace = true` in its own manifest. Deleting those two words
+          # from one crate's Cargo.toml disarms the whole workspace lint table
+          # for that crate — unsafe_code, unwrap_used, expect_used, panic, the
+          # lot — and no gate in this file looked at it before this one. Gate
+          # 11 rule 5b guards the CONTENT of that table; this guards whether
+          # anybody has opted in to it.
+          #
+          # STRICTER THAN "lib.rs", DELIBERATELY, AND IT IS RED BECAUSE OF IT.
+          # A `main.rs` is a SEPARATE CRATE ROOT. The inner attribute at the
+          # top of lib.rs is an attribute on the library crate and does not
+          # reach the binary crate at all — they are compiled separately.
+          # crates/api/src/main.rs carries no forbid today and this gate
+          # refuses it. That difference is written here rather than discovered
+          # in a review, which is gate 13 layer 3's precedent.
+          #
+          # NO UNTRUSTED INPUT REACHES THIS STEP. The inputs are `git ls-files`,
+          # the tracked manifests and the static list below — gate 1c's
+          # discipline. Nothing from the event payload is expanded.
+          #
+          # WHAT IT CANNOT SEE:
+          #   * A crate root that is neither `src/lib.rs` nor `src/main.rs`. A
+          #     `[lib] path = ...` or `[[bin]] path = ...` moves it. The gate
+          #     does not parse the override and does not guess: a manifest
+          #     whose roots it cannot find is REFUSED, so the blind spot is a
+          #     red build rather than a silent skip.
+          #   * `unsafe` inside a dependency. `forbid` is per-crate and std
+          #     itself is full of it. This gate is about the code this
+          #     repository writes.
+          #   * Whether the attribute is inside a `#[cfg(...)]` that removes
+          #     it. It is matched at the start of a line as an inner attribute,
+          #     which is the only place it is legal, but no cfg is evaluated.
+          #   * Anything untracked, `git ls-files` being the input.
+
+          # THE ESCAPE HATCH IS HERE, NEVER IN THE CODE. One tracked crate-root
+          # path per line — a plain path and not `path count`, because the
+          # question is present-or-absent and a count column for a boolean
+          # invites a 0 that reads like an allowance. IT SHIPS EMPTY. The one
+          # root that fails today is named in the log; pinning it here on the
+          # way in would convert a finding into a line nobody reads.
+          allow_root='
+          '
+
+          root=Cargo.toml
+          bad=0
+          nm=0; nr=0
+
+          echo "layer 1: every crate root carries #![forbid(unsafe_code)]"
+          while IFS= read -r m; do
+            [ -n "$m" ] || continue
+            nm=$((nm + 1))
+            c=$(printf '%s\n' "$m" | cut -d/ -f2)
+            found=0
+            for base in lib main; do
+              f="crates/${c}/src/${base}.rs"
+              git ls-files --error-unmatch "$f" >/dev/null 2>&1 || continue
+              found=$((found + 1)); nr=$((nr + 1))
+              if grep -qE '^#!\[forbid\([^]]*\bunsafe_code\b' "$f"; then
+                printf '  ok       %s\n' "$f"
+              elif printf '%s\n' "$allow_root" | awk 'NF{print $1}' \
+                   | grep -qxF -- "$f"; then
+                printf '  allowed  %s — no forbid, listed above\n' "$f"
+              else
+                printf '  REFUSED  %s carries no #![forbid(unsafe_code)]\n' "$f"
+                bad=1
+              fi
+            done
+            if [ "$found" -eq 0 ]; then
+              printf '  REFUSED  %s — neither src/lib.rs nor src/main.rs is tracked.\n' "$m"
+              printf '           This gate will not guess where the crate root is.\n'
+              bad=1
+            fi
+          done < <(git ls-files 'crates/*/Cargo.toml')
+
+          echo "  ${nm} crate manifest(s), ${nr} crate root(s) examined"
+          # A glob that matches nothing is the failure mode gate 8 shipped with
+          # for the whole life of the repository, reporting success throughout.
+          if [ "$nm" -eq 0 ] || [ "$nr" -eq 0 ]; then
+            echo "GATE 16 EXAMINED NO CRATE ROOT. A gate that reads no lib.rs and"
+            echo "no main.rs is not a gate."
+            exit 1
+          fi
+
+          # The same two self-audits gates 11 through 15 carry. An entry naming
+          # a file that is gone makes this gate read stronger than it is, so it
+          # is a failure; an entry whose file now carries the attribute anyway
+          # is only loose, and says so.
+          while IFS= read -r p; do
+            [ -n "$p" ] || continue
+            if ! git ls-files --error-unmatch "$p" >/dev/null 2>&1; then
+              printf '  STALE ALLOWLIST ENTRY — %s is not a tracked file\n' "$p"
+              bad=1
+            elif grep -qE '^#!\[forbid\([^]]*\bunsafe_code\b' "$p"; then
+              printf '  ::warning title=Gate 16 allowlist is loose::'
+              printf '%s forbids unsafe after all — drop the entry\n' "$p"
+            fi
+          done < <(printf '%s\n' "$allow_root" | awk 'NF{print $1}')
+
+          # ---- layer 2: the workspace deny, and who has opted in to it. -----
+          echo
+          echo "layer 2: the workspace lint table, and every member inheriting it"
+          if grep -qE '^[[:space:]]*unsafe_code[[:space:]]*=[[:space:]]*"deny"' "$root"; then
+            echo '  present  root Cargo.toml sets unsafe_code = "deny"'
+          else
+            echo '  REFUSED  root Cargo.toml no longer denies unsafe_code. Gate 5'
+            echo '           states that line already fails the build, and gate 5'
+            echo '           cannot check its own premise.'
+            bad=1
+          fi
+          while IFS= read -r m; do
+            [ -n "$m" ] || continue
+            if awk '
+              /^\[lints\]/ { inl = 1; next }
+              /^\[/        { inl = 0 }
+              inl && /^[[:space:]]*workspace[[:space:]]*=[[:space:]]*true/ { ok = 1 }
+              END { exit !ok }
+            ' "$m"; then
+              printf '  present  %s inherits [lints] workspace = true\n' "$m"
+            else
+              printf '  REFUSED  %s does not write [lints] workspace = true, so the\n' "$m"
+              printf '           workspace lint table applies to none of it\n'
+              bad=1
+            fi
+          done < <(git ls-files 'crates/*/Cargo.toml')
+
+          echo
+          if [ "$bad" -ne 0 ]; then
+            echo "GATE 16 FAILED."
+            echo
+            echo "Add #![forbid(unsafe_code)] to the crate root — every crate"
+            echo "root, a binary being its own — and keep [lints] workspace ="
+            echo "true in the manifest. A deny that one attribute switches off"
+            echo "is not the guarantee CLAUDE.md section 9 is read as making."
+            exit 1
+          fi
+          echo "OK — every crate root forbids unsafe and inherits the lint table."
+
+  # ==========================================================================
+  # GATES 3-6 — the toolchain gates.
+  # ==========================================================================
+      - name: Gate 10 — every invariant names a test that exists
+        run: |
+          set -euo pipefail
+          # docs/04-invariants.md asserts: "A consistency check in CI fails if
+          # a row's test does not exist." Until this gate existed that sentence
+          # was false, which is precisely the decay the file was written to
+          # prevent -- a row pointing at nothing is what turns the file into a
+          # wish list.
+          #
+          # THIS GATE HAD A HOLE AND PRINTED "0 missing" THROUGH IT for its
+          # whole life. Three defects, every one of them silent:
+          #
+          #  1. THE SKIP WAS UNAUDITED. The rule was "skip a row whose status
+          #     cell is —", justified by the legend's meaning of that glyph:
+          #     "not yet reachable (the crate does not exist)". The gate never
+          #     checked the crate. So a row could name a test that exists in no
+          #     file, wear a —, and pass. TEN rows did, in four crates that are
+          #     tracked TODAY: S-02, S-05, S-10, P-01, P-02, P-03, P-04, X-01,
+          #     X-02, X-13. Measured, not inferred -- the old gate printed
+          #     "checked 139 named test(s); 0 missing" on the same tree that
+          #     holds them. The status glyph is now documentation. The fact
+          #     that decides is whether crates/<crate>/Cargo.toml is TRACKED,
+          #     which is the thing the legend was talking about all along.
+          #  2. THE CRATE SEGMENT WAS THROWN AWAY. `crate::module::name` was
+          #     reduced to `name` and searched for across every .rs file in the
+          #     workspace, so `engine::proptest::antimonotone` would have been
+          #     satisfied by an `fn antimonotone` in crates/store. The search is
+          #     now confined to the crate the row names.
+          #  3. `xargs -r grep -q` RETURNS 123 WHEN ANY BATCH MISSES. xargs
+          #     exits 123 if any invocation exits 1..125, and `grep -q` exits 1
+          #     on the batches that do not contain the match -- so as soon as
+          #     the workspace outgrows one ARG_MAX batch, a test that DOES
+          #     exist is reported missing. A red build for a reason that is not
+          #     true is how a gate gets ignored. One fixed-string lookup into a
+          #     table built once replaces it.
+          #
+          # WHAT IT STILL CANNOT SEE:
+          #   * That the named function is a TEST. `#[test]` is not required,
+          #     because a `harness = false` bench function carries no attribute
+          #     and C-01 through C-13 are proven by exactly those. So a row can
+          #     be satisfied by an ordinary function of the right name in the
+          #     right crate.
+          #   * That the test proves the invariant. Nothing mechanical can.
+          #   * The module segment. `store::unit::x` and `store::fault::x` are
+          #     the same question to this gate.
+          #   * A row whose "Proven by" cell is prose, a const assertion or a
+          #     CI gate rather than a `crate::module::name` token. Those rows
+          #     are not checked and never were.
+          #
+          # NO UNTRUSTED INPUT REACHES THIS STEP: `git ls-files`, the document,
+          # and the static patterns below. Gate 1c's discipline.
+          f=docs/04-invariants.md
+          work=$(mktemp -d)
+
+          # ROWS ARE EXEMPTED ONLY HERE, never by a glyph in the document --
+          # that is the whole repair. One row id per line, with the reason
+          # beside it, gate 1d's mechanism: adding a line is a visible diff and
+          # the moment to ask whether the test should just be written.
+          # IT IS DELIBERATELY EMPTY. The ten rows above are reported by name
+          # in the log of this step; pinning them here on the way in would turn
+          # ten findings into one line nobody reads.
+          allow_pending=''
+
+          # (crate, fn) for every tracked crate, built once.
+          fns="$work/fns"; : > "$fns"
+          for c in $(git ls-files 'crates/*/Cargo.toml' \
+                     | sed 's|^crates/||; s|/Cargo.toml$||'); do
+            { git ls-files "crates/$c/*.rs" \
+              | xargs -r grep -ohE '\bfn [a-z_][a-z_0-9]*' \
+              | sed "s|^fn |${c} |" >> "$fns"; } || true
+          done
+          sort -u -o "$fns" "$fns"
+
+          rows=0; checked=0; missing=0; pending=0; exempt=0
+          while IFS= read -r line; do
+            case "$line" in \|*) ;; *) continue ;; esac
+            rows=$((rows + 1))
+            id=$(printf '%s\n' "$line" | awk -F'|' '{print $2}' | tr -d ' ')
+            for t in $( { printf '%s\n' "$line" \
+                          | grep -oE '`[a-z_]+::[a-z_]+::[a-z_0-9]+`' | tr -d '`' || true; } ); do
+              c="${t%%::*}"; fn="${t##*::}"
+              # The ONLY reason a row is not checked: the crate it names is not
+              # a tracked member of this workspace. That is what the legend's
+              # "—" was always supposed to mean, now read off the tree.
+              if ! git ls-files --error-unmatch "crates/${c}/Cargo.toml" >/dev/null 2>&1; then
+                pending=$((pending + 1))
+                continue
+              fi
+              if [ -n "$( { printf '%s\n' "$allow_pending" \
+                            | awk -v I="$id" '$1==I{print "y"; exit}'; } )" ]; then
+                exempt=$((exempt + 1))
+                printf 'EXEMPT (allowlisted) %s — %s\n' "$id" "$t"
+                continue
+              fi
+              checked=$((checked + 1))
+              if ! grep -qxF "${c} ${fn}" "$fns"; then
+                printf 'INVARIANT POINTS AT A TEST THAT DOES NOT EXIST: %s (%s)\n' "$t" "$id"
+                missing=$((missing + 1))
+              fi
+            done
+          done < "$f"
+
+          echo "read ${rows} table row(s) in ${f}"
+          echo "  ${checked} named test(s) checked against a tracked crate"
+          echo "  ${pending} skipped — the crate they name is not a workspace member"
+          echo "  ${exempt} exempted by the allowlist in this file"
+          echo "  ${missing} missing"
+          # A pattern that stops matching is the failure mode gate 8 shipped
+          # with: it reported success while measuring nothing.
+          if [ "$checked" -eq 0 ]; then
+            echo "GATE 10 CHECKED NOTHING. Either every crate vanished or the row"
+            echo "pattern stopped matching. A silent zero is not a pass."
+            exit 1
+          fi
+
+          bad=0
+          [ "$missing" -eq 0 ] || bad=1
+          for i in $( { printf '%s\n' "$allow_pending" | awk 'NF{print $1}'; } ); do
+            if ! grep -qE "^\| *${i} *\|" "$f"; then
+              printf 'STALE ALLOWLIST ENTRY — %s is not a row in %s\n' "$i" "$f"
+              bad=1
+            fi
+          done
+
+          if [ "$bad" -ne 0 ]; then
+            echo
+            echo "Either write the test, or record abandoning the invariant in"
+            echo "docs/05-decisions.md. Rows are never deleted to go green, and"
+            echo "a status glyph no longer silences one."
+            exit 1
+          fi
+          echo "OK — every invariant in a tracked crate names a test that exists."
+
+      - name: Gate 11 — banned constructs on the O(1) paths
+        run: |
+          set -euo pipefail
+          # WHY THIS EXISTS. Gate 8 measures a ratio at 1x/10x/100x, which
+          # catches a bound that has ALREADY broken on a path someone thought
+          # to write a bench for. The audit that produced this gate found four
+          # O(1) defects that no gate could see, because each was a *source
+          # construct* that is superlinear by nature and none of them had a
+          # bench: a map reserved to exactly its load so the next insert
+          # rehashed (2.4 ms at 50k entries), a page render that sorted the
+          # whole universe per request, an encoder nothing called, and a
+          # coverage gate that claimed 100% while exiting 1. Gate 8 says "this
+          # path got slower". Gate 11 says "this construct may not appear".
+          #
+          # WHAT IT SCANS. Tracked `crates/*/src/**.rs` only, and inside each
+          # file only the region BEFORE the first `#[cfg(test)]`. Test code and
+          # benches are exempt on purpose: a test asserting that a refusal
+          # happens legitimately unwraps, sorts and panics.
+          #
+          # NO UNTRUSTED INPUT REACHES THIS STEP. The inputs are `git ls-files`
+          # and the static patterns below, the same discipline gate 1c states.
+          # Nothing from the event payload is expanded. `git ls-files` also
+          # means an UNTRACKED file is invisible — which is right for CI, where
+          # the checkout holds only tracked files, but means a local run can
+          # disagree with CI until the file is added.
+          #
+          # WHAT IT CANNOT SEE, stated plainly because a gate that oversells
+          # itself is worse than no gate:
+          #   * Indirection. `.sort()` behind a trait, a `HashMap` arrived at
+          #     by `.collect()`, a float behind a type alias or a generic
+          #     `T: Float` — all invisible. This is a TEXT scan, not a type
+          #     check. It refuses the spelling, not the behaviour.
+          #   * Macro-generated code. Expanded after this gate has run.
+          #   * `/* ... */` block comments are NOT stripped; only whole lines
+          #     whose first non-blank characters are `//` (which covers `///`
+          #     and `//!`). A banned token inside a block comment or inside a
+          #     string literal is a false positive, and the allowlist is the
+          #     escape hatch for it.
+          #   * "Per-request" is not decidable from text. Rule 4 refuses every
+          #     sort in non-test source and leans on the allowlist to record,
+          #     one file at a time, WHY a given sort is bounded. The reasons
+          #     are written beside the entries and are the reviewable part.
+          #   * A second `#[cfg(test)]` in a file would silently shrink the
+          #     scanned region, so that is a hard failure rather than a guess.
+          #
+          # THE ESCAPE HATCH IS HERE, NEVER IN THE CODE. No magic comment, no
+          # `// gate-11-ok` scattered through crates/. Each entry is
+          # `path max_occurrences`, and the count is pinned at what the file
+          # measures TODAY — so a legitimate existing use stays green while the
+          # NEXT one is a red build and a visible diff on this file. That is
+          # gate 1d's mechanism: adding a line here is the moment to ask
+          # whether the construct is really justified.
+
+          # ---- rule 1. No allowlist. docs/07 layer 4 is unconditional. ------
+          allow_search=''
+
+          # ---- rule 2. CLAUDE.md section 7: paisa i64, never a float. -------
+          # price.rs carries the ONE sanctioned float boundary — the file says
+          # so itself: "the ONLY function in the workspace permitted to do
+          # floating-point arithmetic". The vendor sends rupees as an IEEE
+          # double and something has to accept it; everything downstream of
+          # that `Ok` is an integer forever. vendor.rs::parse_strike is the
+          # other end of the same boundary and hands its f64 straight to it.
+          # NOTE for whoever builds the engine: CLAUDE.md section 7 also lets
+          # Sharpe, p-values and ratios keep full precision. There is no entry
+          # for them because no such code exists yet. When it lands it needs a
+          # line here, and that line is the review.
+          allow_float='
+          crates/core/src/price.rs 4
+          crates/core/src/vendor.rs 1
+          '
+
+          # ---- rule 3. docs/07 law 2: pre-size every map. -------------------
+          # Only HashMap/HashSet. A BTreeMap has no `with_capacity` — capacity
+          # is not a concept for a B-tree — so including it would put three
+          # un-fixable entries in the allowlist and teach a reader to ignore
+          # it. A BTreeMap being O(log n) is a real but DIFFERENT complaint,
+          # and this is not the instrument for it.
+          # manifest.rs::genesis reserves nothing because nothing is known yet
+          # to reserve from; the doc comment argues it and points at
+          # docs/06-limits.md §17. Layer 3's guarantee is about the LOADED
+          # index, which is the one a query touches, and that one is reserved.
+          allow_unsized='
+          crates/pull/src/manifest.rs 1
+          '
+
+          # ---- rule 4. docs/07 layer 12: bounded page, never O(universe). ---
+          # Each of these was traced to its callers before it was written down:
+          #   census.rs   grid_instruments — filters to Segment::Index AND
+          #               Kind::Index first, so it sorts the index series,
+          #               bounded by CLAUDE.md section 1, not by the universe.
+          #   master.rs   skipped_by_reason — sorts DECLINE REASONS, bounded by
+          #               the Skip vocabulary. Reached from `universe()`.
+          #   merge.rs    single_vendor_members — O(universe log universe), and
+          #               allowed only because `universe()` runs once into an
+          #               Arc<Site> (D-0039), not per request. If that parse
+          #               ever moves back into a handler this entry is wrong
+          #               and must be deleted, not re-pinned.
+          #   manifest.rs newest-generation pick — bounded by MAX_SLOTS, 2.
+          allow_sort='
+          crates/api/src/census.rs 1
+          crates/api/src/master.rs 1
+          crates/api/src/merge.rs 1
+          crates/pull/src/manifest.rs 1
+          '
+
+          work=$(mktemp -d)
+          corpus="$work/corpus"
+          : > "$corpus"
+
+          walked=0; kept=0; dropped=0; ambiguous=0
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            walked=$((walked + 1))
+            # `grep -c` exits 1 on no match, and with pipefail that would kill
+            # the gate exactly when a file is clean — the bug gate 5 records.
+            n=$( { grep -c '#\[cfg(test)\]' "$f" || true; } | tr -d ' ')
+            # `wc -l` COUNTS NEWLINES, NOT LINES, so a file whose last line is
+            # unterminated is reported one short — and a one-line file reports
+            # ZERO, which set `end=0` and skipped the file entirely. Caught by
+            # feeding this gate a one-line violation with no trailing newline:
+            # it exited 0. `cargo fmt` would reject such a file, but gate 6a
+            # lives in a later job that this one gates, so relying on it would
+            # make gate 11 blind exactly while it runs first.
+            tot=$(awk 'END{print NR}' "$f")
+            if [ "$n" -gt 1 ]; then
+              printf 'AMBIGUOUS TEST BOUNDARY  %s  (%s attributes)\n' "$f" "$n"
+              ambiguous=$((ambiguous + 1))
+              continue
+            fi
+            if [ "$n" -eq 1 ]; then
+              end=$(( $(grep -n '#\[cfg(test)\]' "$f" | head -1 | cut -d: -f1) - 1 ))
+            else
+              end="$tot"
+            fi
+            kept=$((kept + end)); dropped=$((dropped + tot - end))
+            awk -v F="$f" -v E="$end" '
+              NR<=E { l=$0; sub(/^[ \t]+/,"",l); if (l ~ /^\/\//) next; print F":"NR":"$0 }
+            ' "$f" >> "$corpus"
+          done < <(git ls-files 'crates/*.rs' \
+                   | grep '/src/' | grep -vE '/(tests|benches)/' || true)
+
+          # A gate must say what it walked. A glob that matches nothing is the
+          # failure mode gate 8 shipped with for the whole life of the
+          # repository, and it reported success the entire time.
+          echo "walked ${walked} non-test source file(s) under crates/*/src/"
+          echo "  ${kept} line(s) in scope, ${dropped} after a #[cfg(test)]"
+          echo "  $(awk 'END{print NR}' "$corpus") line(s) after comment stripping"
+          if [ "$walked" -eq 0 ]; then
+            echo "GATE 11 WALKED NOTHING. A gate that scans no file is not a gate."
+            exit 1
+          fi
+          if [ "$ambiguous" -ne 0 ]; then
+            echo
+            echo "The test boundary is the region BEFORE the first #[cfg(test)]."
+            echo "A file with two of them has no such region and would be"
+            echo "scanned only as far as the first, silently. One trailing test"
+            echo "module per file."
+            exit 1
+          fi
+
+          bad=0
+
+          check() {
+            rule="$1"; pattern="$2"; allow="$3"; law="$4"
+            hits=$( { grep -E "$pattern" "$corpus" || true; } )
+            n=$( { printf '%s' "$hits" | grep -c . || true; } | tr -d ' ')
+            echo
+            echo "rule ${rule}: ${n} occurrence(s) — ${law}"
+            for f in $( { printf '%s\n' "$hits" | grep . | cut -d: -f1 | sort -u; } || true ); do
+              c=$( { printf '%s\n' "$hits" | grep -c "^${f}:" || true; } | tr -d ' ')
+              a=$( { printf '%s\n' "$allow" | awk -v F="$f" '$1==F{print $2; exit}'; } || true)
+              [ -n "$a" ] || a=0
+              if [ "$c" -gt "$a" ]; then
+                printf '  REFUSED  %s — %s occurrence(s), %s allowed\n' "$f" "$c" "$a"
+                { printf '%s\n' "$hits" | grep "^${f}:" \
+                    | awk -F: '{printf "           %s:%s\n", $1, $2}' | head -8; } || true
+                bad=1
+              else
+                printf '  allowed  %s — %s of %s\n' "$f" "$c" "$a"
+              fi
+            done
+            # An entry naming a file that no longer exists makes this gate read
+            # stronger than it is, so it is a failure and not a note. An entry
+            # whose file no longer matches is only loose, and says so.
+            for p in $( { printf '%s\n' "$allow" | awk 'NF{print $1}'; } || true ); do
+              if ! git ls-files --error-unmatch "$p" >/dev/null 2>&1; then
+                printf '  STALE ALLOWLIST ENTRY — %s is not a tracked file\n' "$p"
+                bad=1
+              elif ! printf '%s\n' "$hits" | grep -q "^${p}:"; then
+                printf '  ::warning title=Gate 11 allowlist is loose::'
+                printf '%s no longer matches rule %s — tighten it\n' "$p" "$rule"
+              fi
+            done
+            :
+          }
+
+          check 1 '\.binary_search' \
+                "$allow_search" \
+                'docs/07 layer 4 — never binary_search'
+
+          check 2 '\b(f32|f64)\b' \
+                "$allow_float" \
+                'CLAUDE.md section 7 — prices are paisa i64, never a float'
+
+          check 3 '\b(HashMap|HashSet)::(new|default)\(\)' \
+                "$allow_unsized" \
+                'docs/07 law 2 — pre-size every map'
+
+          check 4 '\.sort(_[a-z_]+)?\(' \
+                "$allow_sort" \
+                'docs/07 layer 12 — bounded page, never O(universe)'
+
+          check 5 '(^|[^A-Za-z0-9_])(panic!|todo!|unimplemented!)|\.unwrap\(\)|\.expect\(' \
+                '' \
+                'CLAUDE.md section 4 — degrade loudly or refuse, never die'
+
+          # Rule 5's construct is ALREADY denied by clippy at the workspace
+          # root, and gate 6b runs clippy with -D warnings — so the grep above
+          # is expected to find nothing, and finding nothing is not evidence
+          # this gate works. What clippy cannot defend is clippy: the lint
+          # table is an ordinary tracked file, and deleting one line from it
+          # silently disarms the deny across the whole workspace with every
+          # other gate still green. These two steps guard the guard.
+          echo
+          echo "rule 5b: the lint table that denies rule 5 workspace-wide"
+          for lint in unwrap_used expect_used panic todo unimplemented; do
+            if ! grep -qE "^${lint}[[:space:]]*=[[:space:]]*\"deny\"" Cargo.toml; then
+              printf '  REFUSED  Cargo.toml no longer denies clippy::%s\n' "$lint"
+              bad=1
+            else
+              printf '  present  clippy::%s = deny\n' "$lint"
+            fi
+          done
+
+          # And the second way to disarm it: a local allow. In a test module
+          # that is legitimate and this gate never looks there; in shipping
+          # code it is a panic nobody can see from the lint table.
+          echo
+          echo "rule 5c: nothing disarms those lints outside a test module"
+          dis=$( { grep -E 'allow\([^)]*clippy::(unwrap_used|expect_used|panic|todo|unimplemented)' \
+                   "$corpus" || true; } )
+          if [ -n "$dis" ]; then
+            printf '%s\n' "$dis" | awk -F: '{printf "  REFUSED  %s:%s\n", $1, $2}'
+            bad=1
+          else
+            echo "  none"
+          fi
+
+          echo
+          if [ "$bad" -ne 0 ]; then
+            echo "GATE 11 FAILED."
+            echo
+            echo "Either the construct goes, or its file earns a line in the"
+            echo "allowlist above WITH the reason it is bounded. A count is"
+            echo "raised only by someone who can say why. See CLAUDE.md"
+            echo "section 3 rule 4 and docs/07-o1-architecture.md."
+            exit 1
+          fi
+          echo "OK — no banned construct outside the allowlist."
+
+      - name: Gate 12 — every O(1) claim names the test that proves it
+        run: |
+          set -euo pipefail
+          # WHY THIS EXISTS. The audit that produced this gate found FIVE
+          # documented claims that the code did not have: a coverage row
+          # asserting 100% while the step exited 1, an "authoritative encoder"
+          # nothing called, an append documented "O(1) worst case" that spiked
+          # to 2.4 ms on a census sitting at 7·2^k, a render documented "never
+          # O(universe)" that was exactly that, and seven invariant rows naming
+          # tests that existed in no file. Every one of them was A COMMENT
+          # ASSERTING A PROPERTY THE CODE DID NOT HAVE, and nothing in CI could
+          # see any of them. Gate 8 measures a bound that already broke on a
+          # path someone thought to bench. Gate 11 refuses a construct by its
+          # spelling. Neither reads what the author CLAIMED.
+          #
+          # THE RULE. A doc block under crates/ that makes a cost claim must,
+          # inside that same block, either name its proof or say UNVERIFIED.
+          # UNVERIFIED exists so that an honest admission is always CHEAPER
+          # than a false claim -- if it were not, the false claim is what gets
+          # written. That is the same reason docs/06-limits.md exists.
+          #
+          # WHAT COUNTS AS NAMING THE PROOF, in the order it is tried:
+          #   1. `crate::module::name` that resolves to an `fn name` under
+          #      crates/<crate>/. Gate 10's technique, with gate 10's fix: the
+          #      crate segment is CHECKED, not thrown away, so a same-named
+          #      function in another crate does not satisfy the claim.
+          #   2. A tracked `crates/**/tests/*.rs` or `crates/**/benches/*.rs`
+          #      path. This is the form the benches already use.
+          #   3. An invariant row id -- `C-12`, `M-17`, `S-11` -- that EXISTS
+          #      in docs/04-invariants.md AND whose own "Proven by" cell names
+          #      a test that resolves by rule 1. This is the form the code
+          #      already writes, and it chains: a row gate 10 would refuse
+          #      cannot launder a claim through this gate either.
+          # A src path is NOT proof. Naming the file the claim is written in
+          # proves nothing, and that is the whole defect class.
+          #
+          # NO UNTRUSTED INPUT REACHES THIS STEP. The inputs are `git ls-files`,
+          # docs/04-invariants.md and the static patterns below -- the
+          # discipline gate 1c states. Nothing from the event payload is
+          # expanded.
+          #
+          # WHAT IT CANNOT SEE, said plainly:
+          #   * Whether the claim is TRUE. It checks that a proof is named and
+          #     that the named thing exists. A test can be named that does not
+          #     test the claim, and this gate will believe it. It converts an
+          #     unfalsifiable comment into a falsifiable one; it does not
+          #     falsify it.
+          #   * A claim in an ordinary `//` comment, or in a string, or in a
+          #     `/* */` block. Only `///` and `//!` runs are blocks here.
+          #   * A NEGATIVE claim. "It is O(log n) wearing an O(1) label, and it
+          #     is not constant" is the most honest sentence in this repository
+          #     and this gate refuses it, because no text rule separates "is
+          #     O(1)" from "is not O(1)" without being gamed by the second
+          #     spelling of the first. The escape is the allowlist below, and
+          #     the cheaper fix is to name the test that proves the bound the
+          #     code DOES have.
+          #   * `flat` is an ordinary English word. A short, explicit list of
+          #     nouns is excluded from the trigger -- a flat struct, a flat
+          #     table, a flat bar are not cost claims. That list is in this
+          #     file, so widening it is a visible diff. It is a heuristic and
+          #     it will be wrong in both directions eventually.
+          #   * Macro-generated docs, and anything untracked: the input is
+          #     `git ls-files`, so a local run and CI disagree until `git add`.
+          #
+          # THE ESCAPE HATCH IS HERE, NEVER IN THE CODE. `path max_blocks`,
+          # gate 1d's and gate 11's mechanism. IT IS DELIBERATELY EMPTY. Every
+          # unproven claim on the tree today is reported by name in the log,
+          # and pinning them here on the way in would have converted twelve
+          # findings into one line nobody reads.
+          allow_claim='
+          '
+
+          inv=docs/04-invariants.md
+          work=$(mktemp -d)
+
+          # (crate, fn) for every tracked crate, built once. A fixed-string
+          # lookup afterwards, so `store::proptest::roundtrip` is not satisfied
+          # by an `fn roundtrip` in crates/api.
+          fns="$work/fns"; : > "$fns"
+          for c in $(git ls-files 'crates/*/Cargo.toml' \
+                     | sed 's|^crates/||; s|/Cargo.toml$||'); do
+            { git ls-files "crates/$c/*.rs" \
+              | xargs -r grep -ohE '\bfn [a-z_][a-z_0-9]*' \
+              | sed "s|^fn |${c} |" >> "$fns"; } || true
+          done
+          sort -u -o "$fns" "$fns"
+
+          # A block is a maximal run of consecutive `///` or `//!` lines. Any
+          # other line ends it. One tab-separated record per block, so the
+          # whole block can be searched as one string -- "within its own doc
+          # block" is the unit the rule is stated in.
+          blocks="$work/blocks"; : > "$blocks"
+          walked=0
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            walked=$((walked + 1))
+            awk -v F="$f" '
+              function flush() {
+                if (n > 0) printf "%s\t%d\t%s\n", F, start, text
+                n = 0; text = ""
+              }
+              { l = $0; sub(/^[ \t]+/, "", l); gsub(/\t/, " ", l)
+                if (l ~ /^\/\/[\/!]/) {
+                  sub(/^\/\/[\/!]/, "", l)
+                  if (n == 0) start = NR
+                  n++; text = text " " l
+                } else flush() }
+              END { flush() }
+            ' "$f" >> "$blocks"
+          done < <(git ls-files 'crates/*.rs')
+
+          nb=$(awk 'END{print NR}' "$blocks")
+          echo "walked ${walked} tracked .rs file(s) under crates/"
+          echo "  $(awk 'END{print NR}' "$fns") (crate, fn) pair(s) to resolve against"
+          echo "  ${nb} doc block(s)"
+          # A glob that matches nothing is the failure mode gate 8 shipped with
+          # for the whole life of the repository, reporting success throughout.
+          if [ "$walked" -eq 0 ] || [ "$nb" -eq 0 ]; then
+            echo "GATE 12 WALKED NOTHING. A gate that reads no doc block is not a gate."
+            exit 1
+          fi
+
+          trigger='[Oo]\(1\)|constant[ -]time|never scans?|worst[ -]case|\bflat\b'
+          notclaim='(struct|table|bar|file|field|list|array|layout|namespace)s?'
+
+          refused="$work/refused"; : > "$refused"
+          claimed=0; by_test=0; by_path=0; by_row=0; by_unverified=0
+
+          # Echoes the KIND of proof found, or nothing. Always returns 0: a
+          # bare `[ ... ] && break` as the last command of a loop makes the
+          # enclosing `if` exit 1, and under `set -e` that kills the gate on
+          # the ordinary path. Gate 5 records the same class of bug.
+          prove() {
+            text="$1"
+            for t in $( { printf '%s' "$text" \
+                          | grep -oE '\b[a-z_]+::[a-z_]+::[a-z_0-9]+\b' || true; } ); do
+              if grep -qxF "${t%%::*} ${t##*::}" "$fns"; then echo test; return 0; fi
+            done
+            for p in $( { printf '%s' "$text" \
+                          | grep -oE 'crates/[A-Za-z0-9_./-]*/(tests|benches)/[A-Za-z0-9_.-]+\.rs' \
+                          || true; } ); do
+              if git ls-files --error-unmatch "$p" >/dev/null 2>&1; then echo path; return 0; fi
+            done
+            for r in $( { printf '%s' "$text" | grep -oE '\b[A-Z]-[0-9][0-9]\b' || true; } ); do
+              row=$( { grep -E "^\| *${r} *\|" "$inv" || true; } | head -1)
+              [ -n "$row" ] || continue
+              for t in $( { printf '%s' "$row" \
+                            | grep -oE '`[a-z_]+::[a-z_]+::[a-z_0-9]+`' | tr -d '`' || true; } ); do
+                if grep -qxF "${t%%::*} ${t##*::}" "$fns"; then echo row; return 0; fi
+              done
+            done
+            return 0
+          }
+
+          tab=$(printf '\t')
+          while IFS="$tab" read -r f ln text; do
+            [ -n "${text-}" ] || continue
+            # `flat` is stripped of its non-cost senses BEFORE the trigger runs,
+            # so the exclusion cannot accidentally swallow a real claim in the
+            # same block -- only the words it names.
+            scrub=$(printf '%s' "$text" | sed -E "s/[Ff]lat +${notclaim}//g")
+            printf '%s' "$scrub" | grep -qE "$trigger" || continue
+            claimed=$((claimed + 1))
+            if printf '%s' "$text" | grep -q 'UNVERIFIED'; then
+              by_unverified=$((by_unverified + 1))
+              continue
+            fi
+            case "$(prove "$text")" in
+              test) by_test=$((by_test + 1)) ;;
+              path) by_path=$((by_path + 1)) ;;
+              row)  by_row=$((by_row + 1)) ;;
+              *)    printf '%s:%s\n' "$f" "$ln" >> "$refused" ;;
+            esac
+          done < "$blocks"
+
+          echo "  ${claimed} block(s) make a cost claim"
+          echo "    ${by_test} name a test that exists"
+          echo "    ${by_row} name an invariant row whose test exists"
+          echo "    ${by_path} name a tracked test or bench file"
+          echo "    ${by_unverified} say UNVERIFIED"
+          echo "    $(awk 'END{print NR}' "$refused") name nothing"
+          if [ "$claimed" -eq 0 ]; then
+            echo
+            echo "GATE 12 FOUND NO CLAIM AT ALL in ${nb} doc blocks. Either every"
+            echo "comment stopped saying O(1) in the same commit, or the trigger"
+            echo "stopped matching. Both need a human; a silent zero does not."
+            exit 1
+          fi
+
+          bad=0
+          echo
+          for f in $( { cut -d: -f1 "$refused" | sort -u; } ); do
+            c=$( { grep -c "^${f}:" "$refused" || true; } | tr -d ' ')
+            a=$( { printf '%s\n' "$allow_claim" | awk -v F="$f" '$1==F{print $2; exit}'; } || true)
+            [ -n "$a" ] || a=0
+            if [ "$c" -gt "$a" ]; then
+              printf '  REFUSED  %s — %s unproven claim(s), %s allowed\n' "$f" "$c" "$a"
+              { grep "^${f}:" "$refused" | sed 's/^/             doc block at /' | head -8; } || true
+              bad=1
+            else
+              printf '  allowed  %s — %s of %s\n' "$f" "$c" "$a"
+            fi
+          done
+          # Same two self-audits gate 11 carries. An entry naming a file that
+          # is gone makes this gate read stronger than it is, so it is a
+          # failure; an entry that no longer matches is only loose, and says so.
+          for p in $( { printf '%s\n' "$allow_claim" | awk 'NF{print $1}'; } ); do
+            if ! git ls-files --error-unmatch "$p" >/dev/null 2>&1; then
+              printf '  STALE ALLOWLIST ENTRY — %s is not a tracked file\n' "$p"
+              bad=1
+            elif ! grep -q "^${p}:" "$refused"; then
+              printf '  ::warning title=Gate 12 allowlist is loose::'
+              printf '%s claims nothing unproven any more — drop the entry\n' "$p"
+            fi
+          done
+
+          echo
+          if [ "$bad" -ne 0 ]; then
+            echo "GATE 12 FAILED."
+            echo
+            echo 'A cost claim with no proof beside it is the defect this gate'
+            echo 'was written for. Name the test — crate::module::name, an'
+            echo 'invariant row id, or the bench file — or write UNVERIFIED and'
+            echo 'record it in docs/06-limits.md. CLAUDE.md section 3 rule 6.'
+            exit 1
+          fi
+          echo "OK — every cost claim names its proof or says UNVERIFIED."
+
       - name: Gate 14 — every crate that claims a bound re-measures it
         run: |
           set -euo pipefail
@@ -1964,167 +2125,6 @@ jobs:
           fi
           echo "OK — every crate that claims a bound names a bench that measures it."
 
-      - name: Gate 16 — every crate root forbids unsafe outright
-        run: |
-          set -euo pipefail
-          # WHY THIS EXISTS. Gate 5 counts `allow(unsafe_code)` occurrences and
-          # caps them at three. It never checks that anything is FORBIDDEN. On
-          # a tree where no crate carries the attribute at all it counts zero
-          # exceptions and prints the cleanest possible log for the weakest
-          # possible state — and a new crate arrives with neither attribute by
-          # default, which is exactly the moment nobody is looking. crates/costs
-          # is being written as this gate is.
-          #
-          # DENY IS A DEFAULT; FORBID IS A WALL. The root manifest's
-          # `[workspace.lints.rust] unsafe_code = "deny"` is real and it is
-          # checked below — but a deny is a lint LEVEL, and one
-          # `#[allow(unsafe_code)]` on one function switches it off for that
-          # function with nothing red anywhere. `#![forbid(unsafe_code)]` is
-          # not a level: an inner allow under a forbid is a hard compile error,
-          # not a lint that can be downgraded. The two are complements, and the
-          # gate needs both because either alone is one edit from gone.
-          #
-          # THE THIRD HOLE, WHICH IS THE QUIET ONE. `[workspace.lints]` applies
-          # to exactly NOTHING in a member that does not write `[lints]
-          # workspace = true` in its own manifest. Deleting those two words
-          # from one crate's Cargo.toml disarms the whole workspace lint table
-          # for that crate — unsafe_code, unwrap_used, expect_used, panic, the
-          # lot — and no gate in this file looked at it before this one. Gate
-          # 11 rule 5b guards the CONTENT of that table; this guards whether
-          # anybody has opted in to it.
-          #
-          # STRICTER THAN "lib.rs", DELIBERATELY, AND IT IS RED BECAUSE OF IT.
-          # A `main.rs` is a SEPARATE CRATE ROOT. The inner attribute at the
-          # top of lib.rs is an attribute on the library crate and does not
-          # reach the binary crate at all — they are compiled separately.
-          # crates/api/src/main.rs carries no forbid today and this gate
-          # refuses it. That difference is written here rather than discovered
-          # in a review, which is gate 13 layer 3's precedent.
-          #
-          # NO UNTRUSTED INPUT REACHES THIS STEP. The inputs are `git ls-files`,
-          # the tracked manifests and the static list below — gate 1c's
-          # discipline. Nothing from the event payload is expanded.
-          #
-          # WHAT IT CANNOT SEE:
-          #   * A crate root that is neither `src/lib.rs` nor `src/main.rs`. A
-          #     `[lib] path = ...` or `[[bin]] path = ...` moves it. The gate
-          #     does not parse the override and does not guess: a manifest
-          #     whose roots it cannot find is REFUSED, so the blind spot is a
-          #     red build rather than a silent skip.
-          #   * `unsafe` inside a dependency. `forbid` is per-crate and std
-          #     itself is full of it. This gate is about the code this
-          #     repository writes.
-          #   * Whether the attribute is inside a `#[cfg(...)]` that removes
-          #     it. It is matched at the start of a line as an inner attribute,
-          #     which is the only place it is legal, but no cfg is evaluated.
-          #   * Anything untracked, `git ls-files` being the input.
-
-          # THE ESCAPE HATCH IS HERE, NEVER IN THE CODE. One tracked crate-root
-          # path per line — a plain path and not `path count`, because the
-          # question is present-or-absent and a count column for a boolean
-          # invites a 0 that reads like an allowance. IT SHIPS EMPTY. The one
-          # root that fails today is named in the log; pinning it here on the
-          # way in would convert a finding into a line nobody reads.
-          allow_root='
-          '
-
-          root=Cargo.toml
-          bad=0
-          nm=0; nr=0
-
-          echo "layer 1: every crate root carries #![forbid(unsafe_code)]"
-          while IFS= read -r m; do
-            [ -n "$m" ] || continue
-            nm=$((nm + 1))
-            c=$(printf '%s\n' "$m" | cut -d/ -f2)
-            found=0
-            for base in lib main; do
-              f="crates/${c}/src/${base}.rs"
-              git ls-files --error-unmatch "$f" >/dev/null 2>&1 || continue
-              found=$((found + 1)); nr=$((nr + 1))
-              if grep -qE '^#!\[forbid\([^]]*\bunsafe_code\b' "$f"; then
-                printf '  ok       %s\n' "$f"
-              elif printf '%s\n' "$allow_root" | awk 'NF{print $1}' \
-                   | grep -qxF -- "$f"; then
-                printf '  allowed  %s — no forbid, listed above\n' "$f"
-              else
-                printf '  REFUSED  %s carries no #![forbid(unsafe_code)]\n' "$f"
-                bad=1
-              fi
-            done
-            if [ "$found" -eq 0 ]; then
-              printf '  REFUSED  %s — neither src/lib.rs nor src/main.rs is tracked.\n' "$m"
-              printf '           This gate will not guess where the crate root is.\n'
-              bad=1
-            fi
-          done < <(git ls-files 'crates/*/Cargo.toml')
-
-          echo "  ${nm} crate manifest(s), ${nr} crate root(s) examined"
-          # A glob that matches nothing is the failure mode gate 8 shipped with
-          # for the whole life of the repository, reporting success throughout.
-          if [ "$nm" -eq 0 ] || [ "$nr" -eq 0 ]; then
-            echo "GATE 16 EXAMINED NO CRATE ROOT. A gate that reads no lib.rs and"
-            echo "no main.rs is not a gate."
-            exit 1
-          fi
-
-          # The same two self-audits gates 11 through 15 carry. An entry naming
-          # a file that is gone makes this gate read stronger than it is, so it
-          # is a failure; an entry whose file now carries the attribute anyway
-          # is only loose, and says so.
-          while IFS= read -r p; do
-            [ -n "$p" ] || continue
-            if ! git ls-files --error-unmatch "$p" >/dev/null 2>&1; then
-              printf '  STALE ALLOWLIST ENTRY — %s is not a tracked file\n' "$p"
-              bad=1
-            elif grep -qE '^#!\[forbid\([^]]*\bunsafe_code\b' "$p"; then
-              printf '  ::warning title=Gate 16 allowlist is loose::'
-              printf '%s forbids unsafe after all — drop the entry\n' "$p"
-            fi
-          done < <(printf '%s\n' "$allow_root" | awk 'NF{print $1}')
-
-          # ---- layer 2: the workspace deny, and who has opted in to it. -----
-          echo
-          echo "layer 2: the workspace lint table, and every member inheriting it"
-          if grep -qE '^[[:space:]]*unsafe_code[[:space:]]*=[[:space:]]*"deny"' "$root"; then
-            echo '  present  root Cargo.toml sets unsafe_code = "deny"'
-          else
-            echo '  REFUSED  root Cargo.toml no longer denies unsafe_code. Gate 5'
-            echo '           states that line already fails the build, and gate 5'
-            echo '           cannot check its own premise.'
-            bad=1
-          fi
-          while IFS= read -r m; do
-            [ -n "$m" ] || continue
-            if awk '
-              /^\[lints\]/ { inl = 1; next }
-              /^\[/        { inl = 0 }
-              inl && /^[[:space:]]*workspace[[:space:]]*=[[:space:]]*true/ { ok = 1 }
-              END { exit !ok }
-            ' "$m"; then
-              printf '  present  %s inherits [lints] workspace = true\n' "$m"
-            else
-              printf '  REFUSED  %s does not write [lints] workspace = true, so the\n' "$m"
-              printf '           workspace lint table applies to none of it\n'
-              bad=1
-            fi
-          done < <(git ls-files 'crates/*/Cargo.toml')
-
-          echo
-          if [ "$bad" -ne 0 ]; then
-            echo "GATE 16 FAILED."
-            echo
-            echo "Add #![forbid(unsafe_code)] to the crate root — every crate"
-            echo "root, a binary being its own — and keep [lints] workspace ="
-            echo "true in the manifest. A deny that one attribute switches off"
-            echo "is not the guarantee CLAUDE.md section 9 is read as making."
-            exit 1
-          fi
-          echo "OK — every crate root forbids unsafe and inherits the lint table."
-
-  # ==========================================================================
-  # GATES 3-6 — the toolchain gates.
-  # ==========================================================================
   build:
     name: Gates 3-6 — fmt, clippy, deny, test
     runs-on: ubuntu-24.04
