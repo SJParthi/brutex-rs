@@ -778,6 +778,8 @@ pub struct Site {
     /// plus the two the engine sweeps. Sorted, so a row's ordinal is stable
     /// across reloads and restarts.
     pub series: Vec<census::Series>,
+    /// Folders holding CSVs, walked once at startup rather than per render.
+    pub folders: Vec<String>,
     /// How many instruments each spot target covers, in
     /// [`ingest::SpotTarget::ALL`] order.
     ///
@@ -832,10 +834,16 @@ impl Site {
         // (D-0039): it is O(keys log keys), and that belongs at startup beside
         // the manifest load rather than inside a request.
         let series = census::held_series(&censuses);
+        // THE FOLDER SUGGESTION LIST, WALKED ONCE. It was walked on every
+        // `/pull` render and cost 72 ms against `/store`'s 1 ms, growing with
+        // `~/Downloads` -- a directory this repository does not own and cannot
+        // bound. Same move D-0039 made for the master. See render::folder_suggestions.
+        let folders = render::folder_suggestions();
         Self {
             read,
             censuses,
             series,
+            folders,
             targets,
             store_root,
             loaded_at: ingest::epoch_secs(std::time::SystemTime::now()),
@@ -1079,6 +1087,7 @@ pub fn pull_html(site: &Site, today: Day) -> String {
         journal: journal_note(&path, &log, &trouble),
         halt: Some(HTTP_UNAVAILABLE),
         notes: &site.read.notes,
+        folders: &site.folders,
     })
 }
 

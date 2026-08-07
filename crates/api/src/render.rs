@@ -1393,6 +1393,12 @@ pub struct PullView<'a> {
     pub halt: Option<&'a str>,
     /// Everything an operator has to be told.
     pub notes: &'a [String],
+    /// Folders holding CSVs, walked ONCE at startup by [`folder_suggestions`].
+    ///
+    /// Passed in rather than found here: walking them per render cost 72 ms
+    /// against /store's 1 ms, and grew with a directory this repository does
+    /// not own. See [`folder_input`].
+    pub folders: &'a [String],
 }
 
 /// The two forms. Split out of [`pull_page`] to stay under clippy's 100-line
@@ -1441,7 +1447,10 @@ fn pull_forms(view: &PullView<'_>) -> String {
     let _ = write!(
         out,
         "{}",
-        field("Local vendor folder (optional)", &folder_input(),)
+        field(
+            "Local vendor folder (optional)",
+            &folder_input(view.folders),
+        )
     );
     out.push_str("<button type=\"submit\">Start spot pull</button>");
     out.push_str("</form>");
@@ -2211,21 +2220,31 @@ pub fn audit_page(view: &AuditView<'_>) -> String {
 /// is a convenience, not an index. [`MAX_FOLDER_SUGGESTIONS`] caps it, and the
 /// cap is stated on the page rather than silently truncating: a list that
 /// quietly stops is a list that appears to have found everything.
-fn folder_input() -> String {
-    let mut found: Vec<String> = Vec::new();
-    if let Some(home) = std::env::var_os("HOME") {
-        let home = std::path::PathBuf::from(home);
-        for root in [
-            home.join("Downloads"),
-            home.join(".brutex").join("vendor-data"),
-        ] {
-            collect_csv_dirs(&root, 6, &mut found);
-        }
-    }
-    found.sort();
-    found.dedup();
-    let capped = found.len() > MAX_FOLDER_SUGGESTIONS;
-    found.truncate(MAX_FOLDER_SUGGESTIONS);
+fn folder_input(suggestions: &[String]) -> String {
+    // THE WALK USED TO HAPPEN HERE, ON EVERY RENDER, AND IT COST 70× THE PAGE.
+    //
+    // `folder_input` called `collect_csv_dirs` over `~/Downloads` and
+    // `~/.brutex/vendor-data` to depth 6 each time `/pull` was requested.
+    // Measured on this operator's machine: **72 ms for `/pull` against 1 ms for
+    // `/store`**, walking 39,803 entries under `~/Downloads` — and growing with
+    // a directory this repository does not own and cannot bound.
+    //
+    // `MAX_FOLDER_SUGGESTIONS` did not save it. The cap gates `out.len()`, so a
+    // tree holding fewer than sixty CSV-bearing folders is walked *in full*
+    // every time, and the commonest case is exactly that.
+    //
+    // This is the defect D-0039 already removed once, when the instrument
+    // master was read per request at 150 ms. `docs/07-o1-architecture.md` law 3
+    // — never scan to answer a question — and `CLAUDE.md` §3 rule 4. It also
+    // made `crate::census`'s opening sentence false: there was a `read_dir`
+    // under `crates/api` after all, one module over from the one promising
+    // there was not.
+    //
+    // The list is now walked ONCE, at startup, into `server::Site`, and handed
+    // down. See `census::held_series` for the same bargain and
+    // `docs/06-limits.md` §34 for what it costs.
+    let capped = suggestions.len() > MAX_FOLDER_SUGGESTIONS;
+    let found: Vec<&String> = suggestions.iter().take(MAX_FOLDER_SUGGESTIONS).collect();
 
     let mut out = String::with_capacity(1024);
     out.push_str(
@@ -2257,6 +2276,35 @@ fn folder_input() -> String {
 /// Bounded because the list is rendered into every page load. A cap that is
 /// stated is a cap; a cap that silently truncates is a lie about completeness.
 const MAX_FOLDER_SUGGESTIONS: usize = 60;
+
+/// Every folder holding CSVs, walked **once** and handed to every later render.
+///
+/// # Call this at startup and nowhere else
+///
+/// This is the only `read_dir` under `crates/api`, and it is O(entries under
+/// `$HOME/Downloads`) — unbounded by anything this repository controls.
+/// `server::Site::new` calls it once and holds the result for the process's
+/// lifetime, which is the same bargain D-0039 struck for the instrument master
+/// and `census::held_series` strikes for the coverage axis. Calling it from a
+/// request handler is the defect this function was extracted to make visible.
+///
+/// `docs/06-limits.md` §34 records the cost and what is not bounded about it.
+#[must_use]
+pub fn folder_suggestions() -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = std::path::PathBuf::from(home);
+        for root in [
+            home.join("Downloads"),
+            home.join(".brutex").join("vendor-data"),
+        ] {
+            collect_csv_dirs(&root, 6, &mut found);
+        }
+    }
+    found.sort();
+    found.dedup();
+    found
+}
 
 /// Directories at or under `dir` that directly contain a `.csv`.
 ///
@@ -2742,6 +2790,10 @@ mod tests {
             journal: JOURNAL,
             halt,
             notes: &[],
+            // EMPTY ON PURPOSE. A render must not depend on the machine it runs
+            // on; the walk that used to happen here made the page 72x slower
+            // and made its own test a function of $HOME. See folder_suggestions.
+            folders: &[],
         }
     }
 
