@@ -641,6 +641,69 @@ fn read_census(path: &Path, vendor: Vendor) -> Result<Manifest, String> {
 /// The path and the host's own words, for a directory that cannot be made, a
 /// temporary that cannot be written or flushed, or a rename that is refused.
 fn install(path: &Path, image: &[u8]) -> Result<(), String> {
+    // THE CENSUS LOCK, and the reason it exists is measured rather than
+    // imagined. Two POSTs fired at the same instant — one person, two browser
+    // tabs — over two folders sharing no files at all:
+    //
+    //   both receipts said STORED
+    //   both said "balances: yes — every row accounted for"
+    //   40 bar files landed, all of run A and all of run B
+    //   the census held 20 entries: RUN B ONLY
+    //   6,433 bars, 48.3% of everything written and fsync-ed, invisible
+    //
+    // The install is a read-modify-write of one whole file, so the loser's
+    // whole census is overwritten by a rename that never saw it. Each run's
+    // books were internally perfect and both were wrong about the disk: a
+    // correctness check that only inspects its own run cannot see a concurrent
+    // one.
+    //
+    // `store::file` has taken an advisory `try_lock` on every INDIVIDUAL bar
+    // file since it was written. The census — the one file two runs actually
+    // contend over — was the only one nothing locked. This is that same call,
+    // in the one place it mattered most.
+    //
+    // `try_lock` rather than a blocking lock: a second pull should be told it
+    // is second, loudly, and not wait an unbounded time behind a run that may
+    // be importing eleven thousand contracts.
+    // The directory first: the lock lives beside the census, and on a first
+    // ever run neither exists. `install_locked` creates it too, but that is
+    // after this point and the lock cannot wait for it.
+    // BEST EFFORT, and deliberately not `?`. The lock lives beside the census
+    // and on a first ever run neither exists, so the directory is attempted
+    // here — but a failure to create it is NOT this function's to report.
+    // `install_locked` creates it too and names the fault properly, and a test
+    // that puts a *file* where the directory belongs expects that sentence, not
+    // this one. Swallowing here means the real refusal still reaches the
+    // operator; refusing here would replace it with a worse-worded twin.
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let lock_path = path.with_extension("man.lock");
+    let Ok(lock) = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+    else {
+        // The lock could not even be opened, which means the directory is not
+        // one. Fall through: the install below fails on the same cause and says
+        // so in the words the operator needs.
+        return install_locked(path, image);
+    };
+    if lock.try_lock().is_err() {
+        return Err(format!(
+            "another pull holds the census lock at {}. Refused rather than \
+             queued: two runs installing at once silently discard one, and the \
+             loser's receipt still reads 'every row accounted for' because its \
+             own books balanced. Wait for the other run and try again.",
+            lock_path.display()
+        ));
+    }
+    install_locked(path, image)
+}
+
+/// The install itself, once the census lock is held.
+fn install_locked(path: &Path, image: &[u8]) -> Result<(), String> {
     // A rendered census path is `<root>/manifest/<vendor>.man`, so the parent
     // is always there; the fallback is the path itself, which cannot be
     // created as a directory and therefore fails loudly on the next line

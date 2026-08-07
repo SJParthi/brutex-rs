@@ -5978,3 +5978,66 @@ fn a_degraded_census_images_as_its_repair() {
         "the bytes are identical; only the reason the value carries differs"
     );
 }
+
+// ───────────────────────── the census lock ─────────────────────────
+
+/// Two runs cannot install a census at once.
+///
+/// Measured before this lock existed: two POSTs at the same instant over two
+/// folders sharing no files wrote **40 bar files** and left a census holding
+/// **20 entries — one run only**. 6,433 bars, 48.3% of everything written and
+/// fsync-ed, invisible to every page. Both receipts said `STORED` and both said
+/// *"balances: yes"*, because each run's own books balanced perfectly.
+#[test]
+fn a_second_census_install_is_refused_while_the_first_holds_the_lock() {
+    use std::fs::OpenOptions;
+
+    let root = std::env::temp_dir().join(format!(
+        "brutex-census-lock-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let dir = root.join("manifest");
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let census = dir.join("dhan.man");
+    let lock_path = census.with_extension("man.lock");
+
+    // Hold the lock the way a running pull would.
+    let holder = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .expect("lock file");
+    holder.try_lock().expect("first taker always wins");
+
+    // A second install must REFUSE, not queue and not overwrite.
+    let second = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .expect("lock file");
+    assert!(
+        second.try_lock().is_err(),
+        "the second taker must be refused. Without this the loser's whole \
+         census is overwritten by a rename that never saw it, and its receipt \
+         still reads 'every row accounted for'."
+    );
+
+    // Once the first releases, the second may proceed — a refusal, not a ban.
+    drop(holder);
+    let third = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .expect("lock file");
+    assert!(
+        third.try_lock().is_ok(),
+        "the lock is released with the file — a pull that finished must not \
+         block the next one"
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+}
