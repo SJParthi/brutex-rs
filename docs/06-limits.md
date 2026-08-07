@@ -1526,25 +1526,32 @@ subsection and is not stated as fact.
 
 None of this is new breakage. It is breakage that no document said out loud.
 
+All four figures below are at commit `79c5e80`.
+
 | Gate | Status | What it reports |
 |---|---|---|
-| 9 — coverage | **exit 1** | TOTAL 97.41% regions / 96.93% lines against a 100% floor |
+| 9 — coverage | **exit 1** | TOTAL 96.75% regions / 96.24% lines against a 100% floor |
 | 10 — invariants name real tests | **exit 1** | 10 rows name a test that exists in no file |
-| 1d — declared segments | **exit 1** | 59 undeclared segment-shaped literals under `crates/pull` |
+| 1d — declared segments | **exit 1** | 60 undeclared segment-shaped literals under `crates/pull` |
 | 14 — a claimed bound is re-measured | **exit 1** | `crates/api` and `crates/costs` claim bounds and have no row in the coverage table |
 
 **Gate 9.** `cargo llvm-cov --workspace --locked --fail-under-lines 100
---fail-under-regions 100 --summary-only` → exit 1. 672 of 25,907 regions and 478
-of 15,557 lines uncovered. The six short files are tabulated under X-06 in
-`docs/04-invariants.md`. The dominant one is `crates/pull/src/vendor.rs` at
-**0.00%** — 445 regions, 69 functions, 366 lines, every one uncovered, in a
-tracked file with no `#[test]` in it. `archive.rs`, `fetch.rs` and `csv.rs` have
-none either. That is four modules committed ahead of their tests, and it is the
-same shape D-0029 recorded for `core/src/universe.rs`: gate 10 walks rows→tests
-and never tests→rows, so nothing notices a module that claims nothing.
+--fail-under-regions 100 --summary-only` → exit 1. 851 of 26,169 regions and 592
+of 15,734 lines uncovered. The eight short files are tabulated under X-06 in
+`docs/04-invariants.md`. **Two are at 0.00%** — `crates/pull/src/vendor.rs` (445
+regions, 366 lines) and `crates/pull/src/ingest.rs` (168 regions, 100 lines) —
+both tracked, neither containing a single `#[test]`. `archive.rs`, `fetch.rs`,
+`csv.rs` and `fold.rs` are the same pattern less severely. That is six modules
+in one crate committed ahead of their tests, and it is the same shape D-0029
+recorded for `core/src/universe.rs`: gate 10 walks rows→tests and never
+tests→rows, so nothing notices a module that claims nothing.
 
-**Gate 10.** Reproduced with the gate's own matching logic: rows 291, checked
-284, pending 17, **missing 10** — S-02, S-05, S-10, P-01, P-02, P-03, P-04,
+**This number moved twice during the writing of D-0045**, from 97.41% / 96.93%
+over six files to the figure above over eight, as commits `1f98bb5`, `eb95996`
+and `79c5e80` landed. Re-run it; do not cite it.
+
+**Gate 10.** Reproduced with the gate's own matching logic: rows 293, checked
+288, pending 17, **missing 10** — S-02, S-05, S-10, P-01, P-02, P-03, P-04,
 X-01, X-02, X-13. The gate's `allow_pending` list is deliberately empty, so this
 gate is **red by design** and stays red until those ten tests are written or the
 invariants are formally abandoned in `docs/05-decisions.md`. D-0045 did not
@@ -1555,7 +1562,7 @@ green for their whole lives while naming `store::loom::` and `store::proptest::`
 modules that do not exist.
 
 **Gate 1d.** Reproduced verbatim under `bash` (under `zsh` the allowlist
-word-splits differently and the count is wrong). 59 undeclared literals. They
+word-splits differently and the count is wrong). **60** undeclared literals. They
 arrived with the vendor, fetch, archive and CSV work and are mostly timeframe
 and date tokens — `1min`, `5min`, `1day`, `2024-02-29`, `open_interest`,
 `timestamp`, `payload`. **Two are vendor-shaped and are exactly the question

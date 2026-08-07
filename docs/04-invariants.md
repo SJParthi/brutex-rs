@@ -395,7 +395,7 @@ Added by D-0038. Every row here is proven by a test that runs today.
 | X-03 | Every tracked file has an allowed extension | CI gate 1 | ✓ |
 | X-04 | No build script invokes an external process | CI gate 2 | ✓ |
 | X-05 | `web` depends on `core` alone | CI gate 7 | ✓ |
-| X-06 | **Line and region** coverage is 100% on every crate, with no omit list | **THE GATE EXITS 1 ON THIS TREE.** Measured by running the CI command itself — `cargo llvm-cov --workspace --locked --fail-under-lines 100 --fail-under-regions 100 --summary-only`, cargo-llvm-cov 0.8.4, 2026-08-07: **exit 1**, TOTAL **97.41% regions** (672 of 25,907 missed), **96.93% lines** (478 of 15,557), 94.72% functions (80 of 1,515). Six files are short, and the table below names every one | ✗ |
+| X-06 | **Line and region** coverage is 100% on every crate, with no omit list | **THE GATE EXITS 1 ON THIS TREE.** Measured by running the CI command itself — `cargo llvm-cov --workspace --locked --fail-under-lines 100 --fail-under-regions 100 --summary-only`, cargo-llvm-cov 0.8.4, 2026-08-07 at commit `79c5e80`: **exit 1**, TOTAL **96.75% regions** (851 of 26,169 missed), **96.24% lines** (592 of 15,734), 93.88% functions (94 of 1,537). Eight files are short, and the table below names every one | ✗ |
 | X-06b | ~~Branch coverage is 100% on every crate~~ | **NOT MEASURED.** `llvm-cov` instruments zero branches on the pinned stable toolchain and `--branch` cannot run there at all. Narrowed by D-0030; recorded in `docs/06-limits.md` §7. | — |
 | X-07 | No mutant survives on a touched module | `cargo-mutants`, run per change. `crates/pull`, D-0036: **263 mutants, 227 caught, 36 unviable, 0 survivors**. `crates/costs`, D-0044: **163 mutants over `trip.rs`, `money.rs`, `fill.rs`, `scope.rs`, `error.rs` — 106 caught, 57 unviable, 0 survivors**, and one mutant that *did* survive a first run is written up in `docs/06-limits.md` §27. **Never measured at all: `crates/core`, `crates/store`, `crates/api`**, and the nine `crates/costs` files outside that list. `crates/store` planted five mutants by hand, which §22 records is not a survey. There is no `cargo-mutants` step in CI, so nothing enforces this row | ◐ |
 | X-08 | No tracked file contains a **slash-joined** credential path whose environment segment is a well-known one | CI gate 1c | ✓ |
@@ -409,29 +409,36 @@ Added by D-0038. Every row here is proven by a test that runs today.
 ### X-06, measured rather than asserted — D-0045
 
 The row above carried a tick. The gate it names exits 1, and had been exiting 1
-for some time. These are the six files short of 100%, from the run described in
-the row:
+for some time. These are the eight files short of 100%, from the run described
+in the row:
 
 | File | Regions | Missed | | Lines | Missed | |
 |---|---|---|---|---|---|---|
 | `pull/src/vendor.rs` | 445 | 445 | **0.00%** | 366 | 366 | **0.00%** |
+| `pull/src/ingest.rs` | 168 | 168 | **0.00%** | 100 | 100 | **0.00%** |
 | `pull/src/archive.rs` | 142 | 50 | 64.79% | 93 | 34 | 63.44% |
 | `pull/src/fetch.rs` | 210 | 60 | 71.43% | 148 | 47 | 68.24% |
 | `pull/src/csv.rs` | 373 | 99 | 73.46% | 160 | 30 | 81.25% |
+| `pull/src/fold.rs` | 94 | 11 | 88.30% | 77 | 14 | 81.82% |
 | `store/src/file.rs` | 813 | 17 | 97.91% | 510 | 0 | 100.00% |
 | `api/src/ingest.rs` | 730 | 1 | 99.86% | 546 | 1 | 99.82% |
 
-`pull/src/vendor.rs` is two thirds of the whole workspace shortfall by itself:
-445 regions, 69 functions and 366 lines, **every one of them uncovered**, in a
-tracked file that contains no `#[test]` at all. `archive.rs`, `fetch.rs` and
-`csv.rs` carry none either. That is a module committed ahead of its tests, and
-it is the same shape as the defect D-0029 recorded for `core/src/universe.rs`:
-CI gate 10 walks rows→tests and never tests→rows, so nothing here noticed.
+Six of the eight are in `crates/pull`, and **two of them are at 0.00%** — 613
+regions and 466 lines between them, in tracked files with no `#[test]` in them
+at all. `archive.rs`, `fetch.rs`, `csv.rs` and `fold.rs` are the same pattern
+less severely. That is modules committed ahead of their tests, and it is the
+same shape as the defect D-0029 recorded for `core/src/universe.rs`: CI gate 10
+walks rows→tests and never tests→rows, so a module that claims nothing is
+invisible to it.
 
-**This figure is a snapshot and will move.** It is recorded as a number and a
-date rather than a tick precisely so the next reader re-runs the command instead
-of believing this table. An earlier audit of the same gate measured 95.31%
-lines / 95.91% regions; the gate has been red across both.
+**This figure is a snapshot and it moved twice while D-0045 was being written.**
+The first run of the session measured 97.41% regions / 96.93% lines over six
+short files; commits `1f98bb5`, `eb95996` and `79c5e80` then landed and it fell
+to the figure above over eight. An audit before that measured 95.31% lines /
+95.91% regions. **The gate has been red across all three**, and the direction is
+not monotone. That volatility is the argument for recording a command, a commit
+and a date here rather than a tick: the tick was wrong at every one of those
+points and looked equally right at each.
 
 ### S-20 names three assertions that cannot fail — D-0045
 

@@ -5434,3 +5434,117 @@ fn the_ladder_refuses_to_skip_a_rung() {
     l.record(true);
     assert_eq!(l.completed(), 6);
 }
+
+// ──────────────── dynamic selection, and the automatic work list ────────────
+
+/// Any size, 1 to all of them — the thing three fixed buttons could not do.
+#[test]
+fn a_selection_is_any_size_not_one_of_three_universes() {
+    use pull::work::Selection;
+
+    assert_eq!(Selection::of(["NSE-NIFTY"]).len(), 1, "one instrument");
+    assert_eq!(Selection::of(["A", "B", "C"]).len(), 3, "three");
+    assert!(
+        Selection::of(Vec::<String>::new()).is_empty(),
+        "zero is legal"
+    );
+
+    let many: Vec<String> = (0..785).map(|i| format!("SYM{i}")).collect();
+    assert_eq!(Selection::of(many).len(), 785, "all of them");
+
+    // A duplicate would pull the same window twice and the second write would
+    // be refused as not following the first — a failure caused entirely by the
+    // caller's list, so it is removed rather than passed on.
+    assert_eq!(
+        Selection::of(["NSE-NIFTY", "NSE-NIFTY", "NSE-BANKNIFTY"]).len(),
+        2,
+        "duplicates collapse"
+    );
+    assert_eq!(
+        Selection::of(["", "A", ""]).len(),
+        1,
+        "empty names are not instruments"
+    );
+}
+
+/// The automatic side: re-running a complete store does nothing.
+#[test]
+fn gap_detection_makes_a_rerun_free_and_a_resume_exact() {
+    use pull::work::{Cell, Selection, gaps};
+    use std::collections::HashSet;
+    use store::path::{Timeframe, YearMonth};
+
+    let months = [
+        YearMonth::new(2025, 6).expect("real"),
+        YearMonth::new(2025, 7).expect("real"),
+    ];
+    let pick = Selection::of(["NSE-NIFTY", "NSE-BANKNIFTY", "NSE-FINNIFTY"]);
+    let want = pick.cells(&months, Timeframe::MINUTE_1);
+    assert_eq!(want.len(), 6, "3 instruments x 2 months");
+
+    // Nothing held — everything is work.
+    let none = HashSet::new();
+    let all_work = gaps(&want, &none);
+    assert_eq!(all_work.missing.len(), 6);
+    assert_eq!(all_work.held, 0);
+    assert!(!all_work.is_complete());
+
+    // Interrupted after four: the resume is exactly the remaining two, with no
+    // progress variable involved — the store's own census is the memory.
+    let held: HashSet<Cell> = want.iter().take(4).cloned().collect();
+    let resumed = gaps(&want, &held);
+    assert_eq!(resumed.missing.len(), 2, "exactly what is left");
+    assert_eq!(resumed.held, 4, "and it SAYS how many were already there");
+    assert_eq!(
+        resumed.requested(),
+        6,
+        "held plus missing is what was asked"
+    );
+
+    // Complete — a re-run contacts no vendor at all.
+    let everything: HashSet<Cell> = want.iter().cloned().collect();
+    let again = gaps(&want, &everything);
+    assert!(again.is_complete(), "same inputs, no work, nothing fetched");
+    assert_eq!(again.held, 6);
+
+    // Add one instrument: only the new one is work.
+    let bigger = Selection::of([
+        "NSE-NIFTY",
+        "NSE-BANKNIFTY",
+        "NSE-FINNIFTY",
+        "NSE-MIDCPNIFTY",
+    ]);
+    let grown = gaps(&bigger.cells(&months, Timeframe::MINUTE_1), &everything);
+    assert_eq!(
+        grown.missing.len(),
+        2,
+        "only the new instrument's two months"
+    );
+    assert!(
+        grown
+            .missing
+            .iter()
+            .all(|c| c.instrument == "NSE-MIDCPNIFTY"),
+        "and nothing else is re-fetched"
+    );
+}
+
+/// Cells are instrument-major so a bar file is opened once, not once a month.
+#[test]
+fn cells_are_ordered_instrument_major() {
+    use pull::work::Selection;
+    use store::path::{Timeframe, YearMonth};
+
+    let months: Vec<_> = (1..=3)
+        .map(|m| YearMonth::new(2025, m).expect("real"))
+        .collect();
+    let cells = Selection::of(["AAA", "BBB"]).cells(&months, Timeframe::MINUTE_1);
+
+    assert_eq!(cells.len(), 6);
+    assert!(
+        cells[..3].iter().all(|c| c.instrument == "AAA"),
+        "all of AAA's months before BBB starts — month-major order would open \
+         and close every bar file once per month instead of once"
+    );
+    assert!(cells[3..].iter().all(|c| c.instrument == "BBB"));
+}

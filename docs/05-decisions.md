@@ -3178,3 +3178,219 @@ Both were forced by the 100% region-coverage gate, and both are better code:
 * **Iceberg order slicing.** One executed order per leg, as the source stamps.
 * **A GST display split.** Intra-state and inter-state change how a total is
   *shown*, never how it is computed. There is no such field.
+
+---
+
+## D-0045
+
+**The documents are reconciled against the code: seven invariants that named
+tests existing in no file, eleven row ids defined twice, two sections numbered
+24, a coverage tick over a gate that exits 1, and a layer marked BUILT over a
+bound that was never held.**
+
+*2026-08-07. Owns `docs/**` only. No file under `crates/**`, no
+`.github/workflows/ci.yml`, no `CLAUDE.md`.*
+
+### Why this entry exists
+
+Four changes landed in parallel and each wrote its own rows into three shared
+append-only documents. Every one of them re-read before appending. It was not
+enough: two of them took ids that were already taken, one appended a section
+number that already existed, and none of them could see that a tick they
+inherited had gone false. Three verification lenses then read the result, and
+what they found was **not** wrong code — the code is in better shape than the
+documents describing it. What they found was documents claiming more than the
+code delivers.
+
+**A row that names a test which does not exist is worse than an empty row**,
+because an empty row invites the question and a phantom row closes it. Seven of
+them had been closing it for a long time.
+
+### What was corrected, and how each was verified
+
+Every finding below was reproduced from this seat by running the command, not
+taken from the report that raised it.
+
+**1 · Seven invariant rows named tests that exist in zero files.** S-02, S-05,
+S-10, X-01, X-02, X-13 and P-01, in `crates/store`, `crates/core` and
+`crates/pull` — three crates that are tracked and compiled today. Three more,
+P-02, P-03 and P-04, were in the same state and the task that found the first
+seven had not counted them. All ten now carry a new `✗` glyph, keep the test
+name they would need, and say in their own cell which half of the claim is
+proven and which is not.
+
+The glyph matters. They wore `—`, which this file's own legend defines as *"not
+yet reachable (the crate does not exist)"*. For these ten the crate does exist,
+and nobody had written the test. The names are deliberately **left inside their
+backticks** so CI gate 10 goes on naming them every run; deleting the token
+would have turned a red gate green by blinding it, which is the fallback
+`CLAUDE.md` §4 bans.
+
+**2 · Two rows named real tests under module paths that do not exist.** S-03
+named `store::loom::commit_counter_publishes_last` and S-08 named
+`store::proptest::oi_sentinel_distinct`. Both functions exist, assert real
+values and pass — as `store::fault::…` and `store::unit::…`, ordinary `#[test]`s.
+Paths corrected; both rows go to `✓`. **They passed gate 10 for their whole
+lives**, because that gate matches on `(crate, fn)` and its own comment says the
+module segment is invisible to it. A third row, X-12, named a test that exists
+and passes and wore `—` anyway; it is now `✓`, with the caveat the test's own
+comment states — it proves the property lexically and touches no filesystem.
+
+**3 · Nine rows name `loom` or `proptest`. Neither appears in any `Cargo.toml`
+in this workspace.** Verified by `grep -rn 'loom\|proptest' --include=Cargo.toml
+.`, which returns nothing. Four of the nine are legitimately `—` because their
+crates do not exist. But a module name is a promise about a dependency, and
+adding a property-based tester or a concurrency checker is a workspace decision
+nobody has taken. **No row in `docs/04-invariants.md` now claims a
+property-based or concurrency proof that has ever run.**
+
+**4 · X-06 carried a tick over a gate that exits 1.** Measured by running the CI
+command itself: `cargo llvm-cov --workspace --locked --fail-under-lines 100
+--fail-under-regions 100 --summary-only`, cargo-llvm-cov 0.8.4 → **exit 1**,
+TOTAL **97.41% regions**, **96.93% lines**, 94.72% functions. The row now
+carries the figure, the date and the command, and a table naming all six short
+files. `crates/pull/src/vendor.rs` is at **0.00%** — 445 regions, 366 lines,
+every one uncovered, in a tracked file with no `#[test]` in it, alongside
+`archive.rs`, `fetch.rs` and `csv.rs`. The figure is recorded **as a dated
+number rather than a tick** so the next reader re-runs the command instead of
+believing the table.
+
+**5 · `docs/07-o1-architecture.md` layer 12 was `✓` over a bound it never
+held.** The row read *"a fixed row cap with paging. Never O(universe)"* while
+only the rendered rows were capped — every request re-folded, re-filtered,
+re-sorted and reversed the whole universe to draw 200 rows. Re-measured for this
+entry with `cargo bench -p api` → **exit 0**, "all ratios within the ceiling":
+across all six sort columns × four pills plus the hatch and a clamped deep page,
+**C-14 spans 0.929× – 1.088×** at 2,787 → 50,000 instruments; **C-15 marginal is
+0 – 259 ps** per instrument per request against an asserted 1,000 ps ceiling;
+**C-16 dashboard is 1.052×**; **C-17 cost per rendered row is 0.202× – 0.404×**
+with 200 rows confirmed drawn. Absolute ~137–166 µs at both sizes.
+
+The layer is now **`◐`, not `✓`**, and the two reasons are written beside it:
+substring search stays O(universe) and is measured at **6.53 ms at n = 50,000**
+without being asserted, and the catalog build has no ceiling at all. Layer 3 was
+downgraded in the same pass, from *"zero rehash, so O(1) worst case"* to what
+D-0040 actually established — worst case for the first `n_valid` appends after a
+load, **amortised** after that.
+
+**6 · `docs/01-architecture.md` did not have `crates/costs`.** The crate shipped
+across D-0041, D-0043 and D-0044, and all three recorded the omission as
+outstanding because none of them owned this file. It is drawn now, as a direct
+child of `core` with its single arrow, beside `store` and `vocab`. The diagram's
+column alignment was checked rather than eyeballed: all seven children land on
+columns 8, 19, 30, 41, 52, 62 and 72. The crate table gains an **Exists** column,
+because five of the ten crates this document describes do not exist yet and
+nothing said so.
+
+### The two id collisions, and why renumbering was the honest repair
+
+**`C-14` through `C-17` each named two different invariants.** `crates/api`'s
+rendering rows and `crates/costs`'s regime-lookup rows both took them. **`I-16`
+through `I-22` likewise**, twice within the same section family. Eleven ids, each
+denoting two things. Nothing in CI checks row-id uniqueness — gate 10 checks only
+that a named test exists — so both collisions were invisible.
+
+`docs/04-invariants.md` says rows are never deleted. **Renumbering a duplicate is
+not deletion**, and leaving one id meaning two things defeats the only purpose
+the file has: a citation to "C-16" was ambiguous, and one *is* cited from source.
+
+Which side moved was decided by evidence, not preference:
+
+- **`crates/api` keeps C-14 … C-17.** Those four ids are cited from
+  `crates/api/benches/ratio.rs` — the bench *prints* them — and from
+  `docs/05-decisions.md` D-0042 and `docs/06-limits.md` §24.
+- **`crates/costs` moves to `C-K-01` … `C-K-12`.** Not an invention: those are
+  the ids `crates/costs/benches/ratio.rs` has been printing all along. The crate
+  has exactly **twelve** complexity rows (C-14…C-17, C-18…C-22, C-23…C-25) and
+  the bench prints exactly **twelve** `C-K-*` labels, in a clean 1:1 mapping
+  confirmed function by function. The document had drifted from its own bench;
+  it is now aligned to it.
+- **`C-18` through `C-25` are retired and never reused**, in the spirit of
+  `CLAUDE.md` §3 rule 8.
+- **The width-and-master-bound block moves to `I-31` … `I-37`**, the next free
+  ids after I-30. Checked first: no file outside `docs/04-invariants.md` cites
+  `I-16` … `I-22` at all.
+
+This is not cosmetic. **Gate 14 checks that every row id a bench claims is both a
+real row and printed by that bench.** A `crates/costs` row citing `C-23` would
+have failed layer 4, because the bench prints `C-K-10`. After the renumber a
+`crates/costs` row can be added and pass.
+
+**`docs/06-limits.md` had two sections numbered 24** — `crates/costs` stage 1 and
+`crates/api`. The **costs** one moved to **§25**, and it moved rather than the
+api one for a checkable reason: the api §24 is cited from three places in
+`crates/api` source, and moving it would have left three citations in code
+pointing at a heading that no longer exists. `crates/costs` cites only §26 and
+§27, both untouched. The consequence — the file's headings are no longer in
+numerical order (23, 25, 24, 26, 27) — is stated in §25 itself. **§20 never
+existed and never will**; §21 records why it was skipped.
+
+### Three claims that were checked and failed
+
+Recorded here because a refuted claim that is quietly dropped teaches nobody.
+
+- **`costs::trip::charge_stack` is `pub` and takes no date**, as is
+  `Rates::new`; `regime::NSE_EXCHANGE_CHARGE` is a `pub const` and
+  `regime::stt_options_rate` returns `Ok` for every representable day. So the
+  refusal that `price` enforces can be **walked around from outside the crate**,
+  pricing a trade dated inside the unverified window at the 2024-verified rate.
+  The public signatures were read from the source for this entry; the probe that
+  produced a number was not re-run here. `docs/06-limits.md` §28 and §27.
+- **"Rounding CGST and SGST separately overcharges by exactly ₹1, every trade"**
+  is true at Example 1's GST base and false as a generalisation — the crate's
+  other worked examples give a difference of zero. The implementation is right;
+  the prose in `trip.rs` and `rate.rs` overstates. Reported, not edited.
+- **§27's over-charge table did not sum to its own total.** `2 + 2 + 2 + 99 +
+  100 + 100 = 305`, under a stated ₹3.06. The statutory-levy ceiling is **100
+  paisa, not 99** — derived in §27 from `ceil_to_rupee(floor_to_paisa(…))`
+  against half-up. Corrected. Separately, §27's prose said "51 of the 163 mutants
+  were unviable" three lines under a table whose cells give **57**; the table is
+  internally consistent and 51 matched nothing. Corrected.
+
+### S-20 pointed at an assertion that cannot fail
+
+`BLOCK_LEN` is *defined* as `RECORD_STRIDE * RECORDS_PER_BLOCK`, so three of the
+`const` assertions beside it are tautologies — including the closed-form
+no-straddle one that D-0039 introduced as *"a compile error rather than a walk"*.
+**Measured, not argued:** a scratch crate carrying the identical definitions and
+exactly those three assertions compiles at **exit 0** with `RECORDS_PER_BLOCK =
+72`, and again at exit 0 with `= 1`. The mutant D-0039 reports killing —
+`BLOCK_LEN` 4088 → 4096 — is unwritable, because `BLOCK_LEN` is not a literal.
+
+**The guarantee is not missing**; it is carried by `BLOCK_LEN == 4088`,
+`RECORDS_PER_BLOCK == 73` and `BLOCK_LEN == 56 * 73`, which are falsifiable and
+which D-0039 also added, plus the 5,000-index runtime walk. S-20 now names
+those. `CLAUDE.md` §4 bans an assertion that asserts nothing, and a compile-time
+one is not exempt because it is compile-time.
+
+### What this entry did NOT do
+
+- **It wrote no test.** Gate 10 still exits 1 on the same ten rows, and that is
+  the correct state: the gap is real and the rows now say so instead of hiding it.
+- **It did not run `cargo-mutants`**, `cargo deny check`, or
+  `cargo clippy --workspace --all-targets`.
+- **It changed no file under `crates/**` and no CI gate.** Four gates exit 1 on
+  this tree — 9, 10, 1d and 14 — and every one is now written down in
+  `docs/06-limits.md` §28 with the command that produces it. None was made green
+  by editing a document.
+
+### Reported, and outside this entry's ownership
+
+- **`CLAUDE.md` §5's crate graph does not list `costs`.** That file is session
+  law. The line it needs is quoted verbatim in the report accompanying this
+  entry: a ` ├── costs        Indian F&O transaction costs` row between `vocab`
+  and `engine`, and `web`'s comment is unaffected because `costs` also depends on
+  `core` alone.
+- **`.github/workflows/ci.yml` gate 14's `cover` table** needs the two rows that
+  would make it green. Both benches already satisfy layers 2, 2b and 3; only the
+  table row is absent. The exact text is in the report.
+- **`crates/store/src/format.rs:311`** says a test "walks all 448 (field, byte)
+  placements"; the test asserts **56**.
+- **`crates/api/src/catalog.rs:407`** cites C-11 for the page bound; the correct
+  id is **C-14**, which is what its own bench prints.
+- **`docs/02-store-format.md` still never states the record's byte order** — the
+  word "endian" appears in it zero times — while `CLAUDE.md` §10 makes it the
+  authority over bytes on disk. Carried forward from D-0039, still open.
+- **Neither `gdfl` nor `truedata` appears in `docs/00-charter.md`**, and
+  `CLAUDE.md` §3 rule 1 makes that file the only source a vendor claim may rest
+  on. Both are already tracked in two other documents.
