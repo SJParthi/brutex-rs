@@ -162,6 +162,7 @@ fn window() -> Window {
 /// One request over [`window`].
 fn request() -> BarRequest {
     BarRequest {
+        instrument_id: String::new(),
         window: window(),
         cadence: Cadence::Minute,
     }
@@ -400,6 +401,7 @@ fn a_second_window_records_the_whole_month_not_the_suffix() {
     let store = scratch.store();
 
     let narrow = BarRequest {
+        instrument_id: String::new(),
         window: Window::new(
             Day::new(2022, 10, 3).expect("2022-10-03"),
             Day::new(2022, 10, 3).expect("2022-10-03"),
@@ -418,6 +420,7 @@ fn a_second_window_records_the_whole_month_not_the_suffix() {
     );
 
     let wider = BarRequest {
+        instrument_id: String::new(),
         window: Window::new(
             Day::new(2022, 10, 4).expect("2022-10-04"),
             Day::new(2022, 10, 4).expect("2022-10-04"),

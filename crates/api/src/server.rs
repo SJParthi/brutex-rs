@@ -1439,6 +1439,7 @@ async fn broker_answer(
             store_vendor,
         }) => {
             let request = pull::fetch::BarRequest {
+                instrument_id: String::new(),
                 window: asked.window,
                 cadence: pull::session::Cadence::Minute,
             };
@@ -1509,7 +1510,7 @@ struct BrokerWindow {
     store_vendor: brutex_core::vendor::Vendor,
 }
 
-async fn broker_window(asked: &ingest::SpotRequest, _site: &Site) -> Result<BrokerWindow, String> {
+async fn broker_window(asked: &ingest::SpotRequest, site: &Site) -> Result<BrokerWindow, String> {
     // ONE INSTRUMENT IS ALL THIS PATH CAN ADDRESS, AND IT NOW SAYS SO.
     //
     // `HttpSpec` carries no request-parameter map, so nothing here can name an
@@ -1598,7 +1599,38 @@ async fn broker_window(asked: &ingest::SpotRequest, _site: &Site) -> Result<Brok
     let source = pull::http::HttpSource::new(spec, token).map_err(|why| why.to_string())?;
     let origin = source.url();
 
+    // THE ID THE VENDOR ASKED FOR, RESOLVED IN ONE PROBE.
+    //
+    // This was `String::new()`, so the request named a window and no
+    // instrument — which is the whole of `DH-905 securityId is required`. The
+    // master carries the id, `merge` indexes it by key, and this is where it
+    // reaches the wire.
+    //
+    // Refused rather than defaulted when the vendor does not list it: sending
+    // Dhan a `groww_symbol`, or any other vendor's id, asks the wrong broker
+    // for the wrong thing and it would answer something.
+    let spot_key = brutex_core::instrument::InstrumentKey {
+        exchange: brutex_core::instrument::Exchange::Nse,
+        segment: brutex_core::instrument::Segment::Index,
+        underlying: brutex_core::symbol::Symbol::new("NIFTY")
+            .map_err(|why| format!("NIFTY is not a symbol this build can name: {why}"))?,
+        kind: brutex_core::instrument::Kind::Index,
+    };
+    let Some(instrument_id) = site
+        .read
+        .merged
+        .by_key
+        .get(&spot_key)
+        .and_then(|e| e.ids.get(vendor as usize).copied().flatten())
+    else {
+        return Err(format!(
+            "{} does not list NIFTY in the instrument master this build read,              so there is no id to name it by. Refused rather than sending              another vendor's id, which would ask for the wrong instrument and              be answered.",
+            vendor.as_str()
+        ));
+    };
+
     let request = pull::fetch::BarRequest {
+        instrument_id: instrument_id.as_str().to_owned(),
         window: asked.window,
         cadence: pull::session::Cadence::Minute,
     };
@@ -1817,6 +1849,7 @@ fn run_local(
 ) -> Result<pull::ingest::Ingested, String> {
     use brutex_core::instrument::{Exchange, Segment};
     let request = pull::fetch::BarRequest {
+        instrument_id: String::new(),
         window,
         cadence: pull::session::Cadence::Minute,
     };

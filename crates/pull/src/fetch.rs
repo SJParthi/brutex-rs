@@ -319,8 +319,20 @@ impl RawWindow {
 }
 
 /// What one window of bars was asked for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Not `Copy`: it now carries the vendor's own instrument id, which is a
+/// `String` because the two brokers spell it differently and neither spelling
+/// is known at compile time.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BarRequest {
+    /// The vendor's own id for the instrument being asked for.
+    ///
+    /// Empty on the local-archive path, which addresses a FILE rather than an
+    /// instrument. On the HTTP path this is what
+    /// [`crate::vendor::ParamValue::InstrumentId`] resolves to — `securityId`
+    /// at Dhan, `groww_symbol` at Groww — and its absence is precisely what
+    /// `DH-905 securityId is required` reports.
+    pub instrument_id: String,
     /// The inclusive window the operator asked for.
     pub window: Window,
     /// Whether these are intraday bars or daily ones.

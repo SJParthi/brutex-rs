@@ -673,6 +673,7 @@ mod tests {
             by_key.insert(
                 *key,
                 Entry {
+                    ids: [None; brutex_core::vendor::Vendor::ALL.len()],
                     vendors: *vendors,
                     isin: isin.map(|i| (Vendor::Groww, i)),
                     conflict: None,

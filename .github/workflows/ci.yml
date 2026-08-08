@@ -340,11 +340,31 @@ jobs:
           # three-byte lower-case hex-padding check beside it.
           hash_vector='abc 000fff'
 
+          # ---- group 17: the vendors' REQUEST field names, and one published
+          # example value. Group 8 above carries the names each vendor uses in
+          # its RESPONSE; these are the names it requires in the REQUEST, and
+          # they arrived with the parameter map that stops Dhan answering
+          # DH-905. Every one is read first-hand from the vendor's own
+          # documentation page:
+          #   securityId exchangeSegment instrument   dhanhq.co/docs/v2/historical-data
+          #   exchange segment trading_symbol start_time end_time
+          #                                             groww.in/trade-api/docs
+          # `exchange`, `segment` and `instrument` are ordinary English words a
+          # vendor chose for a field; they name no account and no environment.
+          # `13` is the securityId of NIFTY in Dhan's OWN worked example, used
+          # in a test so the request can be asserted against a value the vendor
+          # published rather than one invented here.
+          request_field='
+          securityId exchangeSegment instrument
+          exchange segment trading_symbol start_time end_time
+          13
+          '
+
           allowed="${seg_shape} ${vendor_wire} ${config_fixture}
           ${secret_fixture} ${scaffold} ${timeframe} ${governor}
           ${record_field} ${header_name} ${bound_number}
           ${debug_label} ${wire_date} ${aws_sigv4} ${aws_shared}
-          ${redact_label} ${hash_vector}"
+          ${redact_label} ${hash_vector} ${request_field}"
           bad=0
           while IFS= read -r word; do
             if [ -z "$word" ]; then continue; fi

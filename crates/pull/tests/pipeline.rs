@@ -111,6 +111,7 @@ fn window() -> Window {
 /// A request for that window, at one-minute cadence — the session filter applies.
 fn request() -> BarRequest {
     BarRequest {
+        instrument_id: String::new(),
         window: window(),
         cadence: Cadence::Minute,
     }
@@ -1265,6 +1266,7 @@ fn a_member_whose_bars_cross_a_month_boundary_is_refused_by_name() {
     let across = "20221031,09:15:01,38445.65,0,0\n20221101,09:15:01,38446.00,0,0\n";
     let dir = folder_of(&scratch, &[("NIFTY", across)]);
     let request = BarRequest {
+        instrument_id: String::new(),
         window: Window::new(
             Day::new(2022, 10, 31).expect("a real date"),
             Day::new(2022, 11, 1).expect("a real date"),

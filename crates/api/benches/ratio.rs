@@ -159,6 +159,7 @@ fn read_of(n: usize) -> Read {
         by_key.insert(
             key(i),
             Entry {
+                ids: [None; brutex_core::vendor::Vendor::ALL.len()],
                 vendors: VendorSet::EMPTY.with(Vendor::Groww).with(Vendor::Dhan),
                 // A body that fails the check digit is `None`, which is a real
                 // state a row renders. Either way the ISIN column has content.

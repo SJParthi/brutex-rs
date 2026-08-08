@@ -79,6 +79,15 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 /// One instrument, after every vendor has had its say.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Entry {
+    /// The id each vendor uses for this instrument, indexed by
+    /// `Vendor as usize`, so a request can NAME it.
+    ///
+    /// This is the last link in the chain that `DH-905 securityId is required`
+    /// reports as broken: the master carries the id, the merge indexes it by
+    /// key, and `pull::vendor::ParamValue::InstrumentId` puts it on the wire.
+    /// `None` where that vendor does not list the instrument, which a caller
+    /// must refuse on rather than substitute another vendor's.
+    pub ids: [Option<brutex_core::vendor::VendorId>; brutex_core::vendor::Vendor::ALL.len()],
     /// Which vendors listed it. Seeing two here is the deduplication, on
     /// screen.
     pub vendors: VendorSet,
@@ -278,6 +287,14 @@ pub fn merge(sources: &[Source]) -> Merged {
             let e = out.by_key.entry(key).or_default();
             e.vendors = e.vendors.with(vendor);
             e.universe = universe::of_instrument(&key);
+            // THE VENDOR'S OWN ID, carried to the one index a request looks in.
+            // Slotted by vendor, never merged: `securityId 13` and
+            // `NSE-NIFTY` name the same instrument at two brokers and are not
+            // interchangeable — sending one to the other is how a request asks
+            // the wrong broker for the wrong thing.
+            if let Some(slot) = e.ids.get_mut(vendor as usize) {
+                *slot = Some(l.vendor_id);
+            }
             match (e.isin, l.isin) {
                 // Nothing on record yet: take what this vendor said, whether
                 // that is an ISIN or the honest absence of one.

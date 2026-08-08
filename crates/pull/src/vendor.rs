@@ -1159,6 +1159,45 @@ pub struct Auth {
     pub scheme: AuthScheme,
 }
 
+/// Where one request parameter's value comes from.
+///
+/// # Why the request is data and not code
+///
+/// `window_async` built the whole request as two hardcoded fields —
+/// `json!({ "fromDate": from, "toDate": to })` for POST and
+/// `.query(&[("from", from), ("to", to)])` for GET. No instrument, no segment,
+/// no interval. That is `DH-905 securityId is required` in two lines, and it
+/// is why a broker has never returned a bar to this build.
+///
+/// Naming the fields here rather than there keeps `CLAUDE.md`'s rule that
+/// adding a vendor is a ROW in this file: Dhan wants `securityId` and
+/// `exchangeSegment`, Groww wants `groww_symbol` and `segment`, and the code
+/// that puts them on the wire never learns either name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ParamValue {
+    /// The window's first day, in this feed's [`DateFormat`].
+    From,
+    /// The window's last day, honouring this feed's [`RangeEnd`].
+    To,
+    /// The vendor's OWN id for the instrument — `SECURITY_ID` at Dhan,
+    /// `groww_symbol` at Groww. Read from the instrument master; see
+    /// `brutex_core::vendor::VendorId`.
+    InstrumentId,
+    /// A word this feed requires and this build does not vary, such as
+    /// `exchangeSegment: "IDX_I"`. Fixed here so it is reviewable beside the
+    /// rest of the row rather than buried in a request builder.
+    Fixed(&'static str),
+}
+
+/// One named request parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Param {
+    /// What this feed calls the field.
+    pub name: &'static str,
+    /// Where its value comes from.
+    pub value: ParamValue,
+}
+
 /// How a date is rendered on the wire, or read out of an archive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DateFormat {
@@ -1305,6 +1344,13 @@ pub struct HttpSpec {
     pub budget: Budget,
     /// Whether that budget is pooled per request kind.
     pub pooling: Pooling,
+    /// Every field this feed's request carries, and where its value comes from.
+    ///
+    /// Empty means the request names nothing but its window, which is the state
+    /// that made Dhan answer `DH-905 securityId is required`.
+    pub params: &'static [Param],
+    /// Headers this feed requires beyond the credential.
+    pub extra_headers: &'static [(&'static str, &'static str)],
 }
 
 /// How an archive vendor nests its files. Reported, and used to explain a
@@ -1712,6 +1758,33 @@ const DHAN: Descriptor = Descriptor {
             per_day: Some(crate::rate::DHAN_PER_DAY),
         },
         pooling: Pooling::PerVendor,
+        // Read first-hand from dhanhq.co/docs/v2/historical-data. All three are
+        // marked REQUIRED there, and their absence is exactly what DH-905
+        // reports. `IDX_I` and `INDEX` are the index-spot pair from the
+        // Annexure; a wider surface needs more rows here, not more code.
+        params: &[
+            Param {
+                name: "securityId",
+                value: ParamValue::InstrumentId,
+            },
+            Param {
+                name: "exchangeSegment",
+                value: ParamValue::Fixed("IDX_I"),
+            },
+            Param {
+                name: "instrument",
+                value: ParamValue::Fixed("INDEX"),
+            },
+            Param {
+                name: "fromDate",
+                value: ParamValue::From,
+            },
+            Param {
+                name: "toDate",
+                value: ParamValue::To,
+            },
+        ],
+        extra_headers: &[],
     }),
     // ONLY the two rungs the verified contract covers. The wider ladder this
     // broker's documentation advertises was NOT read live, so it is not
@@ -1767,6 +1840,34 @@ const GROWW: Descriptor = Descriptor {
         },
         // Groww pools per endpoint group; the other broker does not.
         pooling: Pooling::PerRequestKind,
+        // Read first-hand from groww.in/trade-api/docs/curl/historical-data.
+        // `trading_symbol` is the deprecated endpoint's name for it; the live
+        // one takes `groww_symbol`, and the SAME master row spells the two
+        // differently — NSE-NIFTY-30Sep25-24650-CE against NIFTY25SEP24650CE.
+        params: &[
+            Param {
+                name: "exchange",
+                value: ParamValue::Fixed("NSE"),
+            },
+            Param {
+                name: "segment",
+                value: ParamValue::Fixed("CASH"),
+            },
+            Param {
+                name: "trading_symbol",
+                value: ParamValue::InstrumentId,
+            },
+            Param {
+                name: "start_time",
+                value: ParamValue::From,
+            },
+            Param {
+                name: "end_time",
+                value: ParamValue::To,
+            },
+        ],
+        // Groww's page shows this on every historical call.
+        extra_headers: &[("X-API-VERSION", "1.0")],
     }),
     // Same restraint as the row above, and for the same reason.
     granularities: GranularitySet::EMPTY

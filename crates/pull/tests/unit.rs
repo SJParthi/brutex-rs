@@ -4879,6 +4879,7 @@ fn the_timestamp_encoding_is_dispatched_never_assumed() {
     let raw = RawWindow { rows: vec![row] };
     let day = Day::new(2026, 8, 7).expect("a real date");
     let request = BarRequest {
+        instrument_id: String::new(),
         window: Window::new(day, day).expect("one day"),
         cadence: Cadence::Minute,
     };
@@ -4921,6 +4922,7 @@ fn a_rupee_price_becomes_paisa_and_an_overflow_refuses() {
 
     let day = Day::new(2026, 8, 7).expect("a real date");
     let request = BarRequest {
+        instrument_id: String::new(),
         window: Window::new(day, day).expect("one day"),
         cadence: Cadence::Minute,
     };
@@ -5011,6 +5013,7 @@ fn every_row_is_either_a_bar_or_a_counted_drop() {
 
     let day = Day::new(2026, 8, 7).expect("a real date");
     let request = BarRequest {
+        instrument_id: String::new(),
         window: Window::new(day, day).expect("one day"),
         cadence: Cadence::Minute,
     };

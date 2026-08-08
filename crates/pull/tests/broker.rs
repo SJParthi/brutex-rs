@@ -54,8 +54,8 @@ use pull::ingest::{self, Ingested, Plan};
 use pull::manifest::{EntryKey, Manifest, manifest_path};
 use pull::session::{Cadence, Day, Window};
 use pull::vendor::{
-    Auth, AuthScheme, DateFormat, FieldNames, HttpSpec, Method, PriceScale, RangeEnd,
-    ResponseShape, TimestampEncoding,
+    Auth, AuthScheme, DateFormat, FieldNames, HttpSpec, Method, Param, ParamValue, PriceScale,
+    RangeEnd, ResponseShape, TimestampEncoding,
 };
 use store::path::{Timeframe, YearMonth};
 
@@ -127,6 +127,32 @@ fn broker(body: &str) -> (String, std::sync::mpsc::Receiver<String>) {
 /// makes this a test of the vendor path rather than of a fixture.
 fn spec(base_url: &'static str) -> HttpSpec {
     HttpSpec {
+        // DHAN'S REAL REQUIRED FIELDS, read first-hand from
+        // dhanhq.co/docs/v2/historical-data. This is what `DH-905 securityId
+        // is required` was reporting the absence of.
+        params: &[
+            Param {
+                name: "securityId",
+                value: ParamValue::InstrumentId,
+            },
+            Param {
+                name: "exchangeSegment",
+                value: ParamValue::Fixed("IDX_I"),
+            },
+            Param {
+                name: "instrument",
+                value: ParamValue::Fixed("INDEX"),
+            },
+            Param {
+                name: "fromDate",
+                value: ParamValue::From,
+            },
+            Param {
+                name: "toDate",
+                value: ParamValue::To,
+            },
+        ],
+        extra_headers: &[],
         base_url,
         bars_path: "/v2/charts/historical",
         method: Method::Post,
@@ -168,6 +194,8 @@ fn window() -> Window {
 
 fn request() -> BarRequest {
     BarRequest {
+        // NIFTY at Dhan, from their own worked example.
+        instrument_id: "13".to_owned(),
         window: window(),
         cadence: Cadence::Minute,
     }
@@ -322,6 +350,25 @@ fn a_window_fetched_from_a_broker_lands_in_the_store_and_is_counted() {
     assert!(
         sent.contains("2025-07-02"),
         "toDate is EXCLUSIVE — the day after the operator's last day: {sent}"
+    );
+
+    // AND THE THREE FIELDS DHAN REFUSED THE REQUEST FOR.
+    //
+    // The body used to be `{"fromDate":…,"toDate":…}` and nothing else, which
+    // is the entirety of `DH-905 securityId is required`. Asserting the dates
+    // alone passed throughout that, because the dates were never the problem.
+    assert!(
+        sent.contains("\"securityId\":\"13\""),
+        "the instrument must be NAMED, and 13 is NIFTY in Dhan's own worked \
+         example: {sent}"
+    );
+    assert!(
+        sent.contains("\"exchangeSegment\":\"IDX_I\""),
+        "the segment Dhan's Annexure gives for an index: {sent}"
+    );
+    assert!(
+        sent.contains("\"instrument\":\"INDEX\""),
+        "the instrument type, also required: {sent}"
     );
 }
 

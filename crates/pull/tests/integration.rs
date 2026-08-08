@@ -242,6 +242,7 @@ fn a_bar_outside_the_window_or_the_session_is_never_stored() {
     let archive = archive_with_the_fixture(&scratch);
     let store_root = scratch.store();
     let request = BarRequest {
+        instrument_id: String::new(),
         window: window(),
         cadence: Cadence::Minute,
     };
@@ -330,6 +331,7 @@ fn a_narrower_window_stores_strictly_fewer_bars_and_says_why() {
     let archive = archive_with_the_fixture(&scratch);
     let store_root = scratch.store();
     let request = BarRequest {
+        instrument_id: String::new(),
         window: Window::new(
             Day::new(2022, 10, 3).expect("2022-10-03"),
             Day::new(2022, 10, 3).expect("2022-10-03"),
@@ -368,6 +370,7 @@ fn idempotent_repull_leaves_the_file_byte_identical() {
     let archive = archive_with_the_fixture(&scratch);
     let store_root = scratch.store();
     let request = BarRequest {
+        instrument_id: String::new(),
         window: window(),
         cadence: Cadence::Minute,
     };
@@ -417,6 +420,7 @@ fn a_second_window_over_the_same_month_appends_rather_than_rewrites() {
     let store_root = scratch.store();
 
     let narrow = BarRequest {
+        instrument_id: String::new(),
         window: Window::new(
             Day::new(2022, 10, 3).expect("2022-10-03"),
             Day::new(2022, 10, 3).expect("2022-10-03"),
@@ -429,6 +433,7 @@ fn a_second_window_over_the_same_month_appends_rather_than_rewrites() {
     assert_eq!(stored_bars(&store_root).len(), 2);
 
     let wider = BarRequest {
+        instrument_id: String::new(),
         window: Window::new(
             Day::new(2022, 10, 4).expect("2022-10-04"),
             Day::new(2022, 10, 4).expect("2022-10-04"),

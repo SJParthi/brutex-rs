@@ -631,11 +631,52 @@ impl HttpSource {
         )?;
 
         let url = self.url();
-        let body = serde_json::json!({ "fromDate": from, "toDate": to });
-        let builder = match self.spec.method {
-            Method::Post => self.client.post(&url).json(&body),
-            Method::Get => self.client.get(&url).query(&[("from", &from), ("to", &to)]),
+
+        // THE REQUEST IS BUILT FROM THE DESCRIPTOR ROW, NOT WRITTEN HERE.
+        //
+        // This was `json!({ "fromDate": from, "toDate": to })` and a two-pair
+        // query — a window and nothing else. No instrument, no segment, no
+        // interval. That is why Dhan answered `DH-905 securityId is required`
+        // and why no broker has ever returned a bar to this build.
+        //
+        // Every field now comes from `spec.params`, so adding a vendor stays a
+        // row in `crate::vendor` and this function never learns either broker's
+        // spelling. An empty `params` still sends the window alone, which is
+        // what a feed that needs nothing else would want and is also exactly
+        // the old behaviour — so the shape did not change, only where it is
+        // decided.
+        let pairs: Vec<(&'static str, String)> = self
+            .spec
+            .params
+            .iter()
+            .map(|p| {
+                let v = match p.value {
+                    crate::vendor::ParamValue::From => from.clone(),
+                    crate::vendor::ParamValue::To => to.clone(),
+                    crate::vendor::ParamValue::InstrumentId => request.instrument_id.clone(),
+                    crate::vendor::ParamValue::Fixed(word) => word.to_owned(),
+                };
+                (p.name, v)
+            })
+            .collect();
+
+        let mut builder = match self.spec.method {
+            Method::Post => {
+                let body: serde_json::Map<String, serde_json::Value> = pairs
+                    .iter()
+                    .map(|(n, v)| ((*n).to_owned(), serde_json::Value::String(v.clone())))
+                    .collect();
+                self.client
+                    .post(&url)
+                    .json(&serde_json::Value::Object(body))
+            }
+            Method::Get => self.client.get(&url).query(&pairs),
         };
+        // Headers this feed requires beyond the credential — Groww's
+        // `X-API-VERSION`, which its own page shows on every historical call.
+        for (header, word) in self.spec.extra_headers {
+            builder = builder.header(*header, *word);
+        }
 
         let answer = builder.header(name, value).send().await.map_err(|why| {
             FetchError::TransportFailed {
@@ -728,6 +769,21 @@ mod tests {
 
     fn spec_top(prices: PriceScale) -> HttpSpec {
         HttpSpec {
+            // The window, named — which is what these tests assert and what
+            // the request used to hardcode. A real vendor row carries more
+            // (`securityId`, `exchangeSegment`); the fixtures that care about
+            // those name them for themselves.
+            params: &[
+                crate::vendor::Param {
+                    name: "from",
+                    value: crate::vendor::ParamValue::From,
+                },
+                crate::vendor::Param {
+                    name: "to",
+                    value: crate::vendor::ParamValue::To,
+                },
+            ],
+            extra_headers: &[],
             base_url: "https://vendor.invalid",
             bars_path: "/bars",
             method: Method::Post,
@@ -1089,6 +1145,7 @@ mod tests {
         };
         let source = HttpSource::new(spec, "SUPERSECRET".to_owned()).expect("a client builds");
         let request = BarRequest {
+            instrument_id: String::new(),
             window: crate::session::Window::new(
                 crate::session::Day::new(2025, 7, 1).expect("a real day"),
                 crate::session::Day::new(2025, 7, 1).expect("a real day"),
@@ -1154,6 +1211,7 @@ mod tests {
         };
         let source = HttpSource::new(spec, "SUPERSECRET".to_owned()).expect("a client builds");
         let request = BarRequest {
+            instrument_id: String::new(),
             window: crate::session::Window::new(
                 crate::session::Day::new(2025, 7, 1).expect("a real day"),
                 crate::session::Day::new(2025, 7, 1).expect("a real day"),
@@ -1478,6 +1536,7 @@ mod tests {
     /// A one-day request, which is every socket test's window.
     fn one_day() -> BarRequest {
         BarRequest {
+            instrument_id: String::new(),
             window: crate::session::Window::new(
                 crate::session::Day::new(2025, 7, 1).expect("a real day"),
                 crate::session::Day::new(2025, 7, 1).expect("a real day"),
