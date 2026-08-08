@@ -4078,6 +4078,12 @@ mod tests {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "a test that cannot panic cannot fail, and these lints exist to \
+              keep panics out of the crate rather than out of its tests"
+)]
 mod query_value_tests {
     use super::*;
 
@@ -4142,6 +4148,12 @@ mod query_value_tests {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "a test that cannot panic cannot fail, and these lints exist to \
+              keep panics out of the crate rather than out of its tests"
+)]
 mod store_links_tests {
     use super::*;
 

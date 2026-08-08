@@ -69,6 +69,7 @@ fn ratio(label: &str, base_ps: u128, at_ps: u128) -> bool {
 /// that is scanned by the marker search and then never becomes the identity.
 fn row(trading_symbol: &str) -> MasterRow<'_> {
     MasterRow {
+        vendor_id: "1333",
         exchange: "NSE",
         segment: "CASH",
         underlying: "RELIANCE",

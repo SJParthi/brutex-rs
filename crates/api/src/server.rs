@@ -2619,11 +2619,11 @@ mod tests {
     }
 
     const GROWW_HEAD: &str = "exchange,segment,underlying_symbol,trading_symbol,\
-                              instrument_type,series,isin,expiry_date,strike_price\n";
+                              instrument_type,series,isin,expiry_date,strike_price,groww_symbol\n";
     // `SERIES` is the column the gate reads; `INSTRUMENT_TYPE` is present
     // because the real file has it, and is deliberately never read. D-0025.
     const DHAN_HEAD: &str = "EXCH_ID,SEGMENT,ISIN,INSTRUMENT,UNDERLYING_SYMBOL,SYMBOL_NAME,\
-                             INSTRUMENT_TYPE,SERIES,SM_EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE\n";
+                             INSTRUMENT_TYPE,SERIES,SM_EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE,SECURITY_ID\n";
 
     /// Both vendors, agreeing about NIFTY and RELIANCE.
     fn agreeing(name: &str) -> PathBuf {
@@ -2631,13 +2631,13 @@ mod tests {
             name,
             Some(&format!(
                 "{GROWW_HEAD}\
-                 NSE,CASH,,NIFTY,IDX,,NIFTY,,\n\
-                 NSE,CASH,,RELIANCE,EQ,EQ,INE002A01018,,\n"
+                 NSE,CASH,,NIFTY,IDX,,NIFTY,,,NSE-NIFTY\n\
+                 NSE,CASH,,RELIANCE,EQ,EQ,INE002A01018,,,NSE-RELIANCE\n"
             )),
             Some(&format!(
                 "{DHAN_HEAD}\
-                 NSE,I,NA,INDEX,NIFTY,NIFTY,INDEX,NA,0001-01-01,,\n\
-                 NSE,E,INE002A01018,EQUITY,RELIANCE,RELIANCE INDUSTRIES,ES,EQ,,,\n"
+                 NSE,I,NA,INDEX,NIFTY,NIFTY,INDEX,NA,0001-01-01,,,1333\n\
+                 NSE,E,INE002A01018,EQUITY,RELIANCE,RELIANCE INDUSTRIES,ES,EQ,,,,1333\n"
             )),
         )
     }
@@ -2786,7 +2786,9 @@ mod tests {
         // read green while half the universe had never been opened.
         let dir = masters(
             "missing",
-            Some(&format!("{GROWW_HEAD}NSE,CASH,,NIFTY,IDX,,NIFTY,,\n")),
+            Some(&format!(
+                "{GROWW_HEAD}NSE,CASH,,NIFTY,IDX,,NIFTY,,,NSE-NIFTY\n"
+            )),
             None,
         );
         let (text, clean) = report(&dir);
@@ -2804,7 +2806,7 @@ mod tests {
             Some(&format!(
                 "{GROWW_HEAD}\
                  NSE,CASH,,SOMEBOND,EQ,N2,INE002A01018,,\n\
-                 NSE,CASH,,SOMESME,EQ,SM,INE002A01018,,\n"
+                 NSE,CASH,,SOMESME,EQ,SM,INE002A01018,,,NSE-SOMESME\n"
             )),
             None,
         );
@@ -2822,10 +2824,10 @@ mod tests {
         let dir = masters(
             "unrecognised",
             Some(&format!(
-                "{GROWW_HEAD}NSE,CASH,,RELIANCE,EQ,EQX,INE002A01018,,\n"
+                "{GROWW_HEAD}NSE,CASH,,RELIANCE,EQ,EQX,INE002A01018,,,NSE-RELIANCE\n"
             )),
             Some(&format!(
-                "{DHAN_HEAD}NSE,E,INE002A01018,EQUITY,RELIANCE,RELIANCE INDUSTRIES,ES,EQX,,,\n"
+                "{DHAN_HEAD}NSE,E,INE002A01018,EQUITY,RELIANCE,RELIANCE INDUSTRIES,ES,EQX,,,,1333\n"
             )),
         );
         let (text, clean) = report(&dir);
@@ -2865,11 +2867,11 @@ mod tests {
             "eligibility",
             // Groww declines it: series MF is a fund.
             Some(&format!(
-                "{GROWW_HEAD}NSE,CASH,,FISTIPD3GP,EQ,MF,INF090I01VS3,,\n"
+                "{GROWW_HEAD}NSE,CASH,,FISTIPD3GP,EQ,MF,INF090I01VS3,,,NSE-FISTIPD3GP\n"
             )),
             // Dhan keeps it: series EQ.
             Some(&format!(
-                "{DHAN_HEAD}NSE,E,INF090I01VS3,EQUITY,FISTIPD3GP,FRANKLIN PLAN,ETF,EQ,,,\n"
+                "{DHAN_HEAD}NSE,E,INF090I01VS3,EQUITY,FISTIPD3GP,FRANKLIN PLAN,ETF,EQ,,,,1333\n"
             )),
         );
         let (text, clean) = report(&dir);
@@ -2891,10 +2893,10 @@ mod tests {
         let dir = masters(
             "conflict",
             Some(&format!(
-                "{GROWW_HEAD}NSE,CASH,,CHOLAFIN,EQ,EQ,INE121A01024,,\n"
+                "{GROWW_HEAD}NSE,CASH,,CHOLAFIN,EQ,EQ,INE121A01024,,,NSE-CHOLAFIN\n"
             )),
             Some(&format!(
-                "{DHAN_HEAD}NSE,E,INE121A08PJ0,EQUITY,CHOLAFIN,CHOLA,ES,EQ,,,\n"
+                "{DHAN_HEAD}NSE,E,INE121A08PJ0,EQUITY,CHOLAFIN,CHOLA,ES,EQ,,,,1333\n"
             )),
         );
         let (text, clean) = report(&dir);
@@ -2940,11 +2942,11 @@ mod tests {
             "hatchreach",
             Some(&format!(
                 "{GROWW_HEAD}\
-                 NSE,CASH,,RAJESHEXPO,EQ,EQ,INE343B01030,,\n"
+                 NSE,CASH,,RAJESHEXPO,EQ,EQ,INE343B01030,,,NSE-RAJESHEXPO\n"
             )),
             Some(&format!(
                 "{DHAN_HEAD}\
-                 NSE,E,INE343B01030,EQUITY,RAJESHEXPO,RAJESH EXPORTS,ES,EQ,,,\n"
+                 NSE,E,INE343B01030,EQUITY,RAJESHEXPO,RAJESH EXPORTS,ES,EQ,,,,1333\n"
             )),
         );
         let read = universe(&dir);
@@ -3132,7 +3134,7 @@ mod tests {
         let dir = masters(
             "searchnotes",
             Some(&format!(
-                "{GROWW_HEAD}NSE,CASH,,RELIANCE,EQ,EQ,INE002A01018,,\n"
+                "{GROWW_HEAD}NSE,CASH,,RELIANCE,EQ,EQ,INE002A01018,,,NSE-RELIANCE\n"
             )),
             None,
         );
@@ -3163,7 +3165,7 @@ mod tests {
             "unreadable",
             Some(&format!(
                 "{GROWW_HEAD}\
-                 NSE,CASH,,RELIANCE,EQ,EQ,INE002A01018,,\n\
+                 NSE,CASH,,RELIANCE,EQ,EQ,INE002A01018,,,NSE-RELIANCE\n\
                  NSE,CASH,,NIFTY 100,IDX,,NIFTY,,\n\
                  NSE,CASH,,NIFTY 200,IDX,,NIFTY,,\n"
             )),
@@ -3190,7 +3192,7 @@ mod tests {
             Some(&format!(
                 "{GROWW_HEAD}\
                  NSE,CASH,,RELIANCE,EQ\n\
-                 NSE,CASH,,CHOLAFIN,EQ,EQ,INE121A01024,,\n"
+                 NSE,CASH,,CHOLAFIN,EQ,EQ,INE121A01024,,,NSE-CHOLAFIN\n"
             )),
             None,
         );
@@ -4043,15 +4045,15 @@ mod tests {
             "targetcounts",
             Some(&format!(
                 "{GROWW_HEAD}\
-                 NSE,CASH,,NIFTY,IDX,,NIFTY,,\n\
-                 NSE,CASH,,INDIAVIX,IDX,,NIFTY,,\n\
-                 NSE,CASH,,RELIANCE,EQ,EQ,INE002A01018,,\n"
+                 NSE,CASH,,NIFTY,IDX,,NIFTY,,,NSE-NIFTY\n\
+                 NSE,CASH,,INDIAVIX,IDX,,NIFTY,,,NSE-INDIAVIX\n\
+                 NSE,CASH,,RELIANCE,EQ,EQ,INE002A01018,,,NSE-RELIANCE\n"
             )),
             Some(&format!(
                 "{DHAN_HEAD}\
-                 NSE,I,NA,INDEX,NIFTY,NIFTY,INDEX,NA,0001-01-01,,\n\
-                 NSE,I,NA,INDEX,INDIAVIX,INDIA VIX,INDEX,NA,0001-01-01,,\n\
-                 NSE,E,INE002A01018,EQUITY,RELIANCE,RELIANCE INDUSTRIES,ES,EQ,,,\n"
+                 NSE,I,NA,INDEX,NIFTY,NIFTY,INDEX,NA,0001-01-01,,,1333\n\
+                 NSE,I,NA,INDEX,INDIAVIX,INDIA VIX,INDEX,NA,0001-01-01,,,1333\n\
+                 NSE,E,INE002A01018,EQUITY,RELIANCE,RELIANCE INDUSTRIES,ES,EQ,,,,1333\n"
             )),
         );
         let built = site("targetcounts", &dir);
@@ -4130,10 +4132,10 @@ mod tests {
         let disputed = universe(&masters(
             "dashloud",
             Some(&format!(
-                "{GROWW_HEAD}NSE,CASH,,CHOLAFIN,EQ,EQ,INE121A01024,,\n"
+                "{GROWW_HEAD}NSE,CASH,,CHOLAFIN,EQ,EQ,INE121A01024,,,NSE-CHOLAFIN\n"
             )),
             Some(&format!(
-                "{DHAN_HEAD}NSE,E,INE121A08PJ0,EQUITY,CHOLAFIN,CHOLA,ES,EQ,,,\n"
+                "{DHAN_HEAD}NSE,E,INE121A08PJ0,EQUITY,CHOLAFIN,CHOLA,ES,EQ,,,,1333\n"
             )),
         ));
         let loud = dashboard_html(&disputed);
@@ -4153,13 +4155,13 @@ mod tests {
             "dashboth",
             Some(&format!(
                 "{GROWW_HEAD}\
-                 NSE,CASH,,CHOLAFIN,EQ,EQ,INE121A01024,,\n\
-                 NSE,CASH,,FISTIPD3GP,EQ,MF,INF090I01VS3,,\n"
+                 NSE,CASH,,CHOLAFIN,EQ,EQ,INE121A01024,,,NSE-CHOLAFIN\n\
+                 NSE,CASH,,FISTIPD3GP,EQ,MF,INF090I01VS3,,,NSE-FISTIPD3GP\n"
             )),
             Some(&format!(
                 "{DHAN_HEAD}\
-                 NSE,E,INE121A08PJ0,EQUITY,CHOLAFIN,CHOLA,ES,EQ,,,\n\
-                 NSE,E,INF090I01VS3,EQUITY,FISTIPD3GP,FRANKLIN PLAN,ETF,EQ,,,\n"
+                 NSE,E,INE121A08PJ0,EQUITY,CHOLAFIN,CHOLA,ES,EQ,,,,1333\n\
+                 NSE,E,INF090I01VS3,EQUITY,FISTIPD3GP,FRANKLIN PLAN,ETF,EQ,,,,1333\n"
             )),
         ));
         let two = dashboard_html(&both);
@@ -4179,10 +4181,10 @@ mod tests {
         let dir = masters(
             "hatchhttp",
             Some(&format!(
-                "{GROWW_HEAD}NSE,CASH,,RAJESHEXPO,EQ,EQ,INE343B01030,,\n"
+                "{GROWW_HEAD}NSE,CASH,,RAJESHEXPO,EQ,EQ,INE343B01030,,,NSE-RAJESHEXPO\n"
             )),
             Some(&format!(
-                "{DHAN_HEAD}NSE,E,INE343B01030,EQUITY,RAJESHEXPO,RAJESH EXPORTS,ES,EQ,,,\n"
+                "{DHAN_HEAD}NSE,E,INE343B01030,EQUITY,RAJESHEXPO,RAJESH EXPORTS,ES,EQ,,,,1333\n"
             )),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -4362,7 +4364,9 @@ mod tests {
         // shape of a green light over a half-read universe.
         let dir = masters(
             "health503",
-            Some(&format!("{GROWW_HEAD}NSE,CASH,,NIFTY,IDX,,NIFTY,,\n")),
+            Some(&format!(
+                "{GROWW_HEAD}NSE,CASH,,NIFTY,IDX,,NIFTY,,,NSE-NIFTY\n"
+            )),
             None,
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -4401,7 +4405,9 @@ mod tests {
         assert_eq!(reported(&agreeing("reported")), OK);
         let missing = masters(
             "reportedmissing",
-            Some(&format!("{GROWW_HEAD}NSE,CASH,,NIFTY,IDX,,NIFTY,,\n")),
+            Some(&format!(
+                "{GROWW_HEAD}NSE,CASH,,NIFTY,IDX,,NIFTY,,,NSE-NIFTY\n"
+            )),
             None,
         );
         assert_eq!(reported(&missing), DEGRADED);
@@ -4430,7 +4436,9 @@ mod tests {
         );
         let missing = masters(
             "runreportmissing",
-            Some(&format!("{GROWW_HEAD}NSE,CASH,,NIFTY,IDX,,NIFTY,,\n")),
+            Some(&format!(
+                "{GROWW_HEAD}NSE,CASH,,NIFTY,IDX,,NIFTY,,,NSE-NIFTY\n"
+            )),
             None,
         );
         assert_eq!(
@@ -5342,6 +5350,12 @@ mod tests {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "a test that cannot panic cannot fail, and these lints exist to \
+              keep panics out of the crate rather than out of its tests"
+)]
 mod broker_target_tests {
     use super::*;
 

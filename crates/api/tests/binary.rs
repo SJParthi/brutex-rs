@@ -25,9 +25,9 @@
 use std::process::Command;
 
 const GROWW_HEAD: &str = "exchange,segment,underlying_symbol,trading_symbol,instrument_type,\
-                          series,isin,expiry_date,strike_price\n";
+                          series,isin,expiry_date,strike_price,groww_symbol\n";
 const DHAN_HEAD: &str = "EXCH_ID,SEGMENT,ISIN,INSTRUMENT,UNDERLYING_SYMBOL,SYMBOL_NAME,\
-                         SERIES,SM_EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE\n";
+                         SERIES,SM_EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE,SECURITY_ID\n";
 
 /// A directory holding the given vendor masters, named after the test.
 ///
@@ -75,14 +75,14 @@ fn the_binary_reports_what_it_read_and_exits_zero() {
         "report",
         Some(&format!(
             "{GROWW_HEAD}\
-             NSE,CASH,,NIFTY,IDX,,NIFTY,,\n\
-             NSE,CASH,,RELIANCE,EQ,EQ,INE002A01018,,\n\
+             NSE,CASH,,NIFTY,IDX,,NIFTY,,,NSE-NIFTY\n\
+             NSE,CASH,,RELIANCE,EQ,EQ,INE002A01018,,,NSE-RELIANCE\n\
              NSE,CASH,,SOMEBOND,EQ,N2,INE121A08PJ0,,\n"
         )),
         Some(&format!(
             "{DHAN_HEAD}\
-             NSE,I,NA,INDEX,NIFTY,NIFTY,NA,0001-01-01,,\n\
-             NSE,E,INE002A01018,EQUITY,RELIANCE,RELIANCE INDUSTRIES LTD,EQ,,,\n\
+             NSE,I,NA,INDEX,NIFTY,NIFTY,NA,0001-01-01,,,1333\n\
+             NSE,E,INE002A01018,EQUITY,RELIANCE,RELIANCE INDUSTRIES LTD,EQ,,,,1333\n\
              NSE,E,INE121A08PJ0,EQUITY,SOMEBOND,SOME BOND,N2,,,\n"
         )),
     );
@@ -105,7 +105,9 @@ fn the_binary_exits_non_zero_when_a_vendor_was_never_read() {
     // the universe had never been opened. D-0026.
     let dir = masters(
         "unavailable",
-        Some(&format!("{GROWW_HEAD}NSE,CASH,,NIFTY,IDX,,NIFTY,,\n")),
+        Some(&format!(
+            "{GROWW_HEAD}NSE,CASH,,NIFTY,IDX,,NIFTY,,,NSE-NIFTY\n"
+        )),
         None,
     );
     let (code, text, _) = run(&dir, "report");

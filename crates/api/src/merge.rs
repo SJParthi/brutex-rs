@@ -377,6 +377,7 @@ mod tests {
 
     fn equity(sym: &str, isin: &str) -> Listing {
         Listing {
+            vendor_id: brutex_core::vendor::VendorId::new("1333").expect("a legal id"),
             key: key(sym, Kind::Equity),
             isin: Some(Isin::new(isin).expect("valid")),
             unsuffixed: None,
@@ -385,6 +386,7 @@ mod tests {
 
     fn index(sym: &str) -> Listing {
         Listing {
+            vendor_id: brutex_core::vendor::VendorId::new("1333").expect("a legal id"),
             key: key(sym, Kind::Index),
             isin: None,
             unsuffixed: None,
@@ -640,6 +642,7 @@ mod tests {
         // Groww says BLUECHIP-BE, Dhan says BLUECHIP, and the ISIN says they
         // are one instrument.
         let suffixed = Listing {
+            vendor_id: brutex_core::vendor::VendorId::new("1333").expect("a legal id"),
             key: key("BLUECHIP-BE", Kind::Equity),
             isin: Some(Isin::new("INE657B01025").expect("valid")),
             unsuffixed: Some(key("BLUECHIP", Kind::Equity)),
@@ -661,6 +664,7 @@ mod tests {
         // unmerged row is a visible duplicate; a wrongly merged one is two
         // instruments silently becoming one.
         let suffixed = Listing {
+            vendor_id: brutex_core::vendor::VendorId::new("1333").expect("a legal id"),
             key: key("BLUECHIP-BE", Kind::Equity),
             isin: Some(Isin::new("INE657B01025").expect("valid")),
             unsuffixed: Some(key("BLUECHIP", Kind::Equity)),
@@ -703,6 +707,7 @@ mod tests {
         // One vendor knows the ISIN, the other does not carry one. That is not
         // a disagreement, and the known value must survive it.
         let bare = Listing {
+            vendor_id: brutex_core::vendor::VendorId::new("1333").expect("a legal id"),
             key: key("RELIANCE", Kind::Equity),
             isin: None,
             unsuffixed: None,
