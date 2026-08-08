@@ -2109,13 +2109,37 @@ fn coverage_table(view: &StoreView<'_>) -> String {
             escape(&row.series.to_string()),
             escape(&row.month.to_string()),
         );
-        for &(_, n) in &row.rows {
+        // EACH COUNT LINKS TO THE BARS IT COUNTS.
+        //
+        // `/bars` is the only page in this product that shows an actual price,
+        // and nothing linked to it — you had to hand-type the query string. The
+        // count is already per-vendor, and per-vendor is exactly what `/bars`
+        // is keyed on, so the cell holding the number is the honest place for
+        // the link: click 62,978 under Dhan and see those 62,978 rows.
+        //
+        // A cell with no rows is not linked. Linking it would offer a page that
+        // can only answer "this month is absent", which is what the empty cell
+        // already says here.
+        for &(vendor, n) in &row.rows {
             let miss = if n.is_none() { " miss" } else { "" };
+            let cell = count_cell(n);
+            let inner = if n.is_some_and(|rows| rows > 0) {
+                format!(
+                    "<a href=\"/bars?vendor={}&amp;exchange={}&amp;segment={}\
+                     &amp;symbol={}&amp;month={}\">{cell}</a>",
+                    query_value(vendor.as_str()),
+                    query_value(row.series.exchange.as_str()),
+                    query_value(row.series.segment.as_str()),
+                    query_value(row.series.symbol.as_str()),
+                    query_value(&row.month.to_string()),
+                )
+            } else {
+                cell
+            };
             let _ = write!(
                 out,
-                "<td class=\"num{miss}\">{}{}</td>",
-                swatch(n, peak),
-                count_cell(n)
+                "<td class=\"num{miss}\">{}{inner}</td>",
+                swatch(n, peak)
             );
         }
         out.push_str("</tr>");
@@ -4114,5 +4138,67 @@ mod query_value_tests {
                  be composed and the order would matter"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod store_links_tests {
+    use super::*;
+
+    /// **THE PAGE THAT SHOWS PRICES IS REACHABLE BY CLICKING.**
+    ///
+    /// `/bars` is the only page in this product that renders an actual price,
+    /// and no page linked to it: the nav offers `/`, `/audit`, `/instruments`,
+    /// `/pull` and `/store`, and a grep for `href="/bars` across `render.rs`
+    /// returned nothing. It could be reached only by hand-typing a query
+    /// string, which means in practice it could not be reached at all.
+    ///
+    /// `/store` already lists exactly `(vendor, series, month)` — the whole key
+    /// `/bars` is addressed by — so the count cell is the honest place to put
+    /// the link. Verified live against the real store: 194 links on one page,
+    /// and following one rendered 216 bars of ABB-III.
+    #[test]
+    fn every_held_count_on_the_store_page_links_to_the_bars_it_counts() {
+        let series = crate::census::Series {
+            exchange: brutex_core::instrument::Exchange::Nse,
+            segment: brutex_core::instrument::Segment::Index,
+            symbol: brutex_core::symbol::Symbol::new("NIFTY").expect("valid"),
+            timeframe: store::path::Timeframe::MINUTE_1,
+        };
+        let rows = [Coverage {
+            series,
+            month: store::path::YearMonth::new(2026, 7).expect("valid"),
+            // One vendor holds it, one does not — the second must NOT be
+            // linked, because the only thing that page could say is "absent",
+            // which the empty cell already says.
+            rows: vec![(Vendor::Groww, Some(8_250)), (Vendor::Dhan, None)],
+        }];
+        let html = store_page(&StoreView {
+            today: pull::session::Day::new(2026, 8, 7).expect("valid"),
+            censuses: &[],
+            rows: &rows,
+            page: 0,
+            last_page: 0,
+            total: 1,
+            notes: &[],
+            filter: None,
+            held: 1,
+            held_only: false,
+        });
+
+        // The held count links, and the link carries the WHOLE key: /bars can
+        // default nothing but the exchange and the segment, and defaulting the
+        // rest is how it served the wrong month.
+        let href = "/bars?vendor=groww&amp;exchange=NSE&amp;segment=INDEX\
+                    &amp;symbol=NIFTY&amp;month=2026-07";
+        let href: String = href.split_whitespace().collect();
+        assert!(html.contains(&href), "expected {href} in {html}");
+
+        // Exactly one link: the vendor with no rows is not offered.
+        assert_eq!(
+            html.matches("/bars?vendor=").count(),
+            1,
+            "an absent month must not be linked: {html}"
+        );
     }
 }
