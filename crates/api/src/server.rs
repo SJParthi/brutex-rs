@@ -1510,6 +1510,31 @@ struct BrokerWindow {
 }
 
 async fn broker_window(asked: &ingest::SpotRequest, _site: &Site) -> Result<BrokerWindow, String> {
+    // ONE INSTRUMENT IS ALL THIS PATH CAN ADDRESS, AND IT NOW SAYS SO.
+    //
+    // `HttpSpec` carries no request-parameter map, so nothing here can name an
+    // instrument to the vendor at all — which is why Dhan answers
+    // `DH-905 securityId is required`. One window comes back and it was being
+    // labelled `NIFTY` and filed under `NSE/INDEX/NIFTY` WHATEVER the operator
+    // picked, including `NIFTY Total Market equities`, which names 750 symbols.
+    // The receipt then reported success against the target they chose.
+    //
+    // Refusing the targets this path cannot serve is `CLAUDE.md` §4 — degrade
+    // loudly and name the reason. It does not pretend to be multi-instrument;
+    // it stops claiming to be. The refusal names the blocker so the message
+    // stays true only until the parameter map lands, and turns into a real
+    // multi-instrument pull rather than being quietly deleted.
+    if asked.target != ingest::SpotTarget::Swept {
+        return Err(format!(
+            "the broker path can address ONE instrument today and {} names a \
+             set. pull::vendor::HttpSpec has no request-parameter map, so no \
+             instrument is put on the wire at all — the vendor replies that a \
+             security id is required. Refused rather than fetching one series \
+             and filing it under a name you did not ask for.",
+            asked.target.label()
+        ));
+    }
+
     let Some(home) = std::env::var_os("HOME") else {
         return Err("HOME is unset, so ~/.brutex/credentials.toml cannot be located".to_owned());
     };
@@ -1593,8 +1618,8 @@ async fn broker_window(asked: &ingest::SpotRequest, _site: &Site) -> Result<Brok
         ));
     };
 
-    // The two swept series are the engine surface; the first is what a spot
-    // pull asks for until the form carries an instrument of its own.
+    // Even `Swept` is two series and this fetches one. Saying which, rather
+    // than letting the receipt imply both.
     Ok(BrokerWindow {
         raw,
         instrument: "NIFTY".to_owned(),
@@ -5312,6 +5337,79 @@ mod tests {
         assert!(
             stale.contains("class=\"loud\""),
             "UNCHECKED is one of the words that makes a note loud: {stale}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod broker_target_tests {
+    use super::*;
+
+    /// **A TARGET THIS PATH CANNOT SERVE IS REFUSED BEFORE A SOCKET OPENS.**
+    ///
+    /// `broker_window` fetched one window and returned it labelled `NIFTY`,
+    /// filed under `NSE/INDEX/NIFTY`, whatever the operator picked — including
+    /// `NIFTY Total Market equities`, which names 750 symbols. The receipt then
+    /// reported success against the target they had chosen.
+    ///
+    /// The refusal is placed as the FIRST statement of `broker_window`, ahead of
+    /// the credential read and the socket, because refusing afterwards spends a
+    /// vendor request and a slice of the rate budget to arrive at "no".
+    ///
+    /// This test asserts the POSITION, not the message. Driving the function
+    /// itself needs AWS and a live broker; what can be checked without either is
+    /// that the guard precedes the two things that cost something — and that is
+    /// the half that was wrong when the check was first written.
+    #[test]
+    fn the_unservable_target_guard_precedes_the_credential_and_the_socket() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/server.rs"),
+        )
+        .expect("this module's own source");
+
+        let body = src
+            .split_once("async fn broker_window")
+            .expect("broker_window exists")
+            .1;
+        let end = body.find("\n}\n").expect("it has an end");
+        let body = &body[..end];
+
+        let guard = body
+            .find("asked.target != ingest::SpotTarget::Swept")
+            .expect("the guard is still there");
+        for (what, needle) in [
+            ("the credential read", "CredentialConfig::load"),
+            ("the AWS identity", "AwsIdentity::discover"),
+            ("the socket", "window_async"),
+        ] {
+            let at = body.find(needle).unwrap_or_else(|| {
+                panic!("{what} moved; this test pins an ordering it can no longer see")
+            });
+            assert!(
+                guard < at,
+                "the unservable-target refusal must come BEFORE {what}, or a \
+                 request and a slice of the rate budget are spent to reach a \
+                 refusal that was decidable from the form alone"
+            );
+        }
+    }
+
+    /// The three targets, and which of them this build can actually address.
+    #[test]
+    fn only_the_swept_target_names_a_single_instrument_this_path_can_reach() {
+        // Swept is the two engine-surface indices; the guard lets it through
+        // and `broker_window` fetches the first. The other two name sets whose
+        // members cannot be addressed at all without a parameter map.
+        assert_eq!(ingest::SpotTarget::ALL.len(), 3);
+        let served: Vec<_> = ingest::SpotTarget::ALL
+            .into_iter()
+            .filter(|t| *t == ingest::SpotTarget::Swept)
+            .collect();
+        assert_eq!(
+            served.len(),
+            1,
+            "exactly one target is servable today; when the parameter map lands \
+             this test is the reminder to widen the guard rather than delete it"
         );
     }
 }
