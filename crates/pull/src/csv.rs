@@ -466,6 +466,9 @@ mod tests {
             DateFormat::DashedYmd => format!("{year:04}-{month:02}-{day:02}"),
             DateFormat::SlashedDmy => format!("{day:02}/{month:02}/{year:04}"),
             DateFormat::CompactDmy => format!("{day:02}{month:02}{year:04}"),
+            DateFormat::DashedYmdMidnight => {
+                format!("{year:04}-{month:02}-{day:02} 00:00:00")
+            }
         }
     }
 
@@ -641,7 +644,9 @@ mod tests {
     const fn ranges(format: DateFormat) -> [(usize, usize); 3] {
         match format {
             DateFormat::CompactYmd => [(0, 4), (4, 6), (6, 8)],
-            DateFormat::DashedYmd => [(0, 4), (5, 7), (8, 10)],
+            // The date occupies the same first ten bytes either way; the
+            // clock a datetime format adds after it is not a date field.
+            DateFormat::DashedYmd | DateFormat::DashedYmdMidnight => [(0, 4), (5, 7), (8, 10)],
             DateFormat::SlashedDmy => [(6, 10), (3, 5), (0, 2)],
             DateFormat::CompactDmy => [(4, 8), (2, 4), (0, 2)],
         }
@@ -701,6 +706,7 @@ mod tests {
             let wanted = match format {
                 DateFormat::CompactYmd | DateFormat::CompactDmy => 8,
                 DateFormat::DashedYmd | DateFormat::SlashedDmy => 10,
+                DateFormat::DashedYmdMidnight => 19,
             };
             assert_eq!(
                 text.len(),

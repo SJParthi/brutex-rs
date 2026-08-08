@@ -453,7 +453,15 @@ pub fn land(
             // build would add has already been added by the vendor. Subtract it
             // back out before the shared conversion, rather than teaching that
             // conversion a second mode.
-            TimestampEncoding::IstDateTimeText => row.timestamp - crate::session::IST_OFFSET_SECS,
+            // BOTH TEXT SPELLINGS, ONE BEHAVIOUR. The decoder has already
+            // turned `2026-08-04 09:15:00` and `2026-08-04T09:15:00` into
+            // IST-based seconds — the separator differs on the wire and the
+            // meaning does not — so the offset the vendor already added comes
+            // back out here. Joined rather than written twice, because two arms
+            // doing the same thing is two places for one of them to drift.
+            TimestampEncoding::IstDateTimeText | TimestampEncoding::IsoDateTimeText => {
+                row.timestamp - crate::session::IST_OFFSET_SECS
+            }
         };
 
         // `verdict` does the conversion itself and refuses a timestamp that is

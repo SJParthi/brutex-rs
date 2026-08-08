@@ -151,6 +151,7 @@ impl HttpSource {
             DateFormat::CompactYmd => format!("{y:04}{m:02}{d:02}"),
             DateFormat::SlashedDmy => format!("{d:02}/{m:02}/{y:04}"),
             DateFormat::CompactDmy => format!("{d:02}{m:02}{y:04}"),
+            DateFormat::DashedYmdMidnight => format!("{y:04}-{m:02}-{d:02} 00:00:00"),
         }
     }
 
@@ -176,6 +177,20 @@ impl HttpSource {
                 detail: format!("{last} has no successor to put on the wire: {why}"),
             })?,
         };
+        // A DATETIME FORMAT MUST NOT COLLAPSE A DAY TO A POINT.
+        //
+        // `on_the_wire` renders midnight, which is right for the START of a
+        // window and wrong for the end of an INCLUSIVE one: a single-day pull
+        // then sends `2026-08-04 00:00:00` for both ends, and Groww refuses
+        // with `GA001 Start time should be less than end time`. Measured, not
+        // reasoned about.
+        //
+        // An exclusive end is already the following day, so midnight there is
+        // exactly the boundary and must stay midnight.
+        if format == DateFormat::DashedYmdMidnight && end == RangeEnd::Inclusive {
+            let (y, m, d) = (day.year(), day.month(), day.day());
+            return Ok(format!("{y:04}-{m:02}-{d:02} 23:59:59"));
+        }
         Ok(Self::on_the_wire(day, format))
     }
 
@@ -279,6 +294,9 @@ pub fn decode_body(body: &str, spec: &HttpSpec) -> Result<RawWindow, FetchError>
         // conversions run per object: rupees to paisa through `csv::paisa`, no
         // float, and a value off the tick grid refused by name.
         ResponseShape::ArrayOfObjects { envelope } => decode_objects(&root, spec, envelope),
+        ResponseShape::PositionalRows { envelope, array } => {
+            decode_positional(&root, spec, envelope, array)
+        }
     }
 }
 
@@ -739,6 +757,132 @@ impl HttpSource {
 
         decode_body(&text, &self.spec)
     }
+}
+
+/// One array per bar, read by POSITION: `[ts, open, high, low, close, volume]`
+/// and optionally open interest seventh.
+///
+/// # There are no names here, so the width is the contract
+///
+/// `decode_objects` reads each field by the name the descriptor gives. This
+/// vendor sends no names at all — Groww's page says "in that order" — so a row
+/// that is the wrong length is refused naming BOTH lengths rather than read
+/// short. A six-element row read as seven would take `null` for volume; a
+/// seven read as six would silently drop open interest. Neither is a thing to
+/// discover later from a chart that looks nearly right.
+///
+/// # Errors
+///
+/// [`FetchError::TransportFailed`] naming the bar index and what was found,
+/// for a container that is not the named array, a row that is not an array, a
+/// row of an unusable width, or a cell that is not the number it must be.
+fn decode_positional(
+    root: &serde_json::Value,
+    spec: &HttpSpec,
+    envelope: Option<&'static str>,
+    array: &'static str,
+) -> Result<RawWindow, FetchError> {
+    let container = container(root, envelope)?;
+    let rows = array_at(container, array)?;
+
+    let mut arrays = ParallelArrays {
+        open: Vec::with_capacity(rows.len()),
+        high: Vec::with_capacity(rows.len()),
+        low: Vec::with_capacity(rows.len()),
+        close: Vec::with_capacity(rows.len()),
+        volume: Vec::with_capacity(rows.len()),
+        timestamp: Vec::with_capacity(rows.len()),
+        open_interest: Vec::new(),
+    };
+
+    for (i, row) in rows.iter().enumerate() {
+        let cells = row.as_array().ok_or_else(|| FetchError::TransportFailed {
+            detail: format!("bar {i} is {row}, and this vendor sends one ARRAY per bar"),
+        })?;
+        // Six is the deprecated endpoint, seven the live one, and the seventh
+        // is open interest. Any other width is a shape this build has not seen.
+        if cells.len() != 6 && cells.len() != 7 {
+            return Err(FetchError::TransportFailed {
+                detail: format!(
+                    "bar {i} carries {} cell(s); this vendor sends six \
+                     (timestamp, open, high, low, close, volume) or seven with \
+                     open interest last",
+                    cells.len()
+                ),
+            });
+        }
+        let cell = |at: usize| -> Result<&serde_json::Value, FetchError> {
+            cells.get(at).ok_or_else(|| FetchError::TransportFailed {
+                detail: format!("bar {i} has no cell {at}"),
+            })
+        };
+        arrays
+            .timestamp
+            .push(one_stamp(cell(0)?, spec.timestamps, i)?);
+        arrays.open.push(one_price(cell(1)?, "open", spec.prices)?);
+        arrays.high.push(one_price(cell(2)?, "high", spec.prices)?);
+        arrays.low.push(one_price(cell(3)?, "low", spec.prices)?);
+        arrays
+            .close
+            .push(one_price(cell(4)?, "close", spec.prices)?);
+        // Volume is `null` on an index, which has none. Zero means zero and the
+        // charter's null sentinel is for OPEN INTEREST, not volume, so a null
+        // volume becomes 0 rather than i64::MIN.
+        arrays.volume.push(match cell(5)? {
+            serde_json::Value::Null => 0,
+            given => one_number(given, "volume")?,
+        });
+    }
+
+    RawWindow::decode(&arrays)
+}
+
+/// One timestamp cell, in whichever spelling this feed uses.
+///
+/// A number is taken as it stands; a string is parsed as a local date and time.
+/// `fetch::land` then shifts an IST-based value back to UTC — this function's
+/// only job is to turn the wire into seconds, and it never guesses which.
+fn one_stamp(
+    v: &serde_json::Value,
+    encoding: crate::vendor::TimestampEncoding,
+    at: usize,
+) -> Result<i64, FetchError> {
+    use crate::vendor::TimestampEncoding as T;
+    match encoding {
+        T::EpochSecondsUtc | T::EpochMillisUtc => one_number(v, "timestamp"),
+        T::IstDateTimeText | T::IsoDateTimeText => {
+            let text = v.as_str().ok_or_else(|| FetchError::TransportFailed {
+                detail: format!("bar {at} stamps {v}, and this feed spells its timestamps as text"),
+            })?;
+            local_seconds(text).ok_or_else(|| FetchError::TransportFailed {
+                detail: format!(
+                    "bar {at} stamps {text:?}, which is not YYYY-MM-DD followed by HH:MM:SS"
+                ),
+            })
+        }
+    }
+}
+
+/// `YYYY-MM-DD?HH:MM:SS` to seconds since the epoch, treating the value as
+/// local. The separator is a `T` on Groww's live endpoint and a space on its
+/// deprecated one — and its documentation says space for both — so this accepts
+/// either rather than believing the annotation.
+fn local_seconds(text: &str) -> Option<i64> {
+    let bytes = text.as_bytes();
+    if bytes.len() < 19 {
+        return None;
+    }
+    let num = |from: usize, to: usize| -> Option<i64> { text.get(from..to)?.parse().ok() };
+    let (y, mo, d) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
+    let (h, mi, sec) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
+    let day = crate::session::Day::new(
+        u16::try_from(y).ok()?,
+        u8::try_from(mo).ok()?,
+        u8::try_from(d).ok()?,
+    )
+    .ok()?;
+    let days = i64::from(day.days_from_epoch());
+    Some(days * 86_400 + h * 3_600 + mi * 60 + sec)
 }
 
 #[cfg(test)]
@@ -1547,6 +1691,15 @@ mod tests {
     }
 
     /// A source, and a runtime to drive its one asynchronous method.
+    // `HttpSpec` passed by value here rather than by reference, and clippy is
+    // right that it is now over the 256-byte threshold: it grew a parameter map
+    // and a header list. It is `Copy`, this is a test helper called a handful
+    // of times, and taking it by reference would make every fixture write `&`
+    // for no gain a profile could measure.
+    #[allow(
+        clippy::large_types_passed_by_value,
+        reason = "a Copy descriptor row in a test helper; the copy is the point"
+    )]
     fn source_of(spec: HttpSpec, token: &str) -> Driven {
         Driven(HttpSource::new(spec, token.to_owned()).expect("a client builds"))
     }

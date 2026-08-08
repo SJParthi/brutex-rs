@@ -1211,6 +1211,23 @@ pub enum DateFormat {
     SlashedDmy,
     /// `DDMMYYYY`, no separators.
     CompactDmy,
+    /// `YYYY-MM-DD HH:MM:SS`, at the start of the day.
+    ///
+    /// # Measured, not guessed
+    ///
+    /// Groww refused `2026-08-05` outright:
+    ///
+    /// ```text
+    /// 400 {"status":"FAILURE","error":{"code":"GA001",
+    ///      "message":"Invalid date format: 2026-08-05"}}
+    /// ```
+    ///
+    /// Its page takes `yyyy-MM-dd HH:mm:ss` or epoch seconds, and
+    /// [`DateFormat::DashedYmd`] is neither. The clock is `00:00:00` on the
+    /// start and `00:00:00` on the end, so the window still names whole days
+    /// and [`RangeEnd`] still decides whether the last one is included — this
+    /// changes the SPELLING and not the span.
+    DashedYmdMidnight,
 }
 
 /// Whether a feed's range end includes the day it names.
@@ -1243,6 +1260,24 @@ pub enum ResponseShape {
         /// The object key the array hangs under, or `None` at the top level.
         envelope: Option<&'static str>,
     },
+    /// One ARRAY per bar, read by POSITION.
+    ///
+    /// ```text
+    /// {"payload":{"candles":[["2026-08-04T09:15:00",24653.0,24653.0,
+    ///                         24600.2,24602.45,null,null], …]}}
+    /// ```
+    ///
+    /// Groww's own words: "Each candle has candle timestamp, open, high, low,
+    /// close, volume **in that order**". There are no names to read, so the
+    /// ORDER is the contract — which is why the array's own name is carried
+    /// here rather than guessed, and why a row of the wrong width is refused
+    /// naming the width rather than read short.
+    PositionalRows {
+        /// The object key the array hangs under, or `None` at the top level.
+        envelope: Option<&'static str>,
+        /// What the array is called inside it, e.g. `candles`.
+        array: &'static str,
+    },
 }
 
 /// What a timestamp in a response means.
@@ -1254,6 +1289,13 @@ pub enum TimestampEncoding {
     EpochMillisUtc,
     /// A local IST date and time, `YYYY-MM-DD HH:MM:SS`.
     IstDateTimeText,
+    /// An ISO-8601 local date and time with a `T`, `YYYY-MM-DDTHH:MM:SS`.
+    ///
+    /// Measured, and it matters: Groww's live endpoint returns
+    /// `"2026-08-04T09:15:00"` while its own documentation annotates that very
+    /// field as `yyyy-MM-dd HH:mm:ss`. Trusting the annotation would fail to
+    /// parse the vendor's own example. No zone is carried; the value is IST.
+    IsoDateTimeText,
 }
 
 /// What unit a price arrives in.
@@ -1807,16 +1849,20 @@ const GROWW: Descriptor = Descriptor {
     record: RecordShape::Ohlcv,
     transport: Transport::Http(HttpSpec {
         base_url: "https://api.groww.in",
-        bars_path: "/v1/historical/candle/range",
+        // THE LIVE ENDPOINT. The vendor's own page says of the previous
+        // one: "This API request is deprecated and will NOT work in the
+        // future."
+        bars_path: "/v1/historical/candles",
         method: Method::Get,
         auth: Auth {
             header: "Authorization",
             scheme: AuthScheme::Bearer,
         },
-        date_format: DateFormat::DashedYmd,
+        date_format: DateFormat::DashedYmdMidnight,
         range_end: RangeEnd::Inclusive,
-        response: ResponseShape::ArrayOfObjects {
+        response: ResponseShape::PositionalRows {
             envelope: Some("payload"),
+            array: "candles",
         },
         fields: FieldNames {
             open: "open",
@@ -1827,7 +1873,10 @@ const GROWW: Descriptor = Descriptor {
             timestamp: "timestamp",
             open_interest: None,
         },
-        timestamps: TimestampEncoding::EpochMillisUtc,
+        // MEASURED off a live response: "2026-08-04T09:15:00". Never
+        // millis, and not the space-separated form the vendor's own
+        // documentation annotates this field with.
+        timestamps: TimestampEncoding::IsoDateTimeText,
         prices: PriceScale::Rupees,
         budget: Budget {
             // The per-minute figure is operator-confirmed. The per-second
@@ -1854,7 +1903,9 @@ const GROWW: Descriptor = Descriptor {
                 value: ParamValue::Fixed("CASH"),
             },
             Param {
-                name: "trading_symbol",
+                // The live endpoint takes `groww_symbol`; only the
+                // deprecated one took `trading_symbol`.
+                name: "groww_symbol",
                 value: ParamValue::InstrumentId,
             },
             Param {
@@ -1864,6 +1915,10 @@ const GROWW: Descriptor = Descriptor {
             Param {
                 name: "end_time",
                 value: ParamValue::To,
+            },
+            Param {
+                name: "candle_interval",
+                value: ParamValue::Fixed("1minute"),
             },
         ],
         // Groww's page shows this on every historical call.
@@ -2906,6 +2961,13 @@ mod tests {
     /// test can reach, and a test file full of unreachable arms is exactly the
     /// hole this workflow exists to close. Called below for every feed, so both
     /// arms are taken.
+    // Over clippy's 256-byte by-value threshold since the row grew a parameter
+    // map and a header list. `Transport` is `Copy` and this is a const test
+    // helper; a reference here buys nothing and costs a `&` at every call.
+    #[allow(
+        clippy::large_types_passed_by_value,
+        reason = "a Copy descriptor row in a const test helper"
+    )]
     const fn http_spec(transport: Transport) -> Option<HttpSpec> {
         match transport {
             Transport::Http(spec) => Some(spec),
@@ -2914,6 +2976,10 @@ mod tests {
     }
 
     /// The archive half, same shape and same reason.
+    #[allow(
+        clippy::large_types_passed_by_value,
+        reason = "a Copy descriptor row in a const test helper, same as above"
+    )]
     const fn archive_spec(transport: Transport) -> Option<ArchiveSpec> {
         match transport {
             Transport::LocalArchive(spec) => Some(spec),
@@ -2926,7 +2992,8 @@ mod tests {
     const fn envelope_of(shape: ResponseShape) -> Option<&'static str> {
         match shape {
             ResponseShape::ParallelArrays { envelope }
-            | ResponseShape::ArrayOfObjects { envelope } => envelope,
+            | ResponseShape::ArrayOfObjects { envelope }
+            | ResponseShape::PositionalRows { envelope, .. } => envelope,
         }
     }
 
@@ -3006,7 +3073,15 @@ mod tests {
             "toDate is NOT inclusive — one field, one conversion site"
         );
         assert_eq!(groww.range_end, RangeEnd::Inclusive);
-        assert_ne!(dhan.timestamps, groww.timestamps, "seconds against millis");
+        // WAS: assert_ne!(dhan.timestamps, groww.timestamps, "seconds against millis")
+        //
+        // Groww never sent millis. That assertion passed only because the row
+        // was wrong, so it defended the error against anyone correcting it.
+        // Both are now asserted against what the vendor MEASURABLY sends:
+        // Dhan's sample stamps are ten digits, and a live Groww response reads
+        // "2026-08-04T09:15:00".
+        assert_eq!(dhan.timestamps, TimestampEncoding::EpochSecondsUtc);
+        assert_eq!(groww.timestamps, TimestampEncoding::IsoDateTimeText);
         assert_ne!(dhan.pooling, groww.pooling);
         assert_eq!(dhan.date_format, DateFormat::DashedYmd);
         assert_eq!(dhan.prices, PriceScale::Rupees);
@@ -3021,12 +3096,17 @@ mod tests {
         let envelope = envelope_of(groww.response)
             .expect("the primary broker nests its bars under an envelope");
         assert!(!envelope.is_empty(), "an envelope key of nothing is no key");
+        // ONE ARRAY PER BAR, NOT ONE OBJECT. The row said `ArrayOfObjects` and
+        // this test agreed with it; a live response is
+        // `payload.candles: [["2026-08-04T09:15:00", 24653.0, …], …]`, read by
+        // POSITION because the vendor sends no names at all.
         assert_eq!(
             groww.response,
-            ResponseShape::ArrayOfObjects {
+            ResponseShape::PositionalRows {
                 envelope: Some(envelope),
+                array: "candles",
             },
-            "one object per bar, under that envelope"
+            "one positional array per bar, under that envelope"
         );
         assert_eq!(
             envelope_of(dhan.response),

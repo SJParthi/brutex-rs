@@ -248,6 +248,7 @@ jobs:
           record_field='
           open high low close volume timestamp open_interest payload csv
           data from to candles
+          status error code message
           '
 
           # ---- group 9: an HTTP HEADER NAME, not a value. One broker sends
@@ -358,6 +359,7 @@ jobs:
           securityId exchangeSegment instrument
           exchange segment trading_symbol start_time end_time
           13
+          groww_symbol candle_interval 1minute
           '
 
           allowed="${seg_shape} ${vendor_wire} ${config_fixture}
