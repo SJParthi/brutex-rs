@@ -53,6 +53,34 @@ impl Vendor {
     /// Every vendor this engine reads, in path order.
     pub const ALL: [Self; 2] = [Self::Groww, Self::Dhan];
 
+    /// What this vendor's instrument master is called on disk.
+    ///
+    /// # Why the file name is a property of the vendor
+    ///
+    /// It was a hand-written list in `api::server::master_paths`:
+    ///
+    /// ```text
+    /// vec![(Vendor::Groww, dir.join("groww_instruments.csv")),
+    ///      (Vendor::Dhan,  dir.join("dhan_scrip.csv"))]
+    /// ```
+    ///
+    /// So adding a feed meant editing that function — and forgetting to meant a
+    /// vendor the engine knows about whose master is silently never read, which
+    /// reports as "this vendor lists nothing" rather than as the wiring bug it
+    /// is. A `match` on `Self` cannot be forgotten: a new variant is a compile
+    /// error until it names its file.
+    ///
+    /// Everything downstream already iterates [`Self::ALL`] — the census grid,
+    /// the merge, the ingest form, the coverage table. This was the one place
+    /// that did not, and it was the entry point.
+    #[must_use]
+    pub const fn master_file(self) -> &'static str {
+        match self {
+            Self::Groww => "groww_instruments.csv",
+            Self::Dhan => "dhan_scrip.csv",
+        }
+    }
+
     /// The path segment for this vendor.
     #[must_use]
     pub const fn as_str(self) -> &'static str {

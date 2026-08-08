@@ -96,10 +96,18 @@ impl Command {
 /// Where each vendor's master is expected.
 #[must_use]
 pub fn master_paths(dir: &Path) -> Vec<(Vendor, PathBuf)> {
-    vec![
-        (Vendor::Groww, dir.join("groww_instruments.csv")),
-        (Vendor::Dhan, dir.join("dhan_scrip.csv")),
-    ]
+    // DERIVED FROM THE REGISTRY, not written out. This was a hand-built list of
+    // two pairs, so adding a feed meant editing this function — and forgetting
+    // to meant a vendor whose master was never read, reported as "this vendor
+    // lists nothing" rather than as the wiring bug it was.
+    //
+    // `Vendor::master_file` is a `match`, so a new variant does not compile
+    // until it names its file. Everything downstream of here already iterates
+    // `Vendor::ALL`; this was the one place that did not.
+    Vendor::ALL
+        .into_iter()
+        .map(|vendor| (vendor, dir.join(vendor.master_file())))
+        .collect()
 }
 
 /// The directory the masters are read from.
