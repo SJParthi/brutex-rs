@@ -174,6 +174,22 @@ const _: () = assert!(SLOT_COUNT <= MAX_SLOT_COUNT);
 const _: () = assert!(BLOCK_LEN == 4088);
 const _: () = assert!(SLOT_STRIDE >= 16_384);
 
+// 56 x 73 = 4088, stated in both directions. `BLOCK_LEN == 4088` above pins
+// the product; these pin the two factors, so neither can move while the other
+// compensates and leaves the product — and every offset derived from it —
+// looking untouched.
+const _: () = assert!(RECORDS_PER_BLOCK == 73);
+const _: () = assert!(BLOCK_LEN == 56 * 73);
+
+// **A record can never straddle a block**, as a compile error rather than a
+// walk. The last record of a block starts at `(RECORDS_PER_BLOCK - 1) *
+// RECORD_STRIDE` inside it and ends exactly on the block's last byte; with the
+// divisibility asserted above, every earlier record therefore ends strictly
+// inside. `store::geometry::no_record_straddles_a_block` walks 5,000 indices
+// for the same property at runtime — this is its closed form, and it holds
+// before a test is ever run.
+const _: () = assert!((RECORDS_PER_BLOCK - 1) * RECORD_STRIDE + RECORD_STRIDE == BLOCK_LEN);
+
 /// Bit 0 of [`Header::flags`]: per-block checksums are present.
 ///
 /// A file that sets it carries a sidecar of one [`crate::block`] checksum per
@@ -259,6 +275,122 @@ impl Bar {
     pub const fn close_price(&self) -> Paisa {
         Paisa::from_raw(self.close)
     }
+
+    /// The 56-byte image of this record, little-endian, in field order.
+    ///
+    /// # Why an explicit encoder rather than a cast of the struct
+    ///
+    /// `#[repr(C)]` fixes the field *order*, not the byte order, so a struct
+    /// reinterpreted as bytes is the host's endianness — and this file is meant
+    /// to be the same bytes on every host, which is the argument
+    /// `docs/02-store-format.md` already makes about the block length. Casting
+    /// would also need `unsafe`, and every crate here carries
+    /// `#![forbid(unsafe_code)]`. Little-endian matches the header, whose every
+    /// field `crate::header` writes with `to_le_bytes`, so one file has one byte
+    /// order rather than two.
+    ///
+    /// It lives here rather than in the crate that ingests, because
+    /// `docs/02-store-format.md` §3 is the authority for these bytes and a
+    /// second encoder in `crates/pull` would be a second definition of the
+    /// format, free to drift. `CLAUDE.md` §5's arrow points one way: `pull`
+    /// depends on `store`.
+    ///
+    /// # What holds that claim up
+    ///
+    /// The paragraph above was, until D-0039, a claim this crate did not have:
+    /// nothing called this method, and `store::fault` re-implemented the
+    /// encoder privately — the exact second definition the paragraph forbids.
+    /// Replacing the whole body with zeros left all 79 tests green. Three
+    /// tests now hold it up, and they are named here because a comment that
+    /// names no test is the shape the defect took:
+    ///
+    /// - `store::unit::the_record_image_is_the_pinned_bytes_of_a_known_bar`
+    ///   pins all 56 bytes of one record as a literal array. A body that
+    ///   returns zeros — or any other bytes — fails it.
+    /// - `store::unit::the_image_is_little_endian_and_each_field_owns_its_own_offset`
+    ///   holds up the byte order this comment claims, and walks all 448
+    ///   (field, byte) positions so no two fields can swap.
+    /// - `store::unit::decoding_the_image_returns_the_record_byte_for_byte`
+    ///   round-trips every boundary a record has, [`OI_NULL`] included.
+    ///
+    /// And `store::fault::bitflip_detected` builds its record bytes by calling
+    /// this method, so the format has one definition in fact and not only in
+    /// this paragraph.
+    #[must_use]
+    pub fn image(&self) -> [u8; RECORD_LEN] {
+        let mut out = [0u8; RECORD_LEN];
+        write_at(&mut out, 0, self.ts_micros.to_le_bytes());
+        write_at(&mut out, 8, self.open.to_le_bytes());
+        write_at(&mut out, 16, self.high.to_le_bytes());
+        write_at(&mut out, 24, self.low.to_le_bytes());
+        write_at(&mut out, 32, self.close.to_le_bytes());
+        write_at(&mut out, 40, self.volume.to_le_bytes());
+        write_at(&mut out, 48, self.open_interest.to_le_bytes());
+        out
+    }
+
+    /// Decodes one record.
+    ///
+    /// There is nothing to validate here and that is deliberate:
+    /// `docs/02-store-format.md` §3 — *"a record has no structure that a lost
+    /// write violates"*. An all-zero record is a legal flat bar. Detecting a
+    /// lost write is [`crate::block`]'s job, and range validation happens at the
+    /// ingest boundary before a byte is written, never on the way back in.
+    ///
+    /// # Errors
+    ///
+    /// [`FormatError::RecordTooShort`] when fewer than [`RECORD_STRIDE`] bytes
+    /// are offered. Refused rather than zero-filled: a short tail is
+    /// `store::unit`'s ragged-file case, and inventing the missing bytes would
+    /// manufacture a bar nobody wrote.
+    pub fn decode(bytes: &[u8]) -> Result<Self, FormatError> {
+        let mut image = [0u8; RECORD_LEN];
+        if bytes.len() < RECORD_LEN {
+            return Err(FormatError::RecordTooShort { len: bytes.len() });
+        }
+        for (dst, src) in image.iter_mut().zip(bytes.iter()) {
+            *dst = *src;
+        }
+        Ok(Self {
+            ts_micros: i64::from_le_bytes(le_bytes(&image, 0)),
+            open: i64::from_le_bytes(le_bytes(&image, 8)),
+            high: i64::from_le_bytes(le_bytes(&image, 16)),
+            low: i64::from_le_bytes(le_bytes(&image, 24)),
+            close: i64::from_le_bytes(le_bytes(&image, 32)),
+            volume: i64::from_le_bytes(le_bytes(&image, 40)),
+            open_interest: i64::from_le_bytes(le_bytes(&image, 48)),
+        })
+    }
+}
+
+/// [`RECORD_STRIDE`] as a length, for the record image.
+///
+/// Written as a literal in both widths rather than converted, for the reason
+/// `crate::header` gives about every other paired constant: a conversion here
+/// would carry a failure arm no test could reach. The assertion keeps the two
+/// honest.
+pub const RECORD_LEN: usize = 56;
+
+const _: () = assert!(RECORD_STRIDE == 56 && RECORD_LEN == 56);
+
+/// Writes `src` at `offset` in a record image.
+///
+/// Index-free, because `clippy::indexing_slicing` is denied across this
+/// workspace and an encoder is exactly where a panicking index would eventually
+/// be reached by an offset that moved.
+fn write_at<const N: usize>(out: &mut [u8; RECORD_LEN], offset: usize, src: [u8; N]) {
+    for (dst, byte) in out.iter_mut().skip(offset).zip(src) {
+        *dst = byte;
+    }
+}
+
+/// Reads `N` little-endian bytes at `offset` from a record image.
+fn le_bytes<const N: usize>(image: &[u8; RECORD_LEN], offset: usize) -> [u8; N] {
+    let mut out = [0u8; N];
+    for (dst, src) in out.iter_mut().zip(image.iter().skip(offset)) {
+        *dst = *src;
+    }
+    out
 }
 
 /// Something about the bytes is wrong.
@@ -276,6 +408,15 @@ pub enum FormatError {
     OffsetOverflow,
     /// A slot buffer is shorter than [`SLOT_LEN`].
     SlotTooShort {
+        /// Bytes the caller supplied.
+        len: usize,
+    },
+    /// A record buffer is shorter than [`RECORD_STRIDE`].
+    ///
+    /// Distinct from [`FormatError::SlotTooShort`] because a short *record* and
+    /// a short *slot* are two different files being wrong in two different
+    /// places, and one message for both sends a reader to the wrong offset.
+    RecordTooShort {
         /// Bytes the caller supplied.
         len: usize,
     },
@@ -412,6 +553,9 @@ impl std::fmt::Display for FormatError {
             Self::OffsetOverflow => f.write_str("record offset overflows u64"),
             Self::SlotTooShort { len } => {
                 write!(f, "header slot is {len} bytes, needs {SLOT_LEN}")
+            }
+            Self::RecordTooShort { len } => {
+                write!(f, "record is {len} bytes, needs {RECORD_STRIDE}")
             }
             Self::HeaderRegionTooShort { slots, need } => {
                 write!(f, "header region holds {slots} whole slots, needs {need}")

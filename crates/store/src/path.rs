@@ -553,6 +553,29 @@ impl<'a> StorePath<'a> {
         }
     }
 
+    /// The same month, naming a different sibling file.
+    ///
+    /// [`FileKind::Lock`]'s documentation says the lock "needs a name that is
+    /// derived the same way every other sibling is, rather than invented at the
+    /// call site by string concatenation". This is that derivation. Every
+    /// segment has already been checked, and the extension is a closed set, so
+    /// nothing here can fail — a writer that needs both `.bin` and `.lock`
+    /// takes them from one validated path instead of building two.
+    ///
+    /// `store::write::the_lock_is_the_bar_paths_sibling` is what holds that up.
+    #[must_use]
+    pub const fn with_file(self, file: FileKind) -> Self {
+        Self {
+            vendor: self.vendor,
+            exchange: self.exchange,
+            segment: self.segment,
+            symbol: self.symbol,
+            timeframe: self.timeframe,
+            month: self.month,
+            file,
+        }
+    }
+
     /// The vendor this path belongs to.
     #[must_use]
     pub const fn vendor(self) -> Vendor {

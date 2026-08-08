@@ -7,10 +7,19 @@ license      = { workspace = true }
 publish      = { workspace = true }
 description  = "HTTP surface. Server-rendered HTML; no JavaScript anywhere."
 
-# docs/01-architecture.md gives api `core`, `store` and `engine` as its
-# permitted dependencies. That is a MAXIMUM, not a requirement -- store and
-# engine do not exist yet, so today it depends on core alone and will gain the
-# others when they land.
+# docs/01-architecture.md gives api `core`, `store`, `engine` and -- since
+# D-0038 -- `pull`. That is a MAXIMUM, not a requirement: engine does not exist
+# yet, so it is not taken here and will be when it lands.
+#
+# THE `pull` ARROW IS NEW AND IT IS DELIBERATE. `/pull` and `/store` are the
+# operator's window onto ingest, and both of the things they render are types
+# `pull` already owns: `pull::session::{Day, Window, DropCensus, DropReason}`
+# is the validated calendar and the drop tally, and `pull::manifest::Manifest`
+# is the per-vendor counter file the `/store` page reads instead of walking a
+# directory of ~248,000 entries. Re-deriving either here would be a second
+# definition of a rule that already has one, which is the exact failure
+# `CLAUDE.md` §3 rule 1 and D-0013 are about. The graph stays acyclic: `pull`
+# does not depend on `api` and cannot -- see docs/05-decisions.md D-0038.
 [dependencies]
 # A version is required alongside the path: deny.toml sets
 # wildcards = "deny", and a path dependency with no version IS a wildcard.
@@ -25,8 +34,30 @@ description  = "HTTP surface. Server-rendered HTML; no JavaScript anywhere."
 # harness breaks the same way. Hence `crates/core` declares
 # `[lib] name = "brutex_core"` and this line renames the key to match.
 brutex_core = { path = "../core", package = "core", version = "0.1.0" }
+
+# The manifest, the session window and the validated calendar. A version is
+# required alongside the path for the same reason `brutex_core` carries one:
+# deny.toml sets wildcards = "deny", and a path dependency with no version IS
+# a wildcard.
+pull = { path = "../pull", version = "0.1.0" }
+
+# Taken for `store::path::{Timeframe, YearMonth}` -- the two halves of a
+# manifest key that are not `core` types. Naming them through a re-export would
+# be a second spelling of "which month", which is what `pull::session::Day::
+# year_month` exists to prevent.
+store = { path = "../store", version = "0.1.0" }
+
 axum   = { workspace = true }
 tokio  = { workspace = true }
 
 [lints]
 workspace = true
+
+# Gate 8 — per-request page cost stays constant as the instrument set grows.
+# `harness = false` because there is no benchmarking framework in this
+# repository: every ratio is integer arithmetic over `Instant`, and a framework
+# would be a dependency that decides for us what "the number" is.
+[[bench]]
+name    = "ratio"
+harness = false
+test    = false

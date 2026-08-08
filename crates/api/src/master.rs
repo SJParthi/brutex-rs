@@ -22,6 +22,7 @@
 //! segment and instrument-type alphabets they belong with — one place to look
 //! when a vendor renames a column, rather than one per reader.
 
+use brutex_core::instrument::InstrumentKey;
 use brutex_core::isin::Isin;
 use brutex_core::vendor::{Decoded, Listing, MasterRow, Skip, Vendor, decode_master_row};
 use std::collections::{BTreeMap, HashMap};
@@ -32,6 +33,28 @@ pub struct Loaded {
     /// Rows that decoded into an instrument this engine stores, each with the
     /// vendor's ISIN beside its key.
     pub kept: Vec<Listing>,
+    /// Where each key sits in [`Self::kept`], so resolving one is a probe.
+    ///
+    /// # Why this is not a nicety
+    ///
+    /// The only way to find a listing was to walk `kept`. On the real Dhan
+    /// master that is a scan of every kept row, on a request path, to answer a
+    /// question `InstrumentKey` was built to answer in one step — its own
+    /// documentation says equality and hashing are structural "which is what
+    /// makes duplicate rejection a single probe rather than a scan", and
+    /// nothing was probing.
+    ///
+    /// `CLAUDE.md` §3 rule 4 is a PER-OPERATION bound, so it does not soften
+    /// because the constant happens to be small on today's universe. The index
+    /// costs one `usize` per listing and is built once at startup.
+    ///
+    /// A duplicate key keeps the FIRST listing and is counted in
+    /// [`Self::duplicate_keys`] rather than silently overwriting: two rows that
+    /// reduce to one key is a fact about the vendor's file, and picking one in
+    /// silence is how the wrong `securityId` would reach a request.
+    by_key: HashMap<InstrumentKey, usize>,
+    /// How many rows reduced to a key another row already held.
+    pub duplicate_keys: usize,
     /// Rows declined, counted by reason.
     pub skipped: HashMap<&'static str, usize>,
     /// Every declined row that carried a parseable ISIN, and why it was
@@ -64,6 +87,29 @@ pub struct Loaded {
 }
 
 impl Loaded {
+    /// The listing under a key, in one probe.
+    ///
+    /// This is the whole point of [`Self::by_key`]. Before it existed the only
+    /// way to answer "what is this instrument's vendor id" was to walk
+    /// [`Self::kept`] — a scan on a request path for a question
+    /// `InstrumentKey` was designed to answer in one step.
+    #[must_use]
+    pub fn listing(&self, key: &InstrumentKey) -> Option<&Listing> {
+        self.by_key.get(key).and_then(|at| self.kept.get(*at))
+    }
+
+    /// The vendor's own id for an instrument, in one probe.
+    ///
+    /// What a request actually needs: `securityId` for Dhan, `groww_symbol`
+    /// for Groww. Returns `None` when this vendor does not list it, which a
+    /// caller must refuse on rather than substitute — filing one broker's bars
+    /// under another's prefix is what `Feed::store_vendor` calls destroying
+    /// D-0019 irreversibly.
+    #[must_use]
+    pub fn vendor_id(&self, key: &InstrumentKey) -> Option<&brutex_core::vendor::VendorId> {
+        self.listing(key).map(|l| &l.vendor_id)
+    }
+
     /// Total rows declined.
     #[must_use]
     pub fn skipped_total(&self) -> usize {
@@ -102,6 +148,8 @@ impl Loaded {
 /// Locates the columns this decoder needs, by name.
 #[derive(Debug, Clone, Copy)]
 struct Columns {
+    /// Where the vendor writes its own instrument id.
+    vendor_id: usize,
     exchange: usize,
     segment: usize,
     underlying: usize,
@@ -137,6 +185,7 @@ impl Columns {
         };
         let names = vendor.master_columns();
         Ok(Self {
+            vendor_id: need(names.vendor_id)?,
             exchange: need(names.exchange)?,
             segment: need(names.segment)?,
             underlying: need(names.underlying)?,
@@ -272,6 +321,7 @@ pub fn load(path: &std::path::Path, vendor: Vendor) -> Result<Loaded, String> {
         }
         let get = |i: usize| -> &str { f.get(i).copied().unwrap_or("") };
         let row = MasterRow {
+            vendor_id: get(cols.vendor_id),
             exchange: get(cols.exchange),
             segment: get(cols.segment),
             underlying: get(cols.underlying),
@@ -284,7 +334,18 @@ pub fn load(path: &std::path::Path, vendor: Vendor) -> Result<Loaded, String> {
             option_side: cols.option_side.map_or("", get),
         };
         match decode_master_row(vendor, row) {
-            Ok(Decoded::Keep(l)) => out.kept.push(l),
+            Ok(Decoded::Keep(l)) => {
+                // The index is built as rows arrive rather than in a second
+                // pass, so `kept` and `by_key` cannot disagree about what is
+                // present.
+                match out.by_key.entry(l.key) {
+                    std::collections::hash_map::Entry::Occupied(_) => out.duplicate_keys += 1,
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        slot.insert(out.kept.len());
+                        out.kept.push(l);
+                    }
+                }
+            }
             // The reason text belongs to the Skip variant, in the crate that
             // owns it. A `match` here would need a wildcard -- Skip is
             // `#[non_exhaustive]` -- and a wildcard silently files every
@@ -319,7 +380,7 @@ mod tests {
     use std::io::Write as _;
 
     fn tmp(name: &str, body: &str) -> std::path::PathBuf {
-        let p = std::env::temp_dir().join(format!("brutex-master-{name}.csv"));
+        let p = crate::scratch::path(&format!("master-{name}.csv"));
         let mut f = std::fs::File::create(&p).expect("create");
         f.write_all(body.as_bytes()).expect("write");
         p
@@ -329,9 +390,10 @@ mod tests {
     fn columns_are_found_by_name_not_position() {
         // The columns are deliberately in a DIFFERENT order from the docs and
         // carry two undocumented trailing fields, exactly like the real file.
-        let body = "is_intraday,segment,exchange,instrument_type,trading_symbol,series,\
-                    isin,expiry_date,strike_price,underlying_symbol,internal_trading_symbol\n\
-                    0,CASH,NSE,IDX,NIFTY,,NIFTY,,,,x\n";
+        let body = "is_intraday,segment,exchange,instrument_type,groww_symbol,\
+                    trading_symbol,series,isin,expiry_date,strike_price,\
+                    underlying_symbol,internal_trading_symbol\n\
+                    0,CASH,NSE,IDX,NSE-NIFTY,NIFTY,,NIFTY,,,,x\n";
         let p = tmp("byname", body);
         let got = load(&p, Vendor::Groww).expect("loads");
         assert_eq!(got.kept.len(), 1);
@@ -343,7 +405,7 @@ mod tests {
 
     #[test]
     fn a_missing_column_is_refused_and_named() {
-        let p = tmp("missing", "exchange,segment\nNSE,CASH\n");
+        let p = tmp("missing", "exchange,segment,groww_symbol\nNSE,CASH,NSE-X\n");
         let err = load(&p, Vendor::Groww).expect_err("must refuse");
         // The FIRST missing column is named, whichever it is -- the point is
         // that it refuses and says which, never that it defaults.
@@ -361,6 +423,7 @@ mod tests {
         for vendor in [Vendor::Groww, Vendor::Dhan] {
             let c = vendor.master_columns();
             let mut all = vec![
+                c.vendor_id,
                 c.exchange,
                 c.segment,
                 c.underlying,
@@ -396,8 +459,7 @@ mod tests {
         // Each vendor spells them differently, and a file missing either is a
         // refusal that NAMES the column -- never a silent empty string, which
         // the decoder would report as thousands of routine skips.
-        let groww = "exchange,segment,underlying_symbol,trading_symbol,instrument_type,\
-                     expiry_date,strike_price";
+        let groww = "exchange,segment,underlying_symbol,trading_symbol,instrument_type,expiry_date,strike_price,groww_symbol";
         let err = load(&tmp("noseries", &format!("{groww},isin\n")), Vendor::Groww)
             .expect_err("must refuse");
         assert!(err.contains("\"series\""), "got {err}");
@@ -405,8 +467,7 @@ mod tests {
             .expect_err("must refuse");
         assert!(err.contains("\"isin\""), "got {err}");
 
-        let dhan = "EXCH_ID,SEGMENT,UNDERLYING_SYMBOL,SYMBOL_NAME,INSTRUMENT,\
-                    SM_EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE";
+        let dhan = "EXCH_ID,SEGMENT,UNDERLYING_SYMBOL,SYMBOL_NAME,INSTRUMENT,SM_EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE,SECURITY_ID";
         let err = load(&tmp("noclass", &format!("{dhan},ISIN\n")), Vendor::Dhan)
             .expect_err("must refuse");
         assert!(err.contains("\"SERIES\""), "got {err}");
@@ -420,8 +481,7 @@ mod tests {
         let err = load(
             &tmp(
                 "noside",
-                "EXCH_ID,SEGMENT,UNDERLYING_SYMBOL,SYMBOL_NAME,INSTRUMENT,SM_EXPIRY_DATE,\
-                 STRIKE_PRICE,ISIN,SERIES\n",
+                "EXCH_ID,SEGMENT,UNDERLYING_SYMBOL,SYMBOL_NAME,INSTRUMENT,SM_EXPIRY_DATE,STRIKE_PRICE,ISIN,SERIES,SECURITY_ID\n",
             ),
             Vendor::Dhan,
         )
@@ -433,8 +493,7 @@ mod tests {
             load(
                 &tmp(
                     "noinstrtype",
-                    "EXCH_ID,SEGMENT,UNDERLYING_SYMBOL,SYMBOL_NAME,INSTRUMENT,SM_EXPIRY_DATE,\
-                     STRIKE_PRICE,ISIN,SERIES,OPTION_TYPE\n",
+                    "EXCH_ID,SEGMENT,UNDERLYING_SYMBOL,SYMBOL_NAME,INSTRUMENT,SM_EXPIRY_DATE,STRIKE_PRICE,ISIN,SERIES,OPTION_TYPE,SECURITY_ID\n",
                 ),
                 Vendor::Dhan,
             )
@@ -449,10 +508,7 @@ mod tests {
         // resolved the ticker to the bond. Both lines are verbatim, and the
         // column the gate reads is SERIES -- `D1` for the NCD, `EQ` for the
         // share -- not the INSTRUMENT_TYPE beside it.
-        let body = "EXCH_ID,SEGMENT,ISIN,INSTRUMENT,UNDERLYING_SYMBOL,SYMBOL_NAME,\
-                    INSTRUMENT_TYPE,SERIES,SM_EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE\n\
-                    NSE,E,INE121A08PJ0,EQUITY,CHOLAFIN,CHOLAMANDALAM IN & FIN CO,DEB,D1,,,\n\
-                    NSE,E,INE121A01024,EQUITY,CHOLAFIN,CHOLAMANDALAM IN & FIN CO,ES,EQ,,,\n";
+        let body = "EXCH_ID,SEGMENT,ISIN,INSTRUMENT,UNDERLYING_SYMBOL,SYMBOL_NAME,INSTRUMENT_TYPE,SERIES,SM_EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE,SECURITY_ID\nNSE,E,INE121A08PJ0,EQUITY,CHOLAFIN,CHOLAMANDALAM IN & FIN CO,DEB,D1,,,,1333\nNSE,E,INE121A01024,EQUITY,CHOLAFIN,CHOLAMANDALAM IN & FIN CO,ES,EQ,,,,1333\n";
         let got = load(&tmp("cholafin", body), Vendor::Dhan).expect("loads");
         assert_eq!(got.kept.len(), 1, "only the share survives");
         assert_eq!(got.kept[0].key.underlying.as_str(), "CHOLAFIN");
@@ -475,11 +531,7 @@ mod tests {
     fn an_unrecognised_series_is_recorded_under_the_code_itself() {
         // A count under a shared label cannot distinguish "NSE minted a debt
         // series" from "the vendor renamed the equity series". The CODE can.
-        let body = "EXCH_ID,SEGMENT,ISIN,INSTRUMENT,UNDERLYING_SYMBOL,SYMBOL_NAME,\
-                    INSTRUMENT_TYPE,SERIES,SM_EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE\n\
-                    NSE,E,INE002A01018,EQUITY,RELIANCE,RELIANCE INDUSTRIES,ES,  EQX  ,,,\n\
-                    NSE,E,INE121A01024,EQUITY,CHOLAFIN,CHOLA,ES,EQX,,,\n\
-                    NSE,E,INE775A08105,EQUITY,MOTHERSON,MOTHERSON NCD,DEB,D1,,,\n";
+        let body = "EXCH_ID,SEGMENT,ISIN,INSTRUMENT,UNDERLYING_SYMBOL,SYMBOL_NAME,INSTRUMENT_TYPE,SERIES,SM_EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE,SECURITY_ID\nNSE,E,INE002A01018,EQUITY,RELIANCE,RELIANCE INDUSTRIES,ES,  EQX  ,,,,1333\nNSE,E,INE121A01024,EQUITY,CHOLAFIN,CHOLA,ES,EQX,,,,1333\nNSE,E,INE775A08105,EQUITY,MOTHERSON,MOTHERSON NCD,DEB,D1,,,,1333\n";
         let got = load(&tmp("unrecognised", body), Vendor::Dhan).expect("loads");
         assert_eq!(got.kept.len(), 0);
         assert_eq!(got.skipped.get("unrecognised listing class"), Some(&2));
@@ -495,10 +547,7 @@ mod tests {
         // where the gate declined a genuine share as routine business with
         // `0 unreadable` beside it. `Columns::locate` already refuses a
         // missing HEADER for this hazard; this is the same hazard per row.
-        let body = "exchange,segment,underlying_symbol,trading_symbol,instrument_type,\
-                    series,isin,expiry_date,strike_price\n\
-                    NSE,CASH,,RELIANCE,EQ\n\
-                    NSE,CASH,,CHOLAFIN,EQ,EQ,INE121A01024,,\n";
+        let body = "exchange,segment,underlying_symbol,trading_symbol,instrument_type,series,isin,expiry_date,strike_price,groww_symbol\nNSE,CASH,,RELIANCE,EQ\nNSE,CASH,,CHOLAFIN,EQ,EQ,INE121A01024,,,NSE-X\n";
         let got = load(&tmp("shortrow", body), Vendor::Groww).expect("loads");
         assert_eq!(got.kept.len(), 1, "only the intact row decodes");
         assert_eq!(got.errors.len(), 1);
@@ -524,11 +573,7 @@ mod tests {
         // operator was told `104 unreadable` and nothing else. `NIFTY 100` is
         // a real Dhan index ticker; a space is not a legal Symbol, and 104
         // rows of the real master are exactly that shape.
-        let body = "exchange,segment,underlying_symbol,trading_symbol,instrument_type,\
-                    series,isin,expiry_date,strike_price\n\
-                    NSE,CASH,,NIFTY 100,IDX,,NIFTY,,\n\
-                    NSE,CASH\n\
-                    NSE,CASH,,NIFTY 200,IDX,,NIFTY,,\n";
+        let body = "exchange,segment,underlying_symbol,trading_symbol,instrument_type,series,isin,expiry_date,strike_price,groww_symbol\nNSE,CASH,,NIFTY 100,IDX,,NIFTY,,,NSE-X\nNSE,CASH\nNSE,CASH,,NIFTY 200,IDX,,NIFTY,,,NSE-X\n";
         let got = load(&tmp("grouped", body), Vendor::Groww).expect("loads");
         let by = got.errors_by_reason();
         assert_eq!(by.len(), 2, "two distinct reasons: {by:?}");
@@ -552,7 +597,7 @@ mod tests {
 
     #[test]
     fn an_unreadable_or_empty_file_is_refused() {
-        let missing = std::env::temp_dir().join("brutex-does-not-exist.csv");
+        let missing = crate::scratch::path("does-not-exist.csv");
         assert!(load(&missing, Vendor::Groww).is_err());
         let p = tmp("empty", "");
         assert!(
@@ -562,7 +607,7 @@ mod tests {
         );
         // A file whose SIZE is fine but whose BYTES are not text. `metadata`
         // succeeds and the read is what fails, so both refusal arms are real.
-        let raw = std::env::temp_dir().join("brutex-master-notutf8.csv");
+        let raw = crate::scratch::path("master-notutf8.csv");
         std::fs::File::create(&raw)
             .expect("create")
             .write_all(&[0xFF, 0xFE, 0x00, 0x41])
@@ -580,7 +625,13 @@ mod tests {
         // Sparse: `set_len` allocates no blocks, so this costs no disk. The
         // file is never read -- the refusal happens before `read_to_string`,
         // which is exactly the property under test.
-        let p = std::env::temp_dir().join("brutex-master-toobig.csv");
+        //
+        // THE PATH CARRIES THIS PROCESS'S ID. It used to be one fixed name in
+        // the shared temporary directory, and the `remove_file` below then
+        // failed with NotFound about one run in three: a second process running
+        // the same test deleted the fixture while this one was inside the
+        // 256 MiB read. See `crate::scratch`.
+        let p = crate::scratch::path("master-toobig.csv");
         let f = std::fs::File::create(&p).expect("create");
         f.set_len(MAX_MASTER_BYTES + 1).expect("set_len");
         drop(f);
@@ -592,6 +643,8 @@ mod tests {
         );
         // Exactly at the bound is not over it.
         f_at_bound(&p);
+        // The cleanup is an ASSERTION, not housekeeping: this fixture is
+        // 256 MiB and nothing else may have removed it.
         std::fs::remove_file(&p).expect("cleanup");
     }
 
@@ -617,10 +670,7 @@ mod tests {
         // dropped, never truncated and read anyway.
         let long = "X".repeat(MAX_ROW_BYTES + 1);
         let body = format!(
-            "exchange,segment,underlying_symbol,trading_symbol,instrument_type,\
-             series,isin,expiry_date,strike_price\n\
-             NSE,CASH,,{long},EQ,EQ,INE002A01018,,\n\
-             NSE,CASH,,RELIANCE,EQ,EQ,INE002A01018,,\n"
+            "exchange,segment,underlying_symbol,trading_symbol,instrument_type,series,isin,expiry_date,strike_price,groww_symbol\nNSE,CASH,,{long},EQ,EQ,INE002A01018,,,NSE-X\nNSE,CASH,,RELIANCE,EQ,EQ,INE002A01018,,,NSE-X\n"
         );
         let got = load(&tmp("longrow", &body), Vendor::Groww).expect("loads");
         assert_eq!(got.kept.len(), 1, "the intact row still decodes");
@@ -640,9 +690,7 @@ mod tests {
         // and then never becomes the identity. It used to be KEPT.
         let wide = "X".repeat(brutex_core::vendor::MAX_FIELD_BYTES + 1);
         let body = format!(
-            "exchange,segment,underlying_symbol,trading_symbol,instrument_type,\
-             series,isin,expiry_date,strike_price\n\
-             NSE,CASH,RELIANCE,{wide},EQ,EQ,INE002A01018,,\n"
+            "exchange,segment,underlying_symbol,trading_symbol,instrument_type,series,isin,expiry_date,strike_price,groww_symbol\nNSE,CASH,RELIANCE,{wide},EQ,EQ,INE002A01018,,,NSE-X\n"
         );
         let got = load(&tmp("widefield", &body), Vendor::Groww).expect("loads");
         assert!(got.kept.is_empty(), "an over-wide row is never stored");
@@ -659,14 +707,7 @@ mod tests {
 
     #[test]
     fn skips_are_counted_by_reason_and_errors_keep_their_line_number() {
-        let body = "exchange,segment,underlying_symbol,trading_symbol,instrument_type,\
-                    series,isin,expiry_date,strike_price\n\
-                    BSE,CASH,,SENSEX,IDX,,,,\n\
-                    NSE,COMMODITY,GOLD,GOLD,FUT,,,2026-08-05,\n\
-                    NSE,FNO,031NSETEST,X,FUT,,,2036-11-27,\n\
-                    NSE,CASH,,SOMEBOND,EQ,N2,INE002A01018,,\n\
-                    NSE,CASH,,SOMESME,EQ,SM,INE002A01018,,\n\
-                    NSE,FNO,NIFTY,X,ZZ,,,2026-08-04,1\n";
+        let body = "exchange,segment,underlying_symbol,trading_symbol,instrument_type,series,isin,expiry_date,strike_price,groww_symbol\nBSE,CASH,,SENSEX,IDX,,,,,NSE-X\nNSE,COMMODITY,GOLD,GOLD,FUT,,,2026-08-05,,NSE-X\nNSE,FNO,031NSETEST,X,FUT,,,2036-11-27,,NSE-X\nNSE,CASH,,SOMEBOND,EQ,N2,INE002A01018,,,NSE-X\nNSE,CASH,,SOMESME,EQ,SM,INE002A01018,,,NSE-X\nNSE,FNO,NIFTY,X,ZZ,,,2026-08-04,1,NSE-X\n";
         let p = tmp("skips", body);
         let got = load(&p, Vendor::Groww).expect("loads");
         assert_eq!(got.kept.len(), 0);
@@ -693,9 +734,7 @@ mod tests {
 
     #[test]
     fn a_short_row_is_an_error_and_never_an_index_panic() {
-        let body = "exchange,segment,underlying_symbol,trading_symbol,instrument_type,\
-                    series,isin,expiry_date,strike_price\n\
-                    NSE,CASH\n";
+        let body = "exchange,segment,underlying_symbol,trading_symbol,instrument_type,series,isin,expiry_date,strike_price,groww_symbol\nNSE,CASH\n";
         let p = tmp("short", body);
         let got = load(&p, Vendor::Groww).expect("loads");
         // Too short to hold the columns -> an error naming the shortfall,
@@ -706,10 +745,7 @@ mod tests {
 
     #[test]
     fn dhan_columns_use_their_own_names() {
-        let body = "EXCH_ID,SEGMENT,SECURITY_ID,ISIN,INSTRUMENT,UNDERLYING_SYMBOL,\
-                    SYMBOL_NAME,SERIES,SM_EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE\n\
-                    NSE,I,13,NA,INDEX,NIFTY,NIFTY,NA,0001-01-01,,\n\
-                    NSE,D,1,,OPTIDX,NIFTY,NIFTY,,2026-08-04,19450.00000,CE\n";
+        let body = "EXCH_ID,SEGMENT,SECURITY_ID,ISIN,INSTRUMENT,UNDERLYING_SYMBOL,SYMBOL_NAME,SERIES,SM_EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE\nNSE,I,13,NA,INDEX,NIFTY,NIFTY,NA,0001-01-01,,\nNSE,D,1,,OPTIDX,NIFTY,NIFTY,,2026-08-04,19450.00000,CE\n";
         let p = tmp("dhan", body);
         let got = load(&p, Vendor::Dhan).expect("loads");
         // The INDEX row is kept. The OPTION row is a LIVE contract and is
@@ -730,11 +766,7 @@ mod tests {
 
     #[test]
     fn blank_lines_are_ignored() {
-        let body = "exchange,segment,underlying_symbol,trading_symbol,instrument_type,\
-                    series,isin,expiry_date,strike_price\n\
-                    \n\
-                    NSE,CASH,,NIFTY,IDX,,NIFTY,,\n\
-                    \n";
+        let body = "exchange,segment,underlying_symbol,trading_symbol,instrument_type,series,isin,expiry_date,strike_price,groww_symbol\n\nNSE,CASH,,NIFTY,IDX,,NIFTY,,,NSE-X\n\n";
         let p = tmp("blank", body);
         let got = load(&p, Vendor::Groww).expect("loads");
         assert_eq!(got.kept.len(), 1);

@@ -53,6 +53,34 @@ impl Vendor {
     /// Every vendor this engine reads, in path order.
     pub const ALL: [Self; 2] = [Self::Groww, Self::Dhan];
 
+    /// What this vendor's instrument master is called on disk.
+    ///
+    /// # Why the file name is a property of the vendor
+    ///
+    /// It was a hand-written list in `api::server::master_paths`:
+    ///
+    /// ```text
+    /// vec![(Vendor::Groww, dir.join("groww_instruments.csv")),
+    ///      (Vendor::Dhan,  dir.join("dhan_scrip.csv"))]
+    /// ```
+    ///
+    /// So adding a feed meant editing that function — and forgetting to meant a
+    /// vendor the engine knows about whose master is silently never read, which
+    /// reports as "this vendor lists nothing" rather than as the wiring bug it
+    /// is. A `match` on `Self` cannot be forgotten: a new variant is a compile
+    /// error until it names its file.
+    ///
+    /// Everything downstream already iterates [`Self::ALL`] — the census grid,
+    /// the merge, the ingest form, the coverage table. This was the one place
+    /// that did not, and it was the entry point.
+    #[must_use]
+    pub const fn master_file(self) -> &'static str {
+        match self {
+            Self::Groww => "groww_instruments.csv",
+            Self::Dhan => "dhan_scrip.csv",
+        }
+    }
+
     /// The path segment for this vendor.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -109,6 +137,109 @@ impl VendorSet {
     }
 }
 
+/// The longest vendor instrument id this build will hold, in bytes.
+///
+/// **Derived from the widest grammar either vendor uses, then checked against
+/// both live masters** rather than chosen:
+///
+/// | Part | Bytes | Measured on 2026-08-08 |
+/// |---|---|---|
+/// | exchange | 3 | `NSE`, `BSE` |
+/// | underlying | 10 | longest present |
+/// | expiry | 7 | `DDMmmYY`, e.g. `30Sep25` |
+/// | strike | 6 | longest present, `100000` |
+/// | side | 3 | `FUT`; `CE`/`PE` are shorter |
+/// | separators | 4 | |
+/// | **total** | **33** | longest id actually present: **32** |
+///
+/// 48 leaves room for a seven-digit strike and a longer underlying without
+/// being a number nobody can justify. Dhan's `SECURITY_ID` is at most 7 bytes
+/// and entirely numeric across all 204,819 rows, so it is far inside this.
+///
+/// [`crate::symbol::SYMBOL_CAPACITY`] is 24 and therefore **cannot** hold a
+/// Groww symbol — `NSE-NIFTYNXT50-25Aug26-100000-PE` is 32. That is why this is
+/// a separate type rather than a reuse.
+pub const VENDOR_ID_CAPACITY: usize = 48;
+
+const _: () = assert!(VENDOR_ID_CAPACITY >= 33, "the derived worst case");
+
+/// A vendor's own identifier for an instrument, inline and never heap-allocated.
+///
+/// Dhan calls it `SECURITY_ID` and it is a number; Groww calls it
+/// `groww_symbol` and it is `NSE-NIFTY-30Sep25-24650-CE`. Both are opaque here:
+/// this type carries bytes the vendor chose and hands them back unchanged,
+/// because the moment it parsed them it would own a grammar the vendor can
+/// change without telling anyone.
+///
+/// # Why this exists at all
+///
+/// Neither column was read. `Vendor::master_columns` declared ten names and
+/// neither `SECURITY_ID` nor `groww_symbol` was among them, so the decoder
+/// stepped over the id — column 3 of Dhan's file, on the way to column 5 — and
+/// dropped it. `groww_symbol` appeared nowhere in the workspace at all. Without
+/// it nothing can name an instrument to either vendor, which is why Dhan
+/// answers `DH-905 securityId is required`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VendorId {
+    bytes: [u8; VENDOR_ID_CAPACITY],
+    len: u8,
+}
+
+impl VendorId {
+    /// The id a vendor wrote down, or `None` if it is empty or too long.
+    ///
+    /// # Errors
+    ///
+    /// `None` for an empty id — a row with no id cannot be requested — and for
+    /// one past [`VENDOR_ID_CAPACITY`], which is a grammar this build has not
+    /// seen and must not silently truncate into a different instrument.
+    #[must_use]
+    pub fn new(raw: &str) -> Option<Self> {
+        let raw = raw.trim();
+        if raw.is_empty() || raw.len() > VENDOR_ID_CAPACITY {
+            return None;
+        }
+        let mut bytes = [0_u8; VENDOR_ID_CAPACITY];
+        // `get_mut` rather than an index: the guard above already bounds
+        // `raw.len()`, but a slice expression carries a panic this workspace
+        // denies, and a `?` that no input can take is cheaper than the lint
+        // exception it would otherwise need.
+        bytes.get_mut(..raw.len())?.copy_from_slice(raw.as_bytes());
+        // `len` fits while VENDOR_ID_CAPACITY <= 255, pinned below.
+        let Ok(len) = u8::try_from(raw.len()) else {
+            return None;
+        };
+        Some(Self { bytes, len })
+    }
+
+    /// The id, as the vendor wrote it.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        // Every byte came from a `&str` in `new`, so the prefix is valid UTF-8;
+        // and `len` is at most VENDOR_ID_CAPACITY, so the slice is in range.
+        // Both are expressed as fallible lookups rather than asserted, because
+        // an index expression carries a panic this workspace denies.
+        self.bytes
+            .get(..usize::from(self.len))
+            .and_then(|held| core::str::from_utf8(held).ok())
+            .unwrap_or("")
+    }
+}
+
+const _: () = assert!(VENDOR_ID_CAPACITY <= 255, "len is a u8");
+
+impl core::fmt::Debug for VendorId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "VendorId({:?})", self.as_str())
+    }
+}
+
+impl core::fmt::Display for VendorId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// One row of a vendor instrument master, already split into fields.
 ///
 /// Borrowed rather than owned: a master has hundreds of thousands of rows and
@@ -116,6 +247,9 @@ impl VendorSet {
 /// done to throw away.
 #[derive(Debug, Clone, Copy)]
 pub struct MasterRow<'a> {
+    /// The vendor's own id for this instrument — `SECURITY_ID` at Dhan,
+    /// `groww_symbol` at Groww. Opaque; see [`VendorId`].
+    pub vendor_id: &'a str,
     /// Exchange code, e.g. `NSE`.
     pub exchange: &'a str,
     /// Segment code, e.g. `CASH` or `FNO`.
@@ -172,7 +306,8 @@ impl MasterRow<'_> {
         // array would be built on every row -- ten pointer pairs written to the
         // stack to answer a question that is ten comparisons. Order follows the
         // struct.
-        let checks: [(&'static str, usize); 10] = [
+        let checks: [(&'static str, usize); 11] = [
+            ("vendor_id", self.vendor_id.len()),
             ("exchange", self.exchange.len()),
             ("segment", self.segment.len()),
             ("underlying", self.underlying.len()),
@@ -248,6 +383,8 @@ pub const MAX_FIELD_BYTES: usize = 64;
 /// column map is vendor knowledge, and vendor knowledge belongs here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MasterColumns {
+    /// Which column carries the vendor's own instrument id.
+    pub vendor_id: &'static str,
     /// Header of the exchange column.
     pub exchange: &'static str,
     /// Header of the segment column.
@@ -277,6 +414,12 @@ impl Vendor {
     pub const fn master_columns(self) -> MasterColumns {
         match self {
             Self::Groww => MasterColumns {
+                // The symbol Groww's own historical endpoints take:
+                // `NSE-NIFTY-30Sep25-24650-CE`. NOT `trading_symbol`, which is
+                // the SAME instrument spelled `NIFTY25SEP24650CE` on the same
+                // row — two encodings per row, and only this one is accepted
+                // by /v1/historical/candles.
+                vendor_id: "groww_symbol",
                 exchange: "exchange",
                 segment: "segment",
                 underlying: "underlying_symbol",
@@ -289,6 +432,10 @@ impl Vendor {
                 option_side: None,
             },
             Self::Dhan => MasterColumns {
+                // What `securityId` on every Dhan request body must be. Column
+                // 3 of the file, which the decoder used to step over on its way
+                // to INSTRUMENT at column 5.
+                vendor_id: "SECURITY_ID",
                 exchange: "EXCH_ID",
                 segment: "SEGMENT",
                 underlying: "UNDERLYING_SYMBOL",
@@ -316,6 +463,11 @@ impl Vendor {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Skip {
+    /// The vendor left its own id blank, or wrote one longer than
+    /// [`VENDOR_ID_CAPACITY`]. Either way the instrument cannot be named back
+    /// to them, so it is declined rather than carried: a listing nothing can
+    /// request is one every later lookup finds and no pull can use.
+    NoVendorId,
     /// Not an exchange this engine stores. `docs/05-decisions.md` D-0017.
     ForeignExchange,
     /// An exchange test instrument, not a real listing.
@@ -416,6 +568,7 @@ impl Skip {
     #[must_use]
     pub const fn reason(self) -> &'static str {
         match self {
+            Self::NoVendorId => "no vendor id on the row",
             Self::ForeignExchange => "foreign exchange",
             Self::TestInstrument => "exchange test instrument",
             Self::ForeignSegment => "segment not stored",
@@ -465,6 +618,10 @@ impl Skip {
 /// and move as the key alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Listing {
+    /// The vendor's own id for this instrument, carried through so a request
+    /// can name it. Without this nothing reaches either broker — see
+    /// [`VendorId`].
+    pub vendor_id: VendorId,
     /// The canonical identity, from the columns the vendor actually fills.
     pub key: InstrumentKey,
     /// The vendor's ISIN for this row, when it has one. `None` for an index,
@@ -899,7 +1056,14 @@ pub fn decode_master_row(vendor: Vendor, row: MasterRow<'_>) -> Result<Decoded, 
         _ => None,
     };
 
+    let Some(vendor_id) = VendorId::new(row.vendor_id) else {
+        // A row with no usable id cannot be requested from the vendor, so it is
+        // DECLINED rather than kept: keeping it would put an instrument in the
+        // index that every later lookup would find and no pull could name.
+        return declined(Skip::NoVendorId);
+    };
     Ok(Decoded::Keep(Listing {
+        vendor_id,
         key,
         isin,
         unsuffixed: unsuffixed_key(key, name, row.listing_class)?,
@@ -1023,6 +1187,7 @@ mod tests {
         strike: &'a str,
     ) -> MasterRow<'a> {
         MasterRow {
+            vendor_id: "1333",
             exchange,
             segment,
             underlying,
@@ -1182,6 +1347,7 @@ mod tests {
         // the underlying -- a col-3 value fed into the col-10 field -- so a
         // total decode failure on the engine's primary instrument was green.
         let real = MasterRow {
+            vendor_id: "1333",
             exchange: "NSE",
             segment: "CASH",
             underlying: "", // <-- exactly as the file has it
@@ -1210,6 +1376,7 @@ mod tests {
         // is what let 200,460 Dhan rows disappear while reporting a routine
         // skip. A mapping bug must never look like a legitimate refusal.
         let bad_segment = MasterRow {
+            vendor_id: "1333",
             exchange: "NSE",
             segment: "Z",
             underlying: "NIFTY",
@@ -1225,6 +1392,7 @@ mod tests {
         // Groww's letters are not Dhan's, and vice versa.
         assert!(groww(bad_segment).is_err());
         let dhan_shaped_at_groww = MasterRow {
+            vendor_id: "1333",
             segment: "I",
             ..bad_segment
         };
@@ -1234,6 +1402,7 @@ mod tests {
         );
 
         let bad_type = MasterRow {
+            vendor_id: "1333",
             segment: "D",
             instrument_type: "DBT",
             ..bad_segment
@@ -1244,6 +1413,7 @@ mod tests {
     #[test]
     fn currency_and_commodity_are_declined_not_stored() {
         let cur = MasterRow {
+            vendor_id: "1333",
             exchange: "NSE",
             segment: "C",
             underlying: "USDINR",
@@ -1266,6 +1436,7 @@ mod tests {
         // Currency derivatives are a recognised type this engine does not
         // store -- distinct from an unrecognised code, which is an error.
         let cur = MasterRow {
+            vendor_id: "1333",
             exchange: "NSE",
             segment: "D",
             underlying: "USDINR",
@@ -1303,6 +1474,7 @@ mod tests {
         // Dhan's spellings too.
         for ty in ["FUTIDX", "FUTSTK", "OPTIDX", "OPTSTK"] {
             let r = MasterRow {
+                vendor_id: "1333",
                 exchange: "NSE",
                 segment: "D",
                 underlying: "NIFTY",
@@ -1329,6 +1501,7 @@ mod tests {
         // must be loud -- an option whose side we cannot read is not an option
         // we can store.
         let opt = |side| MasterRow {
+            vendor_id: "1333",
             exchange: "NSE",
             segment: "D",
             underlying: "NIFTY",
@@ -1376,6 +1549,7 @@ mod tests {
 
         let nifty = kept(
             groww(MasterRow {
+                vendor_id: "1333",
                 exchange: "NSE",
                 segment: "CASH",
                 underlying: "",
@@ -1396,6 +1570,7 @@ mod tests {
             decode_master_row(
                 Vendor::Dhan,
                 MasterRow {
+                    vendor_id: "1333",
                     exchange: "NSE",
                     segment: "E",
                     underlying: "RELIANCE",
@@ -1425,6 +1600,7 @@ mod tests {
     /// and the only column this gate reads. D-0025.
     fn dhan_cash<'a>(ticker: &'a str, series: &'a str, isin: &'a str) -> MasterRow<'a> {
         MasterRow {
+            vendor_id: "1333",
             exchange: "NSE",
             segment: "E",
             underlying: ticker,
@@ -1441,6 +1617,7 @@ mod tests {
     /// A Groww `CASH`/`EQ` row on a given NSE series.
     fn groww_cash<'a>(ticker: &'a str, series: &'a str, isin: &'a str) -> MasterRow<'a> {
         MasterRow {
+            vendor_id: "1333",
             underlying: "",
             trading_symbol: ticker,
             listing_class: series,
@@ -1672,6 +1849,7 @@ mod tests {
         // ranks over.
         for series in ["EQ", "BE"] {
             let r = MasterRow {
+                vendor_id: "1333",
                 listing_class: series,
                 ..row("NSE", "CASH", "RELIANCE", "EQ", "", "")
             };
@@ -1735,6 +1913,7 @@ mod tests {
         // which is every instrument the engine exists to sweep.
         for sym in ["NIFTY", "BANKNIFTY"] {
             let g = MasterRow {
+                vendor_id: "1333",
                 underlying: "",
                 trading_symbol: sym,
                 listing_class: "",
@@ -1746,6 +1925,7 @@ mod tests {
             assert_eq!(gl.isin, None, "an index has no ISIN, and none is invented");
 
             let d = MasterRow {
+                vendor_id: "1333",
                 exchange: "NSE",
                 segment: "I",
                 underlying: sym,
@@ -1771,6 +1951,7 @@ mod tests {
         // A live derivative carries no series either. It is declined for being
         // live, and the reason must say so rather than saying "not equity".
         let r = MasterRow {
+            vendor_id: "1333",
             listing_class: "",
             isin: "",
             ..row("NSE", "FNO", "NIFTY", "FUT", "2026-08-04", "")
@@ -1788,6 +1969,7 @@ mod tests {
         // missing or malformed value means the row is not what it claims.
         for bad in ["", "NA", "INE002A01019", "INE002A0101"] {
             let r = MasterRow {
+                vendor_id: "1333",
                 isin: bad,
                 ..row("NSE", "CASH", "RELIANCE", "EQ", "", "")
             };
@@ -1826,6 +2008,7 @@ mod tests {
         // does not adopt it, because only a second vendor's ISIN can confirm
         // that BLUECHIP-BE and BLUECHIP are one instrument.
         let r = MasterRow {
+            vendor_id: "1333",
             underlying: "",
             trading_symbol: "BLUECHIP-BE",
             listing_class: "BE",
@@ -1856,6 +2039,7 @@ mod tests {
             ("LOWVOL-EQ", "BE"),
         ] {
             let r = MasterRow {
+                vendor_id: "1333",
                 underlying: "",
                 trading_symbol: ticker,
                 listing_class: series,
@@ -1872,6 +2056,7 @@ mod tests {
     #[test]
     fn stripping_to_nothing_is_an_error_rather_than_a_silent_no_op() {
         let r = MasterRow {
+            vendor_id: "1333",
             underlying: "",
             trading_symbol: "-EQ",
             listing_class: "EQ",
@@ -1886,6 +2071,7 @@ mod tests {
         // candidate to offer -- even when its ticker happens to end in a dash
         // and a word.
         let r = MasterRow {
+            vendor_id: "1333",
             underlying: "",
             trading_symbol: "NIFTY-IDX",
             listing_class: "IDX",
@@ -1992,6 +2178,7 @@ mod tests {
     /// field that is scanned but never becomes the identity.
     fn wide_row<'a>(field: &str, wide: &'a str) -> MasterRow<'a> {
         let mut r = MasterRow {
+            vendor_id: "1333",
             exchange: "NSE",
             segment: "CASH",
             underlying: "RELIANCE",

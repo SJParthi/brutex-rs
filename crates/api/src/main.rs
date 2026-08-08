@@ -9,6 +9,13 @@
 //!
 //! Usage: `api [serve [ADDR] | report]`.
 
+// A BINARY IS ITS OWN CRATE ROOT, which is exactly why this was missing.
+// `lib.rs` carries the attribute and it does not reach here: `main.rs` is
+// compiled as a separate root, so `crates/api` had one root forbidding unsafe
+// and one that did not. CI gate 16 checks every root for this reason — the
+// omission is invisible from the library side and costs nothing to state.
+#![forbid(unsafe_code)]
+
 /// Serves, or reports, and returns the exit code the operator's shell reads.
 ///
 /// The shutdown signal is passed IN rather than installed inside the server,

@@ -1,0 +1,79 @@
+[package]
+name         = "pull"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+publish      = { workspace = true }
+description  = "Vendor ingest: the credential path configuration, the read-only secret source, and the per-vendor manifest."
+
+# docs/01-architecture.md gives `pull` exactly `core` and `store`. Both are
+# taken, and nothing else is.
+#
+# THERE IS NO AWS SDK DEPENDENCY IN THIS CHANGE, and that is a decision rather
+# than an omission. `aws-config` and `aws-sdk-ssm` sit in the workspace
+# dependency table unused. Taking them here would add roughly a hundred
+# transitive crates to `Cargo.lock` for a change that makes no live call, and CI
+# gate 3 (`cargo deny check`) would then be verifying a licence and advisory
+# surface that nothing in this repository exercises. `src/secret.rs` defines the
+# port the SDK plugs into — one method, `get_parameter` — so the adapter that
+# takes the dependency is a single `impl` block in the change that first makes a
+# live call. See docs/05-decisions.md D-0035.
+[dependencies]
+# The lib target is `brutex_core` and it MUST be referred to by that name: a
+# dependency key of `core` shadows the sysroot crate inside rustdoc's generated
+# doc-test harness. Proven three times now -- in core itself, in store, and the
+# reason this line is spelled the way it is.
+brutex_core = { path = "../core", package = "core", version = "0.1.0" }
+
+# A version is required alongside the path: deny.toml sets wildcards = "deny",
+# and a path dependency with no version IS a wildcard.
+#
+# Taken for `store::crc` and for `store::path::{Timeframe, YearMonth}`. The
+# manifest reuses the bar file's checksum, its two-slot header geometry and its
+# commit-counter argument rather than paraphrasing them -- see
+# `src/manifest.rs`, which also names the one thing it deliberately does not
+# reuse.
+store = { path = "../store", version = "0.1.0" }
+
+# THE SOCKET. Taken now and not before, because until this change nothing in
+# this crate could reach a vendor: `pull::fetch::BarSource` had exactly one
+# implementor and it answered from memory. `default-features = false` with
+# `rustls-tls` keeps OpenSSL and its C toolchain out — CLAUDE.md section 2
+# bans a vendored binding to another language, and CI gate 13 walks Cargo.lock
+# for exactly that.
+reqwest = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+
+# THE CREDENTIAL READ, IN RUST AND NOTHING ELSE.
+#
+# `aws-sdk-ssm` was tried first and refused, on measurement rather than taste.
+# It reaches rustls through `aws-smithy-http-client`, which hard-enables the
+# `aws-lc-rs` backend, which vendors `aws-lc-sys` — a C library. Cargo features
+# are additive, so no `default-features = false` downstream can switch it off.
+# The tree went **145 crates to 232**, and `aws-lc-sys` appeared in the lock:
+# 87 extra crates AND the exact shape `CLAUDE.md` §2 bans, which CI gate 13
+# walks `Cargo.lock` to catch.
+#
+# The AWS *API* needs none of it. `GetParameter` is one HTTPS POST carrying a
+# SigV4 signature, and SigV4 is HMAC-SHA256 over a canonical string. `reqwest`
+# is already here for the broker; these two are pure-Rust RustCrypto crates
+# with no `asm` feature. Two crates instead of eighty-seven, and not one line
+# of C. See `src/ssm.rs` and D-0051.
+hmac = { workspace = true }
+sha2 = { workspace = true }
+
+[lints]
+workspace = true
+
+# ---------------------------------------------------------------------------
+# GATE 8 — the O(1) ratio harness. `harness = false` so it is a plain binary
+# with no benchmarking framework and therefore no dependency; `test = false`
+# because `cargo test` must not run a timing loop, and the coverage gate must
+# not measure one. See D-0034 and crates/core/Cargo.toml.
+# ---------------------------------------------------------------------------
+[[bench]]
+name    = "ratio"
+harness = false
+test    = false

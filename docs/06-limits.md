@@ -443,3 +443,1858 @@ field measured 28 bytes across 333,840 rows of real data. If a vendor
 legitimately grows past 64, this refuses real rows — loudly, naming the field
 and the length, which is the intended failure. It is a number to revisit, not a
 law.
+
+---
+
+## 16. The pasted-secret check is a backstop, not a detector
+
+D-0035. `pull::config::check_segment` refuses a path segment that is 24 or more
+undelimited alphanumerics containing at least one digit. Three things that is
+not.
+
+**It is not a proof about entropy.** It is a rule about a *shape*: names people
+choose are short, or they carry a `-` or a `_`. A secret that happens to be
+short, lower case, alphanumeric and delimited — `ab-12` — passes it, and would
+also pass a human reading the file.
+
+**It is not what does the work.** The length bound (32 bytes) and the byte set
+(`[a-z0-9_-]`, upper case refused separately) are. Every credential shape this
+repository has had in front of it is refused by one of those first: an AWS
+access key by its upper case, a JWT by its `.`, a base64 blob by its `+` or `/`,
+an opaque bearer token by its length. `pull::unit::credential_config_rejects_secret_value`
+drives all four. The backstop exists for the residue.
+
+**It cannot see a secret that is a legal segment.** If an operator's real path
+segment and their real credential were both `k7f2p9q1w8e3-5t6y0u4i2o9`, nothing
+here would tell them apart, and nothing could. The control that actually holds
+is `CLAUDE.md` §8: the value is read from Parameter Store and from nowhere else,
+and the configuration file carries paths only. This check makes the commonest
+mistake loud; it does not make the file safe to put a secret in.
+
+---
+
+## 17. What the manifest makes O(1), and what it does not
+
+D-0035, layer 13 of `docs/07-o1-architecture.md`.
+
+**O(1), and measured.** "How many entries / distinct months / rows does this
+vendor hold" is a field read of the manifest header —
+`pull::bench::census_beats_the_scan_it_replaces` measured it at **193,449×** and
+**402,568×** on two runs of the same tree, against re-deriving the same number
+from 10,000 entries in the same process on an Apple M4 Pro. "What do I hold for
+this month" is one hash probe into a map reserved from the committed entry
+count, flat to within 1.05× at 100× the census
+(`pull::bench::entry_lookup_is_flat`).
+
+**The cause of the C-11 spread is NOT established, and D-0035 said it was.**
+That entry, and this section, and `docs/07-o1-architecture.md` all read "a field
+read sits at the clock's resolution floor, so its measured picoseconds move by a
+factor of two between runs". The harness now measures the clock and prints it,
+and the explanation does not survive the measurement: the smallest non-zero
+interval `Instant` reports on this host is **41 ns**, and the counter side is
+averaged over 100,000 repetitions, so one clock tick is **410 femtoseconds** of
+reported cost — and the 789 ps observation is **1,924 ticks**, not one. Whatever
+moves the counter side between runs, it is not the resolution of the clock. What
+is recorded is therefore the observation alone: the counter side has been seen
+at 378 ps, 604 ps and 789 ps across runs of the same tree while the scan side
+holds at ~152 µs (180 µs on the run that produced the 41 ns figure, on a
+debug-symbol release build).
+The gate asserts 100×, three orders of magnitude below the worst observation, so
+it detects a regression rather than reporting a scheduler — and that argument
+never needed the explanation that was attached to it. D-0036.
+
+**NOT O(1), and not claimed to be.**
+
+*A filtered census.* "How many expired option series" walks the manifest's own
+entries. That is a sequential read of one file instead of ~248,000 directory
+operations, which is the difference the layer is about — but it is O(entries).
+Making it a read means a per-segment counter in the header, which is a **new
+field at a new format version**, never a dynamic schema (`CLAUDE.md` §4).
+
+*The load.* `Manifest::load` decodes and checksum-verifies every committed
+entry, recomputes the distinct-key count and the row total, and refuses a header
+that disagrees with them. That is O(entries) by construction and it is the price
+of the counter being trustworthy afterwards. It is paid once per process.
+
+*The directory walk itself.* The alternative the manifest replaces —
+`stat` on every bar file — has **never been measured here.** It depends on a
+filesystem, a page cache and a device the bench harness does not control, and
+timing it would report the state of one machine's cache rather than a property
+of the code. Every statement in this repository about that saving is an
+**EXTRAPOLATION** from the in-memory entry scan, and is labelled one.
+
+*The writer's index.* A manifest built from a genesis header reserves nothing,
+because nothing is yet known to reserve from, so its map grows as the first keys
+are recorded. Layer 3's no-rehash guarantee is about the **loaded** index — the
+one a query touches — and it holds there because the reservation comes from the
+committed entry count. The writer pays one rehash per doubling, once, on a path
+that is already doing I/O. Until D-0036 the C-12 bench measured the *writer's*
+map and three documents credited the result to the loaded one's reservation;
+the bench now round-trips its census through `Manifest::load`, and
+`pull::unit::the_loaded_index_is_reserved_from_the_census` asserts where the
+reservation comes from as a number.
+
+**The census can drift from the bar files, in both directions, and nothing here
+detects it.** `Manifest::load` checks the header against *this file's own
+entries* and against nothing else. `bars/` is never consulted. So:
+
+- an entry claiming 999,999,999 rows for a month with no bar file anywhere loads
+  clean, and `total_rows()` returns that number as fact;
+- a pull that writes a bar file and crashes before the manifest append leaves
+  the census permanently short;
+- a bar file deleted afterwards leaves it permanently long.
+
+No API in `crates/pull` can notice any of the three, and none is a bug in the
+manifest: the manifest is a record of what a writer *said* it wrote, and the
+only thing that could confirm it is a reconciliation pass over `bars/` — which
+is exactly the ~248,000-operation directory walk layer 13 exists to avoid. A
+reconciliation entry point is **not built**. If one is ever added it is a
+deliberate, occasional, O(files) operation with its own invariant row, and it
+does not belong on the load path. Recorded here rather than left implied, which
+is what this file is for.
+
+**Unmeasured: `x86_64`.** Every number above is aarch64. CI runs on `x86_64` and
+the ratios are asserted there against the shared-hardware ceiling, but the
+absolute picoseconds on that host have never been recorded here.
+
+---
+
+## 18. What CI cannot prove about a credential path
+
+D-0036. `CLAUDE.md` §8 says `crates/pull` "holds no `org`, `env`, or `vendor`
+literal", and X-08 used to be recorded as proven by CI gate 1c. It is not, and
+here is exactly what the two gates do and do not see.
+
+**Gate 1c sees a joined path with a well-known environment name.** Its pattern
+is `/<segment>/(prod|production|dev|development|stage|staging|uat|qa|sandbox|
+live)/`. A synthetic source file containing `const ORG: &str = "<the real org>";`
+and `const ENV_SEGMENT: &str = "<the real env>";` on two lines was run past that
+exact regex and **did not match**. Adding a third line with the joined path did
+match. So gate 1c catches the paste of a whole path; it does not catch a bare
+segment, and it does not catch a joined path whose environment segment is
+outside its ten-word alphabet.
+
+**Gate 1d is the compensating check, and only for `crates/pull`.** Every
+double-quoted literal under that crate which could *be* a segment — lower case,
+`[a-z0-9_-]`, at most `MAX_SEGMENT_LEN` — must appear in an allowlist in the
+workflow. That turns "every segment written down here is invented" from a
+comment into a check, and makes adding one a deliberate act. It says nothing
+about the rest of the repository.
+
+**What neither can do is know the operator's real segments**, because the file
+that holds them is untracked and a CI runner has never seen it. That check is a
+local one, and D-0036 ran it: of the four segment roles, `org` appears in no
+tracked file, `env` appears in one (inside gate 1c's own alphabet in
+`ci.yml`), the region appears in five and is published by `CLAUDE.md` itself,
+each vendor **path** segment appears in eleven and thirteen tracked files
+because the operator set it to the broker's public name, and the field names
+appear in two documents each, which §8 expressly permits.
+
+**So the residual is operator-side and is stated as such.** The `vendor` key
+exists so that a deployment *can* keep its vendor path segment out of a public
+tree. In this deployment that separation is available and is not taken. Nothing
+in this repository can change that, and nothing in this repository will pretend
+to have checked it on a runner.
+
+---
+
+## 19. The secret port cannot tell ciphertext from a credential
+
+D-0036. `SsmSecretSource::read` always passes `with_decryption: true`, and it
+has **no** check that what came back is not the ciphertext of a `SecureString`.
+
+There was a `SecretError::NotDecrypted` variant documented as exactly that
+check — "reported rather than passed through … a vendor would reject it as a bad
+credential and the pull would spend its retries on the wrong problem" — and
+nothing in `crates/pull/src` ever constructed it. A doc comment describing a
+protection nobody wrote is worse than no protection, so the variant is gone.
+
+**What that leaves.** If a `ParameterStore` implementation ever returns
+ciphertext, `read` wraps it in a `Secret`, the vendor rejects it,
+`reread_after_rejection` reads the same ciphertext again, and the pull halts
+with `CredentialHalt::DeadToken` — "the vendor rejected this credential and the
+re-read returned the same value; it is dead and nothing here mints one". That is
+loud, and it names the wrong cause. `CLAUDE.md` §4 is about not failing
+silently; this fails noisily with a wrong diagnosis, which is a smaller fault
+and is written down rather than left to be discovered.
+
+**Why it is not fixed instead.** Recognising a KMS blob means knowing its
+prefix and its length, which is an external fact about a vendor's format, and
+`CLAUDE.md` §3 rule 1 permits no claim about a vendor that is not traceable to a
+source recorded in `docs/00-charter.md`. There is no such source. The change
+that first makes a live call is the change that can record one, and until then
+this is a limit rather than an invention.
+
+---
+
+## 21. What the rate governor does not bound, and what was not measured
+
+D-0037. Numbered §21 rather than §20 because `crates/pull/src/session.rs`
+already points at §20 for the session-window filter, and a cross-reference that
+lands on the wrong section is worse than a gap in the numbering.
+
+### The bucket admits a burst, and the burst is the allowance
+
+`pull::rate::Window` is a token bucket, not an exact sliding window. The
+guarantee it gives is the standard one: over any interval of length `T` it
+admits at most `capacity + rate·T`, where `capacity` is the current allowance
+and `rate` is that allowance per span. So the **long-run** rate never exceeds
+the allowance per window, and a caller that has been idle can spend a full
+bucket at one instant and then earn at the sustained rate.
+
+Concretely, at five per second a caller that has been quiet for a second may
+issue five requests in one microsecond, and if it then keeps issuing it will see
+at most five in any second thereafter. A vendor enforcing an *exact* count over
+a trailing one-second window would see up to ten in the second that straddles
+that burst.
+
+**This is not fixed, and the alternative is worse.** An exact sliding window
+must remember when each request in the window happened — O(c) timestamps for a
+ceiling of `c`, which for the 100,000-per-day window is a 100,000-element ring
+whose size is set by the vendor's number rather than by anything this code
+chooses. `docs/07-o1-architecture.md` law 5 and `CLAUDE.md` §3 rule 4 both point
+the other way. The burst is bounded, it is bounded by a number the governor
+already backs off, and it is written here rather than left to be discovered.
+
+### A `429` is attributed to no span, so every span backs off
+
+A vendor's throttle response says the caller was over budget. It does not say
+over *which* budget, and `CLAUDE.md` §3 rule 1 permits no invented vendor fact
+to guess with. `Governor::record_throttled` therefore halves every live span and
+drains every bucket. That is conservative in the safe direction, and its cost is
+bounded — the short spans earn their allowance back fastest — but a pull that is
+refused for its daily quota does briefly run slower per second than it needed
+to. Reading a `Retry-After` header or a vendor error code would fix it, and both
+are external facts that `docs/00-charter.md` does not record for either vendor.
+The change that first makes a live call is the change that can record one.
+
+### The primary vendor's figures disagree with an operator's
+
+`docs/00-charter.md` §4 records **500 requests per minute** for the primary
+vendor, lane *operator-confirmed, not published*, and records the per-second cap
+as **UNVERIFIED** with the note that the published 10/s applies to a different
+endpoint group and the 8/s production ceiling was *chosen, not measured*.
+
+An operator separately supplied **10/s and 300/minute** for the same vendor. The
+two per-minute figures differ by 40 %. `pull::rate` carries the charter's
+numbers, because the charter is this repository's authority on external facts
+and a constant in a module is not a source. **Which of the two is right is
+unresolved**, and until it is resolved by a vendor document recorded in the
+charter, the governor's per-minute ceiling may be 67 % higher than the vendor
+honours. That is exactly the case the AIMD back-off exists to absorb — the
+allowance halves on the first refusal and converges downward — but absorbing an
+error is not the same as not having one.
+
+The claim that the two endpoint groups' budgets are genuinely **disjoint** —
+which is what `RequestKind` models — rests on one clause of one charter row. It
+is a reasonable reading and it is not a measurement. If the pools are in fact
+shared, the governor permits up to twice the intended rate across the two kinds
+until the first `429`.
+
+### Nothing here is measured against a live vendor
+
+No number in `pull::rate` came from watching a vendor accept or refuse a
+request. The convergence test drives a simulated vendor that honours three per
+second, which proves the *arithmetic* converges and proves nothing about what
+either broker does. Until a live call is made, "the rate the vendor actually
+honours" is a property the code is built to find, not one it has found.
+
+### Two gates in `CLAUDE.md` §9 were not run for this change
+
+Stated plainly rather than left implied:
+
+- **`cargo-mutants` was not run** on `crates/pull/src/rate.rs`. D-0036 ran it
+  across the crate and fixed seven exact-limit survivors; the boundaries this
+  module declares (`MAX_CEILING`, the ceiling-of-zero refusal, the allowance
+  floor of one, the `div_ceil` wait) are each asserted at the limit and one past
+  it by `P-24`, `P-25`, `P-27` and `P-32` for that reason, but no mutant run has
+  confirmed it. `X-07` stays `◐`.
+- **Coverage was not measured** on the new module. Every public item and every
+  branch has a test written against it by inspection, which is not the same
+  statement.
+
+Both are re-runs against a finished tree rather than new work, and neither is
+claimed to have passed.
+
+### `P-01` is not proven, and is not claimed to be
+
+`P-01` — "a rate governor never issues above the configured ceiling, **under any
+concurrency**" — keeps its `—`. `Governor` takes `&mut self` and holds no
+interior mutability, so it cannot be shared across tasks without a lock, and
+this crate supplies none. The `pull::loom::governor_ceiling` test named beside
+that row does not exist. What `P-20` through `P-35` prove is the single-caller
+arithmetic; the concurrency claim arrives with the wrapper that needs it.
+
+---
+
+## 22. `crates/store` has no mutation measurement — five mutants is not a survey
+
+`CLAUDE.md` §9 requires *"no surviving mutant on touched modules"*. D-0039
+brought `crates/store/src/format.rs` from 56.12 % to 100 % line coverage and
+from 50.51 % to 100 % region coverage, and confirmed that five hand-planted
+mutants each fail the suite:
+
+| Mutant | Outcome |
+|---|---|
+| `Bar::image` body → `[0u8; 56]` | `cargo test -p store` exit 101 |
+| `close` encoded `to_be_bytes` | exit 101 |
+| `high`/`low` offsets swapped | exit 101 |
+| the `RecordTooShort` guard made unreachable | exit 101 |
+| `RECORDS_PER_BLOCK` 73 → 72; `BLOCK_LEN` 4088 → 4096 | compile error |
+
+**That is five points, chosen by the person who wrote the tests.**
+`cargo-mutants` has never been run over `crates/store`, so the number of
+surviving mutants in `format.rs`, `header.rs`, `layout.rs`, `path.rs`,
+`block.rs` and `crc.rs` is unknown. It is not zero because nobody has counted
+it; it is unknown.
+
+The fifth row is worth separating from the other four: a mutation to the
+geometry constants cannot be *survived* or *killed* by a test, because it does
+not compile. That is stronger than a passing test, and it is also the reason
+`cargo-mutants` would report those constants as unmutatable rather than as
+covered.
+
+**What would close this:** `cargo-mutants` run over `crates/store` with the
+version pinned, the way `cargo-deny` and `cargo-llvm-cov` are pinned in
+`.github/workflows/ci.yml` — an unpinned mutation tool has the same defect
+D-0034 fixed for the other two, a verdict that can change with no commit.
+`docs/04-invariants.md` X-07 already names `crates/pull` as the only crate
+where mutation has been measured, and it is not widened here.
+
+### And the 100 % is line and region coverage, not branch coverage
+
+`cargo llvm-cov` reports `-` in its branch column for this workspace. That is
+unchanged by D-0039 and is already recorded — see D-0030 and X-06. A line that
+executes is not a line whose every outcome was taken, and no row claims it was.
+
+---
+
+## 23. The manifest append is amortised O(1), not O(1) worst case, and until D-0040 the code claimed otherwise
+
+`CLAUDE.md` §3 rule 4 lists **result append** among the five operations that
+must cost the same however much is held. `crates/pull/src/manifest.rs` carried a
+doc comment saying the loaded index *"never rehashes … O(1) **worst case**
+rather than average"*. That sentence was true of the lookup path and false of
+the append path, and **no bench in the repository touched the append path at
+all**, which is the reason it stood for two changes.
+
+### What was actually happening, measured
+
+`HashMap::with_capacity(n)` rounds `n` up to `7·2^k`. For most `n` the rounding
+leaves spare slots; for `n = 7·2^k` **exactly** it leaves none. The reservation
+was exactly `n_valid`, so a census landing on one of those counts produced a
+table with zero free slots and the next new month rebuilt all of it.
+
+`pull::bench::append_after_load_is_flat` (C-13), 256 new months appended to a
+freshly loaded census, minimum of twelve reloads, Apple M4 Pro, picoseconds per
+append:
+
+| census | reserved before | ps/append before | reserved after | ps/append after |
+|---|---|---|---|---|
+| 1,792 = 7·2⁸ | 1,792 | 228,679 | 3,584 | 93,261 |
+| 14,336 = 7·2¹¹ | 14,336 | 1,285,968 | 28,672 | 84,472 |
+| 57,344 = 7·2¹³ | 57,344 | 5,100,585 | 114,688 | 95,214 |
+
+Ratio across a 32× census: **22.304× before, 1.020× after**. The "before" 1×
+baseline was itself rehashing, so the honest figure for what was removed is the
+last row against the flat cost — **53.6×**.
+
+The round counts 1,000 / 10,000 / 50,000 stayed under the ceiling in **both**
+columns, because `with_capacity` rounded them to 1,792 / 14,336 / 57,344 and
+left 792 / 4,336 / 7,344 spare slots by arithmetic accident. A bench that had
+only visited round numbers would have reported this defect as absent. C-13
+measures both sets for that reason.
+
+### What is true now, stated as a bound rather than as a slogan
+
+The reservation is `min(n_valid · 2, MAX_ENTRIES)`. `Manifest::walk` inserts
+`n_keys` keys and `validate` has already refused `n_keys > n_valid`, so the
+index holds at most `n_valid` elements when the load returns and at least
+`n_valid` slots are free. Therefore:
+
+* **the first `n_valid` calls to `record` after a load are O(1) worst case** —
+  none of them can rebuild the table (M-19);
+* **from `n_valid >= MAX_ENTRIES / 2` upward it is unconditional** —
+  `ManifestHeader::advance` refuses a counter past `MAX_ENTRIES`, so the capped
+  reservation covers every append that will ever be accepted (M-18);
+* **below that, past the headroom, it is amortised O(1) with an `O(n_keys)`
+  worst case.** One call in a doubling rebuilds the table.
+
+### The last arm is NOT closed, and this is what closing it would cost
+
+An unconditional O(1) worst-case append for every census needs the reservation
+to be `MAX_ENTRIES` on **every** load, because `advance` will accept
+`MAX_ENTRIES − n_valid` further appends and any smaller reservation leaves a
+count at which the table must grow. `size_of::<(EntryKey, Entry)>()` is **136
+bytes** on this target (printed by the same bench), and `MAX_ENTRIES` is
+2,097,152, which rounds to 4,194,304 buckets — roughly **574 MB of table for a
+vendor holding three months.** That is the same number the region-sized
+reservation was refused for in D-0036, and it is refused again here for the same
+reason.
+
+So the honest statement is *amortised*, and it is written as amortised in
+`Manifest::record`, in the `Manifest` type header and in M-19 rather than being
+left as an O(1) claim over an amortised bound.
+
+**What the doubling costs.** The *ceiling* is unchanged: a census at
+`MAX_ENTRIES` reserved `MAX_ENTRIES` before D-0040 and reserves `MAX_ENTRIES`
+now. What doubles is the middle — a 248,000-entry census (the measured scale
+`MAX_ENTRIES` is derived from) goes from roughly 72 MB of table to roughly
+144 MB. That is a real cost and it is not amortised away by anything.
+
+### Three things this section does not claim
+
+1. **The cap arm has never been reached through `Manifest::load`.** M-18 checks
+   the arithmetic directly through the public `reservation_for`, because
+   reaching it through a real census needs 1,048,576 entries — 67 MB of entry
+   bytes and a 574 MB table — which is not a thing a unit test builds. The
+   arithmetic is proven; the allocation at that size is **UNVERIFIED**.
+2. **A genesis manifest still reserves nothing**, because there is no census to
+   size a reservation from, so a vendor's *first* pull rehashes once per
+   doubling from the first key. Amortised O(1), unchanged by D-0040, and already
+   recorded in §17.
+3. **The numbers above are one machine, one process, one load.** They are
+   ratios for that reason. No claim is made about a runner this repository has
+   never measured on, and C-13 asserts the ratio rather than a nanosecond
+   threshold.
+
+---
+
+## 25. What `crates/costs` does not know, and what it refuses to guess
+
+Added by D-0041 **as §24, colliding with the `crates/api` §24 further down this
+file — two sections carried the same number.** Renumbered to **§25 by D-0045**,
+and this section is the one that moved, for a reason worth stating: the api §24
+is cited from three places in `crates/api` source
+(`benches/ratio.rs` twice, `src/server.rs` once), and §25 was free. Moving the
+api section would have left three citations in code pointing at a heading that
+no longer exists; moving this one leaves every citation in the repository true.
+`crates/costs` cites only §26 and §27, both of which are unchanged.
+
+**The consequence is that this file's headings are no longer in numerical
+order** — §23, §25, §24, §26, §27 — and that is the honest cost of an
+append-only document repaired without rewriting it. **§20 does not exist and
+never will**: §21's own preamble records that it was skipped deliberately.
+Appended at the end of the file because two other changes were
+editing it at the same time.
+
+### The whole pre-2024-10-01 exchange transaction charge is unknown, on both venues
+
+This is not a rounding caveat. It is **12,692 of the 40,542 representable days —
+31% of the date domain — on which this repository cannot price an options
+trade at all.** `costs::regime::exchange_charge_rate` returns a refusal for every
+one of them, on NSE and on BSE alike.
+
+The reason is recorded on the rows themselves. The pre-boundary charge was a
+member **monthly-premium-turnover slab ladder**. Five superseding documents were
+identified by number — NSE `NSE/FA/46730` (roughly 2021-01 to 2023-03),
+`FA56129` (2023-04 to 2024-03), `FA61137` (2024-04 to 2024-09); BSE notices
+`20231020-46` (effective 2023-11-01, nearest-expiry-scoped) and `20240430-42`
+(effective 2024-05-13, with an active flat-versus-slab source conflict) — and
+**none of the five was ever officially retrieved**. A slab ladder keyed on a
+member's monthly turnover has no honest flat per-trade equivalent in any case,
+and the BSE 2023-11 ladder was expiry-scoped, which a flat table cannot express
+even in principle.
+
+What would close it: the circular bodies, official-direct or official-archive.
+Each one becomes one dated row and a ledger entry, and no code changes. What
+would **not** close it: assuming the current rate, assuming the top retail slab,
+or adding a flag. There is no such flag and there is nowhere in the type for the
+number to go.
+
+For the pre-2023-11 BSE era there is not even an identified document. Part of
+that span may predate the SENSEX options relaunch, when no contract existed — the
+refusal is still the correct answer and is not evidence either way.
+
+### The BSE IPFT zero is UNVERIFIED, and it is not the conservative direction
+
+`costs::rate::BSE_IPFT` is zero. The source it was ported from could not
+establish whether the true figure is exactly zero or merely trivially small, and
+listed it in its own UNVERIFIED set while pricing it as zero.
+
+That behaviour was carried across unchanged rather than promoted to a refusal,
+because turning it into one would be a behaviour change this port had no
+authority to make. **If the true figure is positive, this under-charges.** It is
+not the safe direction and it is not presented as one. It is a single figure
+whose provenance is marked in the constant's own documentation, on a venue this
+repository does not sweep.
+
+### Two dated windows that were identified and deliberately NOT encoded
+
+Both are UNVERIFIED training knowledge with no retrieved circular. Encoding
+either would have split a window on a rate nobody can cite, which is the exact
+failure the refusal row exists to prevent — done quietly, and to a *verified*
+table.
+
+1. **Finance Act 2023 reportedly moved options STT from 0.05% to 0.0625%
+   effective 2023-04-01.** If true, `costs`'s 1990-01-01 anchor row is two
+   windows and every trade before 2023-04-01 is currently priced 25% too high on
+   STT. The row's `source` string says so in full.
+2. **NSE `FA73061` (dated 2026-02-27, effective 2026-03-01) reportedly re-splits
+   the transaction charge and the IPFT as ₹3,552 + ₹1 per crore, leaving the
+   total unchanged at 0.03553%.** If true, the 3,503 + 50 split is wrong from
+   2026-03-01 onward while their **sum** stays right — so any consumer that adds
+   the two is unaffected and any consumer that reports them separately is not.
+
+### The name `bps_x100` is arithmetically wrong by a factor of ten
+
+`costs::rate::BpsX100` is the source's name for the encoding and is kept so that
+every literal in the crate is comparable line-for-line with the source it came
+from. Read as arithmetic the name is wrong: one unit is `0.001` basis points,
+not `100` of them. The true scale is `rate_decimal × 10^7` — one rupee per
+crore — and it is stated on the type, on `RATE_SCALE`, and proven by
+`costs::rate::the_scale_reads_as_rupees_per_crore` against the per-crore figures
+the circulars themselves quote. A reader who trusts the name and not the scale
+will be out by 10×.
+
+### The dates this crate can represent stop at 1990 and 2100
+
+`costs::day::TradeDay` validates through `core`'s `Expiry`, which accepts
+1990..=2100. Outside that window a date is **refused by name**, never clamped —
+clamping would price a 1974 trade at the 1990 rate and say nothing. But it does
+mean a caller holding a real date outside the window gets an error rather than a
+rate, and that the tables' anchor rows say "from the first day this crate can
+represent" rather than "from the beginning of time". It anchored at
+`date.min`; nothing between year 1 and 1989 is representable here, and nothing
+in that span was ever priceable anyway.
+
+### The citation check cannot see non-ASCII whitespace
+
+`has_content` walks bytes for one that is not ASCII whitespace, because
+`str::trim` cannot be called in a `const` context and the check has to run at
+compile time on every shipped row. A citation consisting entirely of
+non-breaking spaces would pass it. The check exists to catch `""` and `"   "`,
+which is what a hurried edit produces.
+
+### What was measured for this change, and what was not
+
+**Measured**, on the operator's machine on 2026-08-07 over three runs, by
+`crates/costs/benches/ratio.rs`: per-lookup cost 1.7–4.3 ns, worst ratio across
+the selected-row, table-row-count and refusal-versus-rate comparisons
+**1.552×** against a 3.0× ceiling. That worst figure is from the run taken while
+other work was compiling on the same machine — the baseline itself moved 1.8×
+between runs — and the two quiet runs topped out at **1.189×**. Both are
+recorded rather than the flattering one, because a ratio measured under load is
+the one that says what the ceiling is for. **No CI-runner figure is claimed,
+because none was taken**, and the numbers are ratios for exactly that reason.
+
+**Measured**: `cargo-mutants` on `crates/costs` — **137 mutants, 79 caught, 57
+unviable, 0 survivors, 1 timeout.** The timeout is `i += 1` → `i *= 1` in
+`has_content`, which makes the byte walk never advance; the mutant does not
+terminate, so no assertion can reach it and the suite hangs instead. It is
+detected, not survived, and it is reported here rather than folded into the
+caught column.
+
+An earlier run of the same tool found **two real survivors**, and both were
+fixed rather than excused: a duplicated year check in `TradeDay::new_const` that
+`core`'s own validator already made redundant (the duplicate was deleted), and
+one arm of `RegimeTable::rows_are_well_shaped` whose conjunction no test
+distinguished from a disjunction (assertions were added for both halves). The
+first was a real defect of the kind coverage cannot see — 100% of a redundant
+branch is still 100%.
+
+**Measured**: line, region and function coverage of `crates/costs` at
+**100.00%** by `cargo-llvm-cov` 0.8.4. Branch coverage is still not measured
+anywhere in this repository — §7 and X-06b already record why.
+
+**Not measured**: `cargo deny check` was not run for this change. No registry
+dependency was taken — `brutex_core` is an in-workspace path dependency — but
+that is an argument, not a measurement.
+
+**Not measured**: nothing in this crate has been checked against a live broker
+contract note. Every figure traces to the predecessor repository's
+`COSTS_VERIFIED` citations, and those citations are the whole warrant. A trade
+priced by a real broker on a real day has not been reproduced here, and until it
+has, "the rate table matches the circulars" and "the charge matches the contract
+note" are different claims and only the first is being made.
+
+---
+
+## 24. The instruments page is O(1) in the universe — except for search, which is not
+
+D-0042 moved every ordering and every filter the instruments page offers out of
+the request and into one build at load time. What that bought, and what it did
+not, measured on this machine with `cargo bench -p api` in the
+release-inheriting `bench` profile, minimum of 8 trials:
+
+### What is now flat, and is asserted
+
+| Path | 2,787 instruments | 50,000 | ratio |
+|---|---|---|---|
+| instruments page, default order | 147,987 ns | 151,618 ns | 1.02× |
+| every sort column, both directions, every pill | — | — | 0.94× – 1.09× |
+| escape hatch (`all=1`) | 142,306 ns | 147,148 ns | 1.03× |
+| clamped deep page (`?page=9999`) | 140,571 ns | 152,840 ns | 1.09× |
+| dashboard | 1,705 ns (at n=2) | 1,691 ns | 0.99× |
+
+Marginal cost per instrument per request: **0 – 259 ps**, against 85,400 ps
+before. C-14 through C-17.
+
+### What is NOT flat, and why no index makes it so
+
+**Substring search.** The page's search box matches a needle anywhere in an
+instrument's canonical name. No ordering of the names answers `contains` by
+arithmetic, so there is no 49th precomputed list that would make this constant.
+
+What the catalog does do is narrow the candidates: every three-byte window of
+every name is indexed, and a needle of three bytes or more is answered from the
+**rarest** trigram's posting list rather than from the whole universe. Measured,
+worst case — the synthetic names in the bench are `NSE-S` plus seven digits, so
+nearly every name carries nearly every trigram and the index narrows almost
+nothing:
+
+| Needle | 2 | 2,787 | 50,000 | why |
+|---|---|---|---|---|
+| `"S0000001"` | 3,867 ns | 18,550 ns | 126,758 ns | 8 bytes, trigram-narrowed |
+| `"S00"` | 4,450 ns | 414,367 ns | 6,481,758 ns | a trigram nearly every name carries |
+| `"S0"` | 4,425 ns | 421,208 ns | 6,464,433 ns | 2 bytes — **no trigram exists** |
+
+Three statements, and only the first is a bound:
+
+1. **A needle longer than the longest name is O(1).** A substring is never longer
+   than the string, so it is answered without touching a row. That arm is real
+   and tested.
+2. **A needle of one or two bytes is O(universe).** There is no trigram to look
+   up, so every row in the selection is examined. This is not repaired: an
+   additional 1-gram and 2-gram index would have posting lists holding nearly the
+   whole universe for exactly the needles that need them, so it would cost memory
+   and buy nothing.
+3. **A needle whose rarest trigram is carried by most of the universe is
+   O(universe).** That is what a search matching most of the universe *is*, and
+   the sort of the matched set is `O(m log m)` on top. The real masters share far
+   fewer trigrams than the synthetic bench data — `"RELI"` narrows to a handful —
+   so the figures above are an **upper bound on search cost, not a typical one**.
+   The typical cost on real symbols is **UNVERIFIED**: no measurement of this
+   page against the real 2,787-instrument master has been taken since D-0042.
+
+The bench prints all three rows and asserts none of them. Asserting a bound that
+cannot hold is how a false claim gets into a gate, which is the defect this whole
+section exists downstream of.
+
+### What the index costs in memory, since it is not free
+
+48 orderings of `usize` indices per instrument, plus one row table, plus the
+uppercased name of each instrument, plus the trigram postings. About **1.1 MB of
+ordering index at the real universe of 2,787**, and about 19 MB at 50,000. Paid
+once at load, never on a request.
+
+The 48 is not minimal. Two of the eight (scope, pill) row sets are provably
+identical to two others — `pill=ntm` and `pill=idx` select the same rows whether
+or not the tracked-universe filter is lifted, because both pills are subsets of
+the tracked scope. Deduplicating them would save two orderings in twelve. It is
+**not** done: the saving is 17 % of an index that is already a megabyte, and the
+argument for it is a proof about universe membership that would have to stay
+true as the universe bits grow. `CLAUDE.md` §8 makes those bits append-only, so
+a future bit could break the proof silently. Eight sets computed from the same
+predicate the request uses cannot.
+
+### What was not measured
+
+- **The build cost at 50,000 instruments is not gated.** It is printed by the
+  bench — the three universes together build in tens of milliseconds — but no
+  ceiling is asserted on it, because it is startup work and the pages are what
+  an operator waits on. A build that became quadratic would show up as a slow
+  start and nothing would fail.
+- **Nothing here was measured against the real masters.** Every figure in this
+  section is synthetic. The audit figures it replaces (3.569 ms at 2,787,
+  124.916 ms at 50,000) were taken against a running server in a debug build and
+  are not comparable in absolute terms to the release figures above — only the
+  **shape** is, and the shape is what is asserted.
+- **No mutation testing has been run on `crates/api`.** 100 % line and region
+  coverage is not evidence that the assertions are load-bearing. `crates/store`
+  carries the same admission in §22.
+
+## 26. What the option arithmetic does not know, and what it refuses to guess
+
+`crates/costs` stage 2 (`docs/05-decisions.md` D-0043) adds the strike grid, the
+moneyness, the lot arithmetic and the expiry resolution. Section 24 above covers
+stage 1's rate gaps and is unchanged. This section is only about what stage 2
+does not know.
+
+### The refusal windows are large, and they are the design working
+
+| Table | Verified from | Days with **no value** | Share of the 40,542-day domain |
+|---|---|---|---|
+| strike grid step | 2021-01-01 | 11,323 | 27.9 % |
+| options lot size | 2021-01-01 | 11,323 | 27.9 % |
+| expiry weekday (weekly and monthly) | 2020-01-01 | 10,957 | 27.0 % |
+
+`TradeDay` reaches back to 1990-01-01 because `core`'s expiry calendar does. The
+predecessor's tables begin at its own data-pull floor. Every day in the gap is a
+**refusal**, and any consumer of this crate has to handle it. It cannot be
+configured away, defaulted, or flagged off.
+
+**Closing them needs data, not code.** One dated row per table, with a citation,
+and the mechanism does not change.
+
+### The lot table follows the source's code, not its documentation
+
+The source's `lot_size_history` module docstring says "for dates before the
+first transition, returns the first recorded value (pre-Jul-2021 defaults)". Its
+`get_lot_size` **raises** instead. The two disagree, and this port follows the
+code, because the docstring describes exactly the silent backwards
+extrapolation `CLAUDE.md` §4 bans. If some downstream consumer was relying on
+the docstring's behaviour, it will now see a refusal where it saw a 75.
+
+### The 2020 expiry rows are secondary-corroborated, not primary-sourced
+
+The source records, and this crate carries verbatim in substance, that the
+**primary NSE circulars for the 2020 rows were unreachable — HTTP 403** — and
+that two independent research rounds agreed the Thursday regime was continuous
+through 2020 for both NIFTY and BANKNIFTY. The rows are shipped as verified on
+that basis. That is a weaker warrant than a retrieved circular and it is stated
+here rather than smoothed over. If the 2020 regime was in fact something else,
+every expiry resolved for 2020 and for the first months of 2021 is wrong by
+whole days.
+
+The SENSEX equivalents were marked by the source as an **UNVERIFIED-continuity
+inference**. They are not in this crate at all, for the scope reason in D-0041
+rather than the evidence reason — but had they been in scope, that marking would
+have made them a refusal row.
+
+### The strike steps are verified over 2021–2026 and applied to 2100
+
+The source states the steps as constants "for the 5-year backfill window" and
+records no SEBI step change over it. This crate dates them from 2021-01-01 with
+**no upper bound**, so a 2085 trade is priced on today's grid. That is an
+extrapolation forward and it is labelled as one. A step change would need one
+new dated row; nothing detects one automatically. There is no upper refusal
+window because there is no evidence of a change to point at, and inventing an
+end date would be as much a fabrication as inventing a rate.
+
+### Trading holidays are not accounted for, at all
+
+An expiry returned by `expiry::next_weekly_expiry` or
+`expiry::next_monthly_expiry` is the **calendar** expiry. When an expiry day
+falls on an NSE trading holiday the contract settles on the previous trading
+day, and neither this crate nor the source knows which days those are. There is
+no holiday calendar in this repository. **Every expiry this crate returns can be
+one or more days late on a holiday week**, and a caller that needs the settled
+date must apply a holiday calendar it obtains elsewhere.
+
+**How often that bites is UNVERIFIED and is not estimated here.** It depends on
+the NSE holiday calendar, which this repository does not hold and which
+`docs/00-charter.md` records no source for; putting a number on it would be
+exactly the invention `CLAUDE.md` §3 rule 1 forbids. What is stated is the
+direction: the calendar expiry is never *earlier* than the settled one, so a
+consumer that uses it unadjusted holds a contract one or more days past
+settlement, not short of it.
+
+### Moneyness is not capped at the chain width
+
+`MoneynessSteps` accepts any `i32`. `CHAIN_HALF_WIDTH` (10) and
+`is_within_chain` are queries a caller may ask; nothing in this crate consults
+them and nothing refuses on them. The source's own `strike_offset_from_atm`
+states that it "doesn't bounds-check", and adding a refusal it does not have
+would be a behaviour change this port had no authority to make. What is bounded
+is the arithmetic — `i32` at the boundary, and a resolved strike outside the
+domain of real prices refused by name — **not the plausibility of the trade**. A
+caller can resolve `OTM+1,000,000` and get a real, arithmetically correct strike
+that no exchange has ever listed.
+
+### `derive_strike_step` and `grid_around_atm` are not ported
+
+* `derive_strike_step` infers a grid step from an observed strike ladder by
+  sorting and taking the minimum gap. It is `O(K log K)`. It exists in the
+  source for the ~212 single stocks whose steps are not published constants; the
+  costable set here is two indices whose steps **are** published constants. It
+  was deliberately not ported, and putting a sort into a crate whose claim is
+  closed-form arithmetic would be a regression.
+* `grid_around_atm` materialises a 21-strike chain into a `Vec`. Not ported: a
+  caller that wants a rung calls `strike_at` for it.
+
+The source also records an **honesty caveat** on `derive_strike_step` that
+survives its absence: fed a sparse observed ladder, the minimum observed gap is
+an integer multiple of the true base step — an **over**estimate. Nothing in this
+crate can encounter that, because nothing here derives a step.
+
+### What was measured, and what was not
+
+Gate 8 (`crates/costs/benches/ratio.rs`, C-K-05 through C-K-09) was run **four
+times** on the operator's machine on 2026-08-07. Per-call cost 0.62–15.7 ns;
+every ratio under the 3.0× ceiling.
+
+* The largest ratio was **2.300×** — the monthly rollover arm against the
+  in-month arm. That is not a scan appearing. The rollover arm performs the
+  month resolution and the table lookup **twice**, which is exactly the "at most
+  two" the O(1) claim is made as. It is reported rather than buried because a
+  reader comparing the two columns deserves to know why they differ by 2×.
+* **No CI-runner figure exists.** The 3.0× ceiling asserted in the harness is
+  the shared-CI number; whether a GitHub runner stays under it is UNVERIFIED.
+* `TradeDay::from_ordinal`, `last_of_its_month` and `earlier_in_same_month` are
+  **not timed individually**. Their O(1) claims are structural — a fixed count
+  of multiplications and divisions, and a four-iteration walk over a
+  compile-time constant — and they are exercised only inside the expiry ratios
+  above. No isolated wall-clock figure is claimed for any of them.
+* `at_the_money`, `strike_at`, `moneyness_steps`, `contract_quantity` and
+  `notional` **are** timed, as C-K-05 through C-K-07.
+
+### Branch coverage is still not measured
+
+Line, region and function coverage across `crates/costs` are **100.00 %**
+(4,891 regions, 2,799 lines, 250 functions, measured with cargo-llvm-cov 0.8.4
+on 2026-08-07). Branch coverage is not measured, because llvm-cov instruments
+zero branches on the pinned toolchain — already recorded as X-06b and in §7, and
+unchanged by this work.
+
+### Nothing here has been checked against a broker contract note
+
+Stage 1's admission stands and now covers more surface. "The lot size matches
+the circular", "the expiry matches the calendar" and "the position matches the
+contract note" are three different claims, and only the first two are being
+made — from the predecessor's citations, which are the entire warrant.
+
+### Mutation testing was run, and what it found
+
+`cargo-mutants 26.2.0`, 2026-08-07, over the nine files this change touched.
+
+| Files | Mutants | Caught | Unviable | **Survived** | Timed out |
+|---|---|---|---|---|---|
+| `dated` `day` `error` `expiry` `lot` `moneyness` `strike` `venue` | 328 | 246 | 82 | **0** | 0 |
+| `regime` (touched only to move two `const` helpers out) | 39 | 19 | 20 | **0** | 0 |
+
+Getting to zero took three fixes, and none of them was an excuse:
+
+1. **One real survivor.** `if remainder > 0` in `atm_offset` mutated to
+   `>= 0` and nothing died — because that branch is only reached when
+   `2·|r| > d > 0`, which forces `r ≠ 0`, so the two spellings are behaviourally
+   **identical**. It was an equivalent mutant that no assertion could ever kill.
+   Rather than allowlist it, the branch was deleted: the direction of the bump
+   is now `remainder.signum()`, which has no arm to be equivalent about.
+2. **Four non-terminating mutants** in the date arithmetic (`+`→`-` in
+   `days_from_civil`, `-`→`/` in `civil_from_days`, and two more) hung the suite
+   for 60 s each instead of failing an assertion. The cause was two tests of
+   mine that walked the domain with `plus_days` in a `while` loop — a trip count
+   driven by the very arithmetic under mutation. Both now walk
+   `every_representable_day`, whose trip count is 111 × 12 × 31 by construction,
+   and every inner scan is bounded by an assertion. All four are now **caught**.
+3. **Two more non-terminating mutants** were removed structurally rather than
+   tested around: `i += 1` in `has_content` and in `last_of_its_month` each
+   mutate to `i *= 1`, which never advances. `has_content` and `str_eq` now
+   consume the slice tail instead of indexing with a counter — which also
+   retired two `clippy::indexing_slicing` exemptions — and
+   `last_of_its_month`'s four probes are unrolled.
+
+**What this does not say.** 82 of the 328 mutants were *unviable* — they did not
+compile, usually because a `const` shape assertion rejected them at build time.
+That is a real signal (the compiler caught them) but it is not the tests
+catching them, and it is reported in its own column rather than folded into
+"caught". `crates/rate` was not mutated because it was not touched; `crates/core`
+still has no mutation measurement at all.
+
+## 27. What the round-trip calculator does not know, and what it deliberately over-charges
+
+`crates/costs` stage 3. See `docs/05-decisions.md` D-0044 for the decisions;
+this section is only the gaps.
+
+### The rounding is deliberately MORE expensive than the exchange's
+
+Every rate-scaled levy **ceils**. A real exchange rounds statutorily half-up, so
+every figure this crate produces is at least the real charge and usually a little
+above it. The predecessor makes this permanent under
+`DEC-FILL-WORST-CASE-ONLY-001`, on the argument that a backtest that flatters is
+worse than one that is pessimistic.
+
+Stated as a bound, because it is one. Per round trip the deliberate over-charge
+is at most:
+
+| Component | Over-charge ceiling |
+|---|---|
+| exchange transaction charge | 1 paisa per leg — 2 paisa |
+| SEBI turnover fee | 2 paisa |
+| investor protection fund | 2 paisa |
+| securities transaction tax | 1 rupee — 100 paisa |
+| stamp duty | 1 rupee — 100 paisa |
+| GST | 1 rupee — 100 paisa |
+
+**That tax row read "1 rupee (99 paisa)" and the table then did not sum to its
+own total: 2 + 2 + 2 + 99 + 100 + 100 = 305 = ₹3.05, against the ₹3.06 stated
+below it.** Corrected to 100 by D-0045. The ceiling for a statutory levy is
+**100 paisa, not 99**, and it is worth writing out because the wrong figure was
+plausible. `statutory_levy` is `ceil_to_rupee(floor_to_paisa(scaled(…)))`. Let
+the raw amount be `100k + r` paisa. For `r` in `1..=99` ours gives `100(k+1)`;
+half-up to the rupee gives `100k` when `r <= 49` and `100(k+1)` when `r >= 50`.
+So the gap is **100 paisa for `r` in `1..=49` and 0 otherwise** — never 99, and
+never anything between. Only the parenthetical was wrong; the ₹3.06 total and
+the direction were right.
+
+So at most **₹3.06 per round trip**, always in the same direction. On the ₹67.12
+of `COSTS_VERIFIED` §5 Example 1 that is up to 4.6% of the charge stack — small
+against the stack, and **not** small against the ₹3.25 gross of a one-tick
+winner. A strategy whose edge is a tick or two is being judged more harshly here
+than the exchange would judge it, and that is the intent, not an accuracy claim.
+
+The **direction** is certain; the size above is a ceiling, not a measurement of
+the typical case. No distribution of the actual over-charge over real trades has
+been computed, because no real trade set has been priced.
+
+### Nothing here has been checked against a broker contract note
+
+Unchanged from §26 and worth restating, because stage 3 is where it would show.
+Every figure traces to the predecessor repository's citations. "The rate matches
+the circular", "the arithmetic matches the specification" and "the total matches
+the contract note" are three different claims, and only the first two are being
+made. **No contract note, no exchange bill and no broker statement has been
+compared against any output of this crate.**
+
+The four worked examples are the predecessor's own enforced oracles, regenerated
+by it from its own shipped calculator. Reproducing them proves this port agrees
+with the source. It does **not** prove the source was right.
+
+### The lot size is keyed on the trade date, not the contract's vintage
+
+`RoundTrip::in_lots` reads the lot size in force on the **entry day**. A real
+exchange lot revision applies per contract from a stated expiry onward, so around
+a transition the two disagree: a NIFTY trip on 2024-11-19 is sized at 25 and one
+on 2024-11-20 at 75 — a threefold jump keyed purely on the day — even though a
+still-listed pre-revision contract kept its old lot until its own expiry.
+
+The predecessor records exactly this limitation and stamps its output with the
+basis it used. The per-circular contract-level rollout dates are UNVERIFIED, so
+no vintage logic is invented here either. **A trip on a pre-revision contract
+opened after a revision date is mis-sized, and by the full ratio.** How often
+that happens over a real backtest is UNVERIFIED and deliberately not estimated.
+
+A caller that knows the contract's vintage should resolve the quantity itself and
+use `RoundTrip::new`, which takes units.
+
+### The futures charge stack is NOT ported
+
+`brutex/costs/futures_costs.py` (48 KB) and `rust/fno-math/src/exec/costs_futures.rs`
+were read and are not ported. Two reasons, in order:
+
+1. **The rates do not exist here.** A futures stack needs a futures transaction
+   tax, a futures exchange transaction charge, and the Groww
+   `min(flat, turnover)` brokerage arm. Stage 1 shipped **options** rates only,
+   and no futures rate has a citation recorded in this repository. Writing one
+   down would be the invention Golden Rule 1 forbids.
+2. **Nothing would use it.** `CLAUDE.md` §1 fixes the engine surface at two NSE
+   indices, so the only futures this engine can see are **index** futures — and
+   `scope::is_cost_free` prices those signal-only, which needs no rate at all.
+   That arm **is** ported and tested.
+
+What that leaves unported: a **single-stock** futures round trip cannot be priced
+by this crate. It also cannot be reached, because `venue::swept_slot` refuses
+every symbol outside the swept set. Both halves are refusals rather than wrong
+answers.
+
+The parts of the futures model that differ from the options one — one gross
+formula for both directions instead of a sign branch, and per-leg
+`min(flat, turnover)` brokerage instead of a flat round trip — are recorded here
+so that a later port starts from the divergence rather than rediscovering it.
+
+### `scope.py`'s single-stock half is not expressed
+
+The source's rule is "an index that is not an option". The clause about single
+stocks — every stock, in every segment, is cost-bearing — is true and is **not**
+a variant of `scope::Segment`, because this crate holds no single-name lot table
+and no single-name rates. A `SingleName` variant would be a scope claim the crate
+cannot honour. The refusal happens earlier, at `venue::swept_slot`.
+
+### The expiry charge state machine is absent
+
+`Outcome::ExpiryExercise`, `ExpiryAssign` and `ExpiryWorthless` are **refused**,
+not priced. The `CALCULATOR_SPEC` §4.2 machine — the transaction tax on intrinsic
+value for an exercise, no tax on an assignment, brokerage only on a worthless
+expiry — is not implemented in the predecessor either. `regime::stt_exercise_rate`
+exists, is dated and is verified, and **nothing calls it**. A backtest that holds
+an option to expiry cannot be costed by this crate at all.
+
+### The Muhurat brokerage waiver is absent
+
+`COSTS_VERIFIED` §5 Example 5 documents ₹0 brokerage during a Muhurat session and
+carries the predecessor's own banner saying its calculator has no such branch.
+Neither has this one; a Muhurat trip is charged the full flat fee, which
+**over**-charges. Asserted rather than assumed by
+`costs::trip::the_fifth_worked_example_is_not_ported_and_the_reason_is_asserted`.
+
+### One rounding guard cannot be reached through the GST stage
+
+`money::ceil_to_rupee` refuses when the next whole rupee leaves `i64`. That arm is
+reachable through the transaction tax (a sell notional near `i64::MAX` at a
+rate-scale rate) and is tested there. It is **arithmetically unreachable** through
+the GST stage: the GST base is itself an `i64`, and 18% of any `i64` is at most a
+fifth of one, so its raw can never come within a rupee of the ceiling. Stated
+rather than left as an untested-looking corner.
+
+### GST is computed, never split
+
+An intra-state trade is CGST plus SGST on a bill. This crate has no split field,
+no `GstSplit` type and no display half. The split changes how a total is *shown*
+and never how it is computed — and computing it as two halves is the
+`DEC-COST-001` defect. A consumer that must display two halves derives them from
+`Charges::gst`, and the two displayed halves may not each be a whole rupee.
+
+### Trading holidays, iceberg slicing, and the SEBI-fee GST boundary
+
+* **Holidays** are still not accounted for anywhere in this crate (§26). Stage 3
+  adds no calendar of its own and inherits the gap unchanged.
+* **Iceberg slicing** is not implemented: one executed order per leg. A real
+  order sliced into several would pay brokerage per slice, so this
+  **under**-charges a sliced order. The predecessor defers it identically.
+* **GST on the SEBI fee** is applied for **all** dates. The predecessor records a
+  claimed ~2022-07-18 introduction of GST on the SEBI turnover fee with **no
+  in-repo citation**, and deliberately does not implement it. Neither does this.
+  A pre-boundary trip is over-charged by 18% of a sub-rupee fee — conservative,
+  and it is carried across rather than invented away.
+
+### Exactly what was and was not measured
+
+**Measured**, on the operator's machine on 2026-08-07, over four runs of
+`cargo bench -p costs`:
+
+* `charge_stack` at 32.9–37.6 ns per call; `price` at 37.3–41.2 ns.
+* C-K-10: one lot against a million (0.927×–1.030×), a five-paisa premium
+  against a lakh-rupee one (0.895×–0.957×), a win against a loss
+  (0.991×–1.027×).
+* C-K-11: one lot against a million (0.954×–0.977×), the first verified day
+  against the last regime (0.983×–1.012×), NIFTY against BANKNIFTY
+  (0.956×–1.039×).
+* C-K-11 and C-K-12's two sub-1.0× arms: a signal-only trip at 0.128×–0.137×
+  and a refused trip at 0.164×–0.179×. Both do less work by design; they are
+  reported rather than omitted for being flattering.
+
+**NOT measured.** No figure from a CI runner exists for any stage-3 row; the
+3.0× ceiling asserted in the harness is the shared-CI number and whether a GitHub
+runner stays under it is UNVERIFIED. `money`'s and `fill`'s primitives are never
+timed in isolation — only as components of C-K-10 — so their O(1) claims are
+structural (a fixed instruction sequence with no loop) and are labelled as such.
+The operation counts in `trip`'s module documentation are **counted by reading**,
+not by instrumenting a compiled binary; they are laid out per stage so that the
+reading can be repeated, and no instruction-level measurement backs them.
+
+### Coverage and mutation
+
+Line, region and function coverage are **100.00%** across the whole of
+`crates/costs` under the CI command's own thresholds
+(`cargo llvm-cov -p costs --locked --fail-under-lines 100 --fail-under-regions 100`,
+cargo-llvm-cov 0.8.4). Branch coverage is still **not measured** — llvm-cov
+instruments zero branches on the pinned toolchain, already recorded as X-06b and
+§7, unchanged by this work.
+
+**Mutation**, cargo-mutants 26.2.0, over the four files stage 3 wrote or edited:
+
+| File | Mutants | Caught | Unviable | Survived |
+|---|---|---|---|---|
+| `trip.rs` | 101 | 57 | 44 | 0 |
+| `money.rs`, `fill.rs`, `scope.rs` | 46 | 39 | 7 | 0 |
+| `error.rs` | 16 | 10 | 6 | 0 |
+
+One mutant survived the first run and is worth recording, because it is exactly
+the class of defect a golden example cannot catch: **`+ sebi` mutated to
+`- sebi` inside the GST base survived all four worked examples.** The shipped
+SEBI turnover fee is two paisa on a real trade, so flipping its sign moves the
+GST base by four paisa and the rupee ceiling absorbs it entirely. It is killed by
+`the_gst_base_is_the_sum_of_all_four_service_components_with_a_plus_sign`, which
+prices the same trip at a SEBI rate large enough for the sign to show. **A
+component small enough to hide inside a rounding is invisible to every example
+that uses its real rate**, and that is a general fact about this cost stack, not
+a one-off.
+
+**57** of the 163 mutants were **unviable** — they did not compile. That is the
+compiler catching them, not the tests, and it is reported in its own column
+rather than folded into "caught".
+
+*This sentence said **51**, contradicting the table three lines above it.
+Corrected by D-0045 from the table's own cells: 44 + 7 + 6 = 57 unviable,
+57 + 39 + 10 = 106 caught, and 106 + 57 = 163, which is 101 + 46 + 16. The table
+is internally consistent and 57 is the figure the run produced; 51 matched
+nothing.*
+
+### Gates NOT run
+
+`cargo test --workspace --locked` and `cargo clippy --workspace --all-targets`
+were **not** run to green. Other agents are mid-edit in `crates/api`,
+`crates/pull` and `crates/store`, and a workspace-wide run currently reports
+diffs that are not stage 3's. `cargo fmt -p costs --check`,
+`cargo clippy -p costs --all-targets -- -D warnings`, `cargo test -p costs` and
+the coverage command above all pass at exit 0.
+
+---
+
+## 28. Which CI gates are red today, and what three verification lenses could not confirm
+
+Added by D-0045, which reconciled the documents against the code rather than
+against the reports written about the code. **Every number in this section was
+produced by running the command named beside it**, on this tree, on 2026-08-07,
+on the operator's machine (Apple M4 Pro, cargo/rustc 1.97.1, cargo-llvm-cov
+0.8.4). Nothing here is quoted from an agent report; where a finding originated
+elsewhere and could not be reproduced from this seat, it says so in the third
+subsection and is not stated as fact.
+
+### Four CI gates exit non-zero on this tree
+
+None of this is new breakage. It is breakage that no document said out loud.
+
+All four figures below are at commit `79c5e80`.
+
+| Gate | Status | What it reports |
+|---|---|---|
+| 9 — coverage | **exit 1** | TOTAL 96.75% regions / 96.24% lines against a 100% floor |
+| 10 — invariants name real tests | **exit 1** | 10 rows name a test that exists in no file |
+| 1d — declared segments | **exit 1** | 60 undeclared segment-shaped literals under `crates/pull` |
+| 14 — a claimed bound is re-measured | **exit 1** | `crates/api` and `crates/costs` claim bounds and have no row in the coverage table |
+
+**Gate 9.** `cargo llvm-cov --workspace --locked --fail-under-lines 100
+--fail-under-regions 100 --summary-only` → exit 1. 851 of 26,169 regions and 592
+of 15,734 lines uncovered. The eight short files are tabulated under X-06 in
+`docs/04-invariants.md`. **Two are at 0.00%** — `crates/pull/src/vendor.rs` (445
+regions, 366 lines) and `crates/pull/src/ingest.rs` (168 regions, 100 lines) —
+both tracked, neither containing a single `#[test]`. `archive.rs`, `fetch.rs`,
+`csv.rs` and `fold.rs` are the same pattern less severely. That is six modules
+in one crate committed ahead of their tests, and it is the same shape D-0029
+recorded for `core/src/universe.rs`: gate 10 walks rows→tests and never
+tests→rows, so nothing notices a module that claims nothing.
+
+**This number moved twice during the writing of D-0045**, from 97.41% / 96.93%
+over six files to the figure above over eight, as commits `1f98bb5`, `eb95996`
+and `79c5e80` landed. Re-run it; do not cite it.
+
+**Gate 10.** Reproduced with the gate's own matching logic: rows 293, checked
+288, pending 17, **missing 10** — S-02, S-05, S-10, P-01, P-02, P-03, P-04,
+X-01, X-02, X-13. The gate's `allow_pending` list is deliberately empty, so this
+gate is **red by design** and stays red until those ten tests are written or the
+invariants are formally abandoned in `docs/05-decisions.md`. D-0045 did not
+write them; it stopped the rows claiming to be proven. Note gate 10 **cannot see
+the module segment** — its own comment says `store::unit::x` and
+`store::fault::x` are the same question to it — which is why S-03 and S-08 sat
+green for their whole lives while naming `store::loom::` and `store::proptest::`,
+modules that do not exist.
+
+**Gate 1d.** Reproduced verbatim under `bash` (under `zsh` the allowlist
+word-splits differently and the count is wrong). **60** undeclared literals. They
+arrived with the vendor, fetch, archive and CSV work and are mostly timeframe
+and date tokens — `1min`, `5min`, `1day`, `2024-02-29`, `open_interest`,
+`timestamp`, `payload`. **Two are vendor-shaped and are exactly the question
+this gate exists to force: `gdfl` and `truedata`.** Both are already tracked and
+public in `docs/08-vendor-samples.md` and `docs/05-decisions.md`, so the gate is
+not leaking them for the first time. Whether either is *also* the operator's
+real `<vendor>` path segment is operator-side and unknowable from inside this
+repository — the same reasoning gate 1d's own comment applies to `groww` and
+`dhan`, recorded in §18. **Separately: neither vendor appears in
+`docs/00-charter.md`**, and `CLAUDE.md` §3 rule 1 makes that file the only
+source a vendor claim may rest on. That is a Golden Rule 1 gap, not a gate 1d
+gap, and it is recorded here because nothing else records it.
+
+**Gate 14.** Reproduced by running the gate's own discovery and layer 1: 51 cost
+claims across 2,134 doc blocks in 51 tracked source files →
+`REFUSED crates/api — 7 cost claim(s), no row in the table` and
+`REFUSED crates/costs — 21 cost claim(s), no row in the table`. Both crates
+track a bench that satisfies layers 2, 2b and 3; only the table row is missing.
+The exact rows to add are quoted in D-0045 and reported to the operator.
+`.github/workflows/ci.yml` is not this change's file.
+
+### Three claims that were checked and did not survive
+
+**The round-trip charge stack can be reached without a date, from outside the
+crate.** `costs::trip::price` resolves rates by day and refuses an unverified
+window — that part holds. But `costs::trip::charge_stack` is `pub` and takes
+`(fills, quantity, direction, &Rates)` with **no day at all**, and
+`costs::trip::Rates::new` is `pub const` and takes four rates with **no day
+either**. `BpsX100::new` is crate-private, but `regime::NSE_EXCHANGE_CHARGE` and
+`regime::BSE_EXCHANGE_CHARGE` are `pub const BpsX100`, `regime::stt_options_rate`
+is `pub` and returns `Ok` for every representable day, and `rate::ipft` is a
+`pub const fn`. So an external caller can assemble a `Rates` and price a trade
+dated inside the refusal window at the 2024-verified exchange rate, with nothing
+refusing. That is the runtime escape hatch the predecessor's
+`DEC-ETC-REGIME-HISTORY-001` §9 forbids. **The public signatures above were read
+from the source for this entry; the out-of-crate probe that produced a number
+(₹61.90 for a 2019 trip) was run by the verification lens and not reproduced
+here.** `charge_stack`'s own doc comment discloses that it "resolves no date and
+cannot refuse for a citation reason"; §27 did not, and now does.
+
+**"Rounding CGST and SGST separately overcharges by exactly ₹1, every trade" is
+false as a generalisation.** The assertion in the test is fine — at Example 1's
+GST base of 4,512 paisa the two answers really do differ by exactly 100 paisa.
+The *generalisation* into "systematic, every trade" is contradicted by the
+crate's own other worked examples, whose GST bases give a difference of **zero**.
+The implementation is correct — it rounds once — and only the prose in
+`trip.rs` and `rate.rs` overstates. Those are source files and are reported
+rather than edited.
+
+**The ₹3.06 over-charge decomposition did not sum to ₹3.06.** Fixed in §27
+above: the securities-transaction-tax ceiling is 100 paisa, not the 99 the table
+carried, and the derivation is written out there. The total and the direction
+were always right.
+
+### What is NOT verified, by anyone, including this entry
+
+Recorded so no reader mistakes an unexamined claim for an examined one.
+`CLAUDE.md` §3 rule 6.
+
+- **Every "before" figure in this repository is unverifiable without reverting
+  the fix.** That covers `store/format.rs` at 56.12% lines, `pull`'s 5,100,585 ps
+  append, and `api`'s 124.916 ms page and 80.640× dashboard. The **after**
+  figures reproduce and their shape is consistent with each before-figure, but
+  that is inference. The api before/after pair is additionally **debug against
+  release** and is not comparable in absolute terms — only the ratio is, which
+  is why the ratio is what C-14 … C-17 assert.
+- **`cargo-mutants` was not run for D-0045.** The `crates/costs` figures (163
+  mutants, 0 survivors) were reproduced by a verification lens and matched to the
+  unit; they are not this entry's measurement. `crates/core`, `crates/store` and
+  `crates/api` have **never** been mutation-tested at all, and `crates/store`'s
+  five hand-planted mutants are five points of a space the tool enumerates in
+  full (§22). **CI has no `cargo-mutants` step**, so `CLAUDE.md` §9's
+  "no surviving mutant" bullet is enforced by nobody.
+- **Branch coverage is not measured and cannot be**, on the pinned toolchain —
+  `llvm-cov` reports `-` in the branch column for all 47 files including TOTAL.
+  Every 100% figure anywhere in these documents is **line and region only**.
+  X-06b and §7.
+- **No figure in any of these documents comes from a CI runner.** Every ratio is
+  one machine, one process, one load. The 3.0× ceiling the harnesses assert is
+  the shared-CI number; whether a GitHub runner stays under it is **UNVERIFIED**
+  for every gate-8 row in the repository.
+- **Nothing in `crates/costs` has been checked against a broker contract note,
+  an exchange bill or a broker statement.** A lens proved the Rust reproduces the
+  predecessor to the paisa over 37,668 swept cases. That proves the
+  *port*. It says nothing about whether the source was right, and neither does
+  any row in `docs/04-invariants.md`.
+- **The `crates/api` search figures are synthetic only.** Every measured needle
+  runs against names of the form `NSE-S` plus seven digits, engineered so nearly
+  every name carries nearly every trigram. That is an **upper bound** on search
+  cost, not a typical one. What a real symbol prefix costs against the real
+  masters is unmeasured.
+- **The `crates/api` catalog build has no asserted ceiling.** The bench prints it
+  (41 ms for all three universes) and gates nothing, so a build that turned
+  quadratic would fail no gate.
+- **`cargo deny check`, `cargo clippy --workspace --all-targets` and
+  `cargo test --workspace --locked` were not run by D-0045** beyond the workspace
+  test and format runs it reports. Per-crate gates are green.
+- **The memory figures are arithmetic, not measurement.** The 136-byte key/value
+  pair width *is* measured and printed by the pull bench. Everything built on it
+  — ~574 MB at `MAX_ENTRIES`, ~72 MB → ~144 MB at a 248,000-entry census — is
+  calculation over hashbrown's power-of-two bucket rounding. **No resident-set
+  size has been measured by anyone**, and an independent redoing of the same
+  arithmetic gives ~570 MB rather than ~574 MB, so even the calculation is not
+  agreed to three significant figures.
+
+### Two source-file defects found and reported, not fixed
+
+D-0045 owns `docs/**` only. Both of these are in `crates/**`:
+
+- `crates/store/src/format.rs:311` tells the reader that
+  `the_image_is_little_endian_and_each_field_owns_its_own_offset` *"walks all 448
+  (field, byte) placements"*. The test asserts `placements == 56`, its own
+  comment says `7 x 8 = 56`, and S-17 says 56. **448 corresponds to no quantity
+  in that test.**
+- `crates/api/src/catalog.rs:407` cites the flatness of `page()` as
+  *"`docs/04-invariants.md` C-11"*. C-11 is a `crates/pull` manifest invariant
+  (`pull::bench::census_beats_the_scan_it_replaces`). The correct id is **C-14**,
+  which is what `crates/api/benches/ratio.rs` itself prints.
+## 29. `crates/greeks` — what is bounded, what is measured, and what is neither
+
+Added by D-0046. **Renumbered from §18 to §29 on merge**: `feat/greeks` numbered it when this file ended at §17, and `feat/pull` had meanwhile appended §18 through §28. Same collision as the D-0037 one, one document over — and the same cause: a number chosen on an unmerged branch is provisional until it merges.
+
+### The solver is not O(1), and the crate says so in its own documentation
+
+`CLAUDE.md` §3 rule 4 is about per-operation cost. Inverting the
+Black-Scholes price in volatility is a root find. What it has instead is a
+ceiling that is **arithmetic**:
+
+```text
+MAX_ITERATIONS = BRACKET_EVALUATIONS + NEWTON_STEPS + BISECTION_STEPS
+                 + FINAL_EVALUATION
+               = 2 + 8 + 64 + 1
+               = 75
+```
+
+The bisection performs exactly 64 halvings of `[1e-6, 5]` with no early exit,
+no tolerance test and no stagnation detection. `(5 − 1e-6)/2^64 ≈ 2.7e-19` is
+narrower than one unit in the last place of any volatility in the band, so a
+fixed count is sufficient rather than merely safe — and its cost does not
+depend on any input value, because it does not read the input to decide when
+to stop.
+
+**This said 72 until D-0046, and 72 was wrong by three.** The two evaluations
+that establish the bracket and the one at the answer were never counted, while
+the constant's own documentation called itself "the largest total number of
+model evaluations one solve can cost". A refused solve costs 75 as well. The
+test named for the bound read the `iterations` field, which was
+`spent + BISECTION_STEPS` by construction and therefore could not observe the
+gap; `greeks::solver::the_reported_cost_is_every_model_evaluation` now counts
+at `Checked::greeks`, the one function every evaluation passes through.
+
+**Measured on an 819-point grid of moneyness × maturity × volatility — by the
+calibration harness, whose rescuer was Brent and whose bisection exited early.
+This is NOT a measurement of the shipped solver.** It is why the shipped shape
+was chosen. The shipped solver uses a fixed 64-halving bisection and is
+measured at a worst total of **75**, which is also its arithmetic ceiling. The
+table below counts *search* evaluations only, which is what that harness
+counted; add three for the bracket and the answer to compare it with 75.
+
+| Newton cap | by Newton | rescued | worst total | median |
+|---|---|---|---|---|
+| 0 — bracketed only | 0 | 523 | 55 | 17 |
+| **8 — the cap shipped** | 232 | 291 | **63** | 19 |
+| 500 | 432 | 100 | 444 | 11 |
+
+Newton alone reached **427** iterations with a fixed tolerance and **444** with
+stagnation detection, at `K/S = 1.10, T = 2h`; median 7–8, p90 ≈ 71, p99
+351–394. Worst among points resolvable to fourteen digits: **131**.
+
+**Said plainly because it argues against the shipped shape:** at a cap of 8 the
+Newton pre-pass did not beat the bracketed method alone on that grid — 63
+against 55 worst, 19 against 17 median. It is kept for the common case, which
+converges in three or four steps and never reaches the bisection.
+
+### `exp` and `ln` are NOT measured for constant time
+
+The closed form has no loop and no input-dependent branch other than the one
+choosing a call from a put. That is a statement about the **code**, not about
+the **cost**: whether the platform's `exp`, `ln` and `sqrt` take the same time
+for every argument is not measured here, and this crate carries no bench that
+would measure it. Any claim that one greek evaluation is constant-time is
+therefore an **EXTRAPOLATION** from the shape of the source.
+
+What *is* asserted as a number is the solver's iteration count, which is an
+integer and does not move with a scheduler —
+`greeks::solver::the_iteration_count_never_exceeds_the_arithmetic_bound`.
+
+### `f64` runs out before the model does
+
+Measured floor — the smallest relative radius around the true volatility on
+which the computed price is still strictly ordered on both sides — against the
+textbook `ulp(price)/vega` estimate:
+
+| case | `ulp/vega` estimate | **measured floor** |
+|---|---|---|
+| at the money, 7 days | 1.60e-16 | **1.67e-14** |
+| at the money, 1 day | 2.11e-16 | 3.76e-14 |
+| at the money, 1 hour | 1.29e-16 | 2.73e-13 |
+| 1.25 S, 7 days | 8.32e-19 | 1.84e-13 |
+| 0.75 S, any maturity | 1.3e-1 | **inf — no volatility recoverable** |
+
+Over an 819-point grid: **223 points resolvable to fourteen digits, 321
+resolvable but coarser, 275 not resolvable at all.**
+
+**Fourteen significant digits is at the very edge of `f64` Black-Scholes even
+at the money.** A vendor printing seventeen digits of implied volatility is
+printing the shortest round-trip form of an `f64`; it is **not** evidence of
+fourteen correct digits.
+
+### The `Indeterminate` numerator was wrong, and "two orders of magnitude" was too
+
+The paragraph that used to sit here called the `ulp(price)/vega` estimate
+"optimistic by two orders of magnitude". **Both halves of that were wrong, and
+D-0046 replaces them.**
+
+`ulp(price)` is not the granularity of a model price at all. The price is
+`forward·N(d1) − discounted_strike·N(d2)`: each product carries a unit in the
+last place of *its own* magnitude, and each `N` carries the CDF's `2.22e-16`
+absolute error multiplied by the leg in front of it. So the granularity is set
+by the legs. Measured on a one-day NIFTY call two percent in the money at 5%
+volatility: price `507.76`, `ulp(price) = 1.13e-13`, real granularity
+`1.14e-11` — a factor of **100.8**, not the "two orders of magnitude at the
+money" the old text quoted for a different quantity. Deep out of the money the
+factor is unbounded: the price falls below the granularity of the terms that
+produced it entirely, and no ratio describes that.
+
+What the wrong numerator cost, measured over an NSE envelope — spot 25,851.19,
+the 50-point ladder ±20 rungs, maturities from one 1-minute bar to one year, σ
+5%–60%, r = 9.46%, premiums at or above one ₹0.05 tick, **8,759 quotable
+points**:
+
+| numerator | accepted | wrong >1e-3 | wrong >1e-2 | worst relative σ error |
+|---|---|---|---|---|
+| `ulp(price)` — shipped first | 8,096 | **15** | **5** | **5.5e-2** |
+| `max(forward, K·e^-rT)` | 8,072 | 0 | 0 | 3.3e-4 |
+| **`forward + K·e^-rT` — shipped now** | 8,068 | **0** | **0** | **2.2e-4** |
+
+Every one of the 15 was returned as `Ok` with an `uncertainty` inside the
+`1e-3` bound; the worst came back 5.14% wrong reporting `7.76e-4`. Two named
+degenerate cases fell out of the same expression and are fixed by the same
+line: a subnormal quote underflowed the numerator to exactly `0.0` — over a
+sweep of 3,388 sub-`1e-10` quotes that reach the guard, **440** were accepted
+reporting perfect certainty, the worst repricing **`1.49e25`** relative away
+from its own quote — and a quote below `1e-290` was accepted at
+`uncertainty = 3.5e-19` while repricing **1,183×** away. Both are now refused.
+The expression divides before it multiplies, and
+`price_scale / vega ≥ 1/4` for any inputs, so it cannot underflow.
+
+`GreeksError::Indeterminate` still screens on a first-order estimate, so its
+criterion remains **necessary and not sufficient** — it cannot see that the
+computed price is not strictly monotone in σ. Passing it does not prove the
+answer is good to `MAX_RELATIVE_UNCERTAINTY`; failing it proves the answer is
+worthless. What has changed is that the bound is now *met* by the answers it
+accepts: worst relative volatility error `2.2e-4` on the NSE envelope and
+`2.3e-6` on the crate's own grid, against a stated `1e-3`.
+
+**And the test could not have caught it.** `price → IV → price` is satisfied
+identically wherever the computed price is flat in `f64`, which is exactly the
+regime the guard exists for: at the failing point the price round trip measures
+`0e0` while the volatility is 5.14% wrong. `crates/greeks`'s grid also stepped
+straight over the regime — moneyness rungs 0.80/0.95/1.00/1.05/1.25 and
+sub-0.02-year maturities of only 1/8760 and 1/365. Both are repaired:
+`greeks::solver::a_volatility_round_trips_through_the_solver_and_back` asserts
+the volatility, and the grid gains 0.98/1.02 rungs and 2- and 5-day maturities.
+Under the old numerator that grid accepts 1,137 answers with a worst of
+`1.31e-3`, so the new test fails on the old code.
+
+### Bit-for-bit only within one target
+
+`CLAUDE.md` §3 rule 5 asks for byte-identical reruns. **Within one target this
+crate delivers it**; across two targets it does not, and the difference is
+measured rather than reasoned about.
+
+`exp` and `ln` are not correctly rounded in any mainstream libm and IEEE-754
+does not require them to be. Verified on this machine: the release LLVM IR
+emits `@llvm.exp.f64` ×10 and `@llvm.log.f64` ×2 and the aarch64 assembly emits
+`bl _exp` ×9 and `bl _log` ×1 — calls into the platform's libm, not code in
+this crate. `sqrt` is the hardware `fsqrt` and *is* correctly rounded, so it
+contributes nothing; there are zero fused multiply-adds and zero fast-math
+flags in the emitted code.
+
+Measured natively, by running the crate's arithmetic twice on this machine —
+once through Apple's libm and once through the pure-Rust `libm` crate, which is
+what `wasm32-unknown-unknown` links through `compiler-builtins`. The copy used
+was first validated bit-for-bit against the shipped crate over 12,096
+comparisons.
+
+| | measured |
+|---|---|
+| `exp` disagrees between the two | **1,866 of 20,000** probed arguments; first at `exp(-59.916)`, 1 ulp |
+| `ln` disagrees | **971 of 20,000** |
+| model price | **63 of 1,344** grid rows differ, worst relative **1.23e-12** |
+| implied volatility | **140 of 1,344** differ, worst relative **4.22e-14** |
+| error variant, `method`, `iterations` | **zero** changes on this grid |
+
+A ±1-ulp perturbation of every `exp` and `ln` result — an upper bound on what a
+*conforming* libm may do, and **not** a model of a real one, since no real
+implementation is biased in one direction everywhere — moves prices by up to
+`6.44e-10` relative and changes the **refusal kind** on up to 1,151 of 1,344
+rows. **No discrete flip was observed between the two real libms and none is
+claimed.** The mechanism is demonstrated; the occurrence is not.
+
+CI runs `ubuntu-24.04` on x86_64 with glibc's libm while development is aarch64
+macOS with Apple's, so two libms are already in play in this project. **No
+measurement was taken on glibc** — this machine has no x86_64 toolchain — and
+nothing here should be read as one.
+
+**The discrete outputs are target-dependent too, and that is the sharper
+hazard.** Which `GreeksError` variant is returned, which `Method` finished, and
+the `iterations` count are all decided by floating-point comparisons on
+quantities carrying the libm's last bits — `uncertainty > MAX_RELATIVE_UNCERTAINTY`,
+`price <= intrinsic`, `vega <= 0.0`, `(MIN..=MAX).contains(&next)` and
+`step.abs() <= NEWTON_STEP_TOLERANCE`. A trailing-digit difference is a
+rounding note; a caller that logs "the vendor quote was below intrinsic" on one
+machine and "indeterminate" on another has no reproducible audit trail at all.
+Under the ±1-ulp perturbation that is what happens on up to 1,151 of 1,344
+rows.
+
+**The rule this implies:** a greek, an implied volatility, a `Method` or an
+`iterations` count from this crate must never enter the blake3 run identity of
+`CLAUDE.md` §3 rule 3 and must never be compared byte-for-byte across machines;
+a consumer that branches on `GreeksError` variant or records `method` must
+treat that as a property of the machine it ran on. Nothing in this repository
+does any of it today. Invariant G-10 is narrowed to what its test proves.
+
+One side effect worth recording: the repaired `Indeterminate` numerator also
+tightens cross-libm agreement, because the points it now refuses are the
+ill-conditioned ones. Under the ±1-ulp perturbation the worst
+implied-volatility divergence falls from `9.80e-4` to `4.40e-6`.
+
+### Hart 5666 caps at about eight relative digits
+
+Shipped because it is 145× faster than the reference. Measured: **2.22e-16**
+absolute everywhere, **8.911872737504238e-9** relative at `x = −7.78`. Every
+price this crate produces inherits that. Abramowitz & Stegun 7.1.26 was
+rejected outright — 6.97e-8 absolute and a relative error of **1.01** in the
+tail, which is no relative accuracy at all.
+
+### The anchor is not an anchor, and this is the honest reading of it
+
+Three claims made in the first version of this section, and in the first draft
+of the ledger entry that is now D-0046, were withdrawn by D-0046 after
+measurement. All three overstated what one strike can carry.
+
+**1. "Four of the eight published numbers are inputs to the fit." It is six.**
+`root_years()` consumes both deltas through `published_d1()`; `close_one_side()`
+consumes vega once per side and theta once per side. Delta ×2 + vega ×2 + theta
+×2 = six. Those six land at `1e-15`–`1e-14` against a `1e-9` tolerance because
+a bisection inverted its own equation.
+
+**2. "The two gammas are the prediction, and reproducing them is the thing
+this file actually proves." They are not a prediction.** With `q = 0` the
+fitted spot is `S = vega·100/(n(d1)·√T)`, so the fitted gamma reduces to
+`n(d1)^2 / (100·vega·sigma)` — no `S`, no `K`, no `T`, no `r`. That is the same
+scale-free identity `vega·gamma·sigma == n(d1)^2` used, *with the published
+gammas as inputs*, to decide the volatility transposition. One equation
+asserted twice. Measured through the shipped `Contract::greeks`: forcing `r`
+from −50% to +200% and scaling `T` by 0.25× to 10× leaves both gammas identical
+to fifteen printed digits, and the two residuals the anchor prints
+(`1.561e-7`, `3.423e-6`) are the two the transposition test produces.
+
+**3. No single contract reproduces the chain at all.** Matching both published
+deltas exactly forces `d1 = 0.097184 / 0.082008`, which forces the model's vega
+*ratio* to `n(d1c)/n(d1p) = 0.998641`. That quantity contains no `S`, `K`, `T`
+or `r`, so nothing can move it. Dhan publishes `12.2025/12.18593 = 1.001360`.
+Minimax over the four scale-fixing fields at `q = 0`, all four residuals
+balanced on the bound: **884× the vendor's own `5e-6` display half-ulp.** The
+reported "agreement" exists because *two mutually inconsistent contracts* were
+fitted to one strike; the 0.2722% spot residual between them is the honest
+headline, and it is the one residual invariant to the day divisor — identical
+to nine decimals for every divisor from 252 to 500.
+
+A genuinely independent anchor needs a field the fit does not consume: the
+premium `C − P`, or a second strike from the same chain at the same instant.
+Neither was captured.
+
+### The day divisor: 252 is excluded, 365 is not selected
+
+The criterion — the two sides of one strike must agree on `r` — is *affine* in
+the divisor, because the `e^{rT}` in `r·K·e^{-rT}` cancels against `K`'s
+construction. So the side-to-side rate spread is a straight line in `D` with
+exactly one root. Measured through the shipped crate:
+
+| `D` | 252 | 360 | 365 | 365.25 | 366 | **370.0757** | 372 | 375 | 400 |
+|---|---|---|---|---|---|---|---|---|---|
+| spread, points | −23.2598 | −1.9848 | −0.9999 | −0.9506 | −0.8029 | **2.8e-15** | +0.3791 | +0.9700 | +5.8948 |
+
+At `D* = 370.075666` both sides give `r = 10.019595%` exactly. The criterion's
+own ranking is therefore `370.08 > 375 > 365 > 366 > … > 252`. It excludes a
+trading-day divisor by a factor of 23, which is the fact the crate's unit table
+rests on, and it does **not** pick a calendar one.
+
+Two consequences were recorded as facts and were not:
+
+- The **0.9999-point "rate residual"** was pinned as a property of the sample.
+  It is an artifact of assuming `D = 365`; at the criterion's root it is zero.
+- **Nothing in the anchor pinned 365.** Replaying every divisor-dependent
+  assertion at `D = 375` instead of 365, **every one of them still passed** —
+  the eight greek comparisons, both rho signs, the spot spread (0.2722%, which
+  does not move), the rate spread (0.9700, inside the pinned `[0.85, 1.15]`)
+  and the rate midpoint (10.0756%, inside the pinned `[9, 11]`). `D = 375` is
+  exactly the number of one-minute
+  bars in an NSE session (09:15–15:30), so it is a realistic wrong choice a
+  future editor could make, and no test would have caught it.
+
+Repaired by `greeks::vendor_anchor::the_rate_criterion_has_its_root_at_370_and_365_is_a_convention_near_it`,
+which asserts the root's location and the spread's monotonicity in `D`, and by
+`…the_trading_day_divisor_is_excluded_and_the_calendar_one_is_not_selected`,
+which asserts both what survives and that 375 beats 365.
+
+### The carry is assumed, not measured
+
+`the_delta_difference_needs_no_carry_once_the_two_volatilities_are_right`
+contained no volatility and tested no carry: `published_d1()` reads only the
+two deltas, so its assertion was `N(N^-1(x)) + N(N^-1(y)) == x + y`, which
+holds for any deltas, any volatilities and any `q`. Measured end to end
+through the shipped crate, refitting the same eight published fields:
+
+| `q` | fitted `T` | fitted `r`, call / put | worst published residual |
+|---|---|---|---|
+| 0% | 5.158352 cal days | 9.4619% / 10.4618% | 3.423e-6 |
+| 1% | 4.085107 cal days | 2.2634% / 20.2018% | 3.643e-6 |
+| 2% | 3.428167 cal days | −2.8682% / 27.9462% | 3.792e-6 |
+
+All three reproduce every published field, both gammas included, inside the
+vendor's `5e-6` display precision. `q = 0` is **consistent** with the sample
+and is not implied by it, and the `T = 5.158 ± 0.079` day interval is a
+rounding-box width conditional on `q = 0` and on the transposition — not an
+identification result. The test is renamed to what it proves and
+`…the_carry_is_consistent_with_zero_and_the_sample_cannot_pin_it` is what
+actually probes `q`.
+
+The `q = −46%` figure the first version printed for "what a single volatility
+would need" was never computed by anything. It is **−42.54%**, and the test now
+takes it.
+
+### What the Dhan sample cannot settle
+
+The captured chain pins `T` — conditional on `q = 0` and on the transposition —
+and does **not** pin `r`. Over the rounding box of the six printed fields —
+200,000 draws, uniform half-ulp on each, deterministic generator:
+
+| quantity | p2.5 | median | p97.5 | width |
+|---|---|---|---|---|
+| `T`, calendar days | 5.0796 | **5.1583** | 5.2376 | 0.158 |
+| `S` | 25654.8 | 25851.2 | 26050.8 | 396 |
+| `r`, call side | 8.9173% | **9.4618%** | 10.0025% | **1.085 pts** |
+| `r`, put side | 9.8966% | **10.4619%** | 11.0326% | 1.136 pts |
+
+and the two sides differ by 1.00 points, which lies outside both intervals. The
+problem is well-conditioned in `T` and ill-conditioned in `r`, structurally:
+`r` enters theta only through `r·K·e^-rT·N(d2)` while `T` enters through
+`S·n(d1)·sigma/(2·sqrt(T))`, which is most of it. One-at-a-time sensitivity to
+the last printed digit says the same thing — a half-ulp on either delta moves
+`T` by 0.046 days and `r` by 0.32 points, while half-ulps on vega and theta
+move `r` by **0.0000**.
+
+A joint four-parameter chi-square over all eight published fields, each with
+its `5e-6` display precision as its sigma, gives **chi²/dof = 7.0e5 at best**
+across all eight configurations tested. **No single `(S, K, T, r)` reproduces
+all eight fields within their printed precision.** Best-fit residual pulls run
+to −1249 on the call delta.
+
+Publishing the spot would not fix it: a 1% error in `S` moves `r` by only about
+0.2 points, measured. What would settle it, in order of leverage:
+
+1. **The premiums.** `C − P = S·e^-qT − K·e^-rT` is model-free and linear in
+   `r`. Measured leverage at this maturity: one rupee of `C − P` is worth
+   **0.27 percentage points** of `r`.
+2. **The capture and expiry timestamps.** 5.158 calendar days ending 15:30 IST
+   lands at 21:06, outside session hours; 3.561 trading days lands inside one.
+   Both are arithmetically available and the sample cannot choose.
+3. **A second strike from the same chain at the same instant.** `T` and `r` are
+   common across strikes, so two strikes over-determine both — and would expose
+   the volatility transposition directly.
+
+### UNVERIFIED
+
+- Whether Dhan's `r` is a market rate or a hardcoded constant near 10%.
+- **The day divisor, and the day count behind it.** 252 is excluded at 23.3:1.
+  365 is **not** selected — the criterion's root is 370.08 and it prefers 375.
+- **The carry.** `q = 0` is assumed; `q = 1%` and `q = 2%` fit the same eight
+  fields at `T = 4.085` and `3.428` days.
+- Whether the vendor prices spot BSM or forward Black-76. Every conclusion
+  above survives either, but the forward reading would shift `T` by about 4%.
+- The NIFTY and BANKNIFTY strike intervals. Nothing in `docs/00-charter.md`
+  states them, so `Moneyness::from_ladder` takes the interval as an argument
+  and assumes nothing.
+- **Whether this crate's output is reproducible on x86_64 glibc.** Two libms
+  were compared, both reachable from this machine. glibc's was not one of them,
+  and no claim is made about it.
+
+### Mutation testing: 320 killed, 2 alive, and both are named
+
+`cargo mutants --package greeks`, on the tree that ships: **335 mutants, 320
+caught, 2 missed, 0 timed out, 13 unviable.** Eleven of the thirteen unviable
+replace a function body with `Default::default()` for a type that has no
+`Default`; the other two turn `+` into `-` inside `MAX_ITERATIONS`'s own
+definition, where `2 − 8` does not const-evaluate. None of them compiles and
+none is a survivor.
+
+The first pass missed **eleven**, and every one of them was a real hole:
+
+| what survived | what it exposed |
+|---|---|
+| `>` → `>=` on four separate bounds | no test stood on the inclusive edge of any bound. Each bound was proved to refuse the value past it and never proved to accept the value on it |
+| `*` → `/` inside rho, twice | the central-difference check skipped a greek whose *analytic* value was below the stencil's noise floor — so a defect that made rho small made itself unresolvable and escaped. The gate now uses the larger of the analytic and the numeric value |
+| six arithmetic mutations in the Brenner-Subrahmanyam seed | a seed only changes how long the search takes, never what it returns, so nothing that asserts an answer can see it being wrong. The seed is now a named function with its own test |
+| `+=` → `*=` on the iteration counter | `iterations <= MAX_ITERATIONS` is satisfied by zero. The floor is now asserted as well as the ceiling |
+
+**The two that remain are not holes, and this is the honest reading of them:**
+
+1. `solver.rs` — `uncertainty > MAX_RELATIVE_UNCERTAINTY` against `>=`. The two
+   differ only when the computed uncertainty is *exactly* `1e-3`. That value is
+   a quotient of a price, a vega and a volatility, all derived through a root
+   find; no input can be chosen to produce the exact bit pattern, so no test
+   can distinguish the two.
+2. `solver.rs` — `price(middle) < price` against `<=` inside the bisection. The
+   two differ only when the model price at a midpoint equals the target
+   exactly, and at that point **both** choices keep the root inside the
+   bracket. The final answers can differ by at most the final bracket width,
+   `2.7e-19`, which is below one unit in the last place of any volatility the
+   function returns.
+
+`CLAUDE.md` §9 asks for no surviving mutant on a touched module. Two survive,
+both on a comparison whose boundary is unreachable, and neither corresponds to
+a behaviour a caller could observe. Recording them here is the alternative to
+either deleting the check or claiming a clean sweep that was not taken.
+
+Two more were removed rather than tested, in `normal.rs`: `x > 0.0` appeared
+twice where `x` can never be zero — once past the saturating tail, once where
+`upper` is exactly `0.5` at zero and both arms return the same number. Both are
+now written as a question about the **sign**, which has no boundary at all.
+
+## 30. There is no incremental type-ahead on the symbol fields, and there cannot be one
+
+Referenced by `crates/api/src/render.rs` since the `<datalist>` was removed and
+**not written until now** — a pointer to a section that did not exist is exactly
+the kind of quiet gap this file is for.
+
+A `<datalist>` over the ~750-symbol universe was put on the instruments search
+box and the F&O underlying so that typing would narrow the choices. It does
+narrow. It also made **Chrome open the full list on focus, before a single
+character is typed**, and draw a `▼` beside the field — so it read as a dropdown
+of 750 items, which is the shape it was meant to replace. Suppressing the
+indicator with `::-webkit-calendar-picker-indicator` removed the arrow and did
+not stop the focus behaviour: that popup belongs to the browser, not to the page,
+and no CSS or attribute cancels it.
+
+Three ways to get true type-to-filter, and only one is available here:
+
+1. A script filtering a list on each keystroke. `CLAUDE.md` §2 forbids it, and
+   four tests assert `<script>` never appears in any page this server emits.
+2. A server round-trip per keystroke. Also needs a script to fire it.
+3. A server round-trip on **submit**: type a symbol, press Enter, get matches.
+
+Option 3 already existed on the instruments page and always had — the
+`method="get"` form searches the whole universe rather than the rendered page,
+and its result is a linkable, reloadable URL. **So: there is no incremental
+type-ahead on this surface, and there will not be one while §2 stands.**
+
+## 31. The calendar's month arrows do not cross a year boundary
+
+`crates/api/src/calendar.rs`. The day pane's header is `‹ August 2026 ›` and the
+arrows are `<label>`s for the neighbouring month's radio. **A `<label>` drives
+exactly one control.** Stepping from January back to December would have to check
+`m12` *and* the previous year's radio — two controls on one click, which no
+markup expresses and which `CLAUDE.md` §2 forbids solving with a script.
+
+So January's `‹` and December's `›` are inert spans, greyed and
+`pointer-events:none`, rather than labels that would silently do the wrong thing.
+The header title between them clears the month and drops to the month pane, whose
+own title clears the year and drops to the year pane, so **changing year is two
+clicks and is always available.** Asserted by
+`calendar::tests::the_arrows_step_one_month_and_do_not_cross_a_year_boundary`.
+
+This is a limit of the no-script constraint, not an oversight, and the cost is
+one extra click on 2 of the 12 months.
+
+## 32. `census::held_series` is O(keys log keys), and it is the only thing on `/store` that is not O(1)
+
+`crates/api/src/census.rs`, and `pull::manifest::Manifest::held_keys` beneath it.
+
+The coverage grid's instrument axis is now read out of the censuses rather than
+out of the instrument master (D-0048), which means enumerating every key each
+manifest holds and sorting them. That is **O(keys) to collect and O(keys log keys)
+to sort**, and no arrangement of a hash index makes it less.
+
+**It is not on a request path.** `api::server::Site::new` computes it once at
+startup, beside the `Manifest::open` that is already O(entries) and the master
+read that measured 150 ms per request when it was wrongly per-request (D-0039).
+Every `/store` request is then ordinal arithmetic into that vector plus one hash
+probe per cell, unchanged.
+
+The sort is not an optimisation and cannot be dropped: the pager addresses a row
+by **ordinal**, and `HashMap` iteration order is not stable between runs, so an
+unsorted axis would put a different instrument on page 3 after every restart and
+two reloads would disagree about what is held.
+
+**What is not bounded:** the axis grows with the store. At the 194 series on the
+operator's disk today the sort is immeasurable; at the ~248,000 entries
+`docs/07-o1-architecture.md` uses as its scale figure it would be a startup cost
+of the same order as the manifest load itself, which is already accepted there.
+**That has not been measured**, and this file does not claim it has.
+
+## 33. What mutation testing left behind on these four fixes, and what it removed instead
+
+`cargo mutants` over the touched modules, run and re-run rather than assumed.
+
+**Final: 56/56 caught in `crates/api/src/calendar.rs`, 212/212 in
+`crates/pull/src/{http,manifest}.rs`, and none surviving in
+`crates/api/src/census.rs`.** The first run was not that, and what it took to
+get there is the part worth recording.
+
+### Two boundaries were deleted rather than tested
+
+`month_length` counted down with `while probe > 28`, and `>=` there is
+**indistinguishable**: the loop's last iteration asks `Day::new(year, month, 28)`,
+true for every month, so both spellings return 28. `first_year` clamped with
+`if offered < MIN_YEAR`, and `<=` returns the same 1970 at the boundary.
+
+Both are mutants no test could kill, which by `CLAUDE.md` §4 is a test that
+asserts nothing dressed as a passing gate. So the boundaries are gone: the first
+is four questions in descending order, the second is
+`MIN_YEAR + offered.saturating_sub(MIN_YEAR)`, which is a clamp with no branch
+and whose every operator a test can falsify. Same move `crates/greeks`'
+`normal.rs` made for its two, recorded in §29.
+
+### A `contains` cannot falsify a range
+
+Every boundary in `dynamic_css` survived the first run — `length < 31` as `<=`,
+`length + 1` as `length - 1`, `n > 0` as `n >= 0`, `cap.day() + 1` as
+`cap.day() - 1`. All of them produce CSS that is a **superset** of the correct
+text, so `assert!(css.contains(".c29"))` passes against a rule that greys
+27 through 31 as readily as against one that greys 29 through 31.
+
+The tests now assert whole rules, built in the test from what the rule must mean,
+plus three shapes that must never appear at all: a selector list starting with a
+comma (`:checked) ,`), a rule with an empty selector list (`:checked) {`), and a
+trailing comma (`,{`). The last two need a **December** cap and a **31st** cap in
+the fixture — for any earlier month `month < 12` and `month <= 12` are both true,
+and the mutant is invisible.
+
+### A bound nobody can allocate is a bound nobody tested
+
+`text.len() > MAX_RESPONSE_BYTES` was a comparison whose `>=` and `==` mutants
+could only be killed by a test that allocates 64 MiB. It is now `too_large(len)`,
+a `const fn`, and the boundary is three assertions and no allocation.
+`MAX_RESPONSE_BYTES` itself had no test at all — `64 * 1024 * 1024` mutated to
+`64 + 1024 + 1024` is a 2,112-byte ceiling that would refuse every real answer,
+and nothing looked at the value.
+
+### What is still not covered, and why
+
+`crates/pull/src/http.rs` sits at **96.6% line, 95.5% region**, not 100. The
+uncovered arms are three, all needing fault injection this build has no seam for:
+
+1. `HttpSource::new` failing because the TLS backend is unavailable — a
+   deployment fault, not reachable from a test.
+2. `answer.text()` failing **mid-read**, after headers arrived and before the
+   body finished.
+3. The 64 MiB size refusal firing over a real body. The *decision* is now tested
+   at its boundary through `too_large`; the branch that formats the refusal is
+   not.
+
+`crates/api/src/census.rs` sits at 99.59%. These are stated rather than rounded
+up to a claim of 100%.
+
+## 34. The census is rewritten whole per broker window, and that does not scale to the requested backfill
+
+**Measured, not estimated for the constants; extrapolated for the scope, and
+the two are separated below.**
+
+`crates/pull/src/ingest.rs` installs the census by re-imaging every committed
+entry and renaming the result. That is a deliberate bargain, and the module
+says so: an `O(entries)` write bought in exchange for an install that is one
+`rename`, taken **once per run**.
+
+It is once per run for `from_dir` — one folder, twelve thousand members, one
+install. It is once per **window** for `from_window`, which hands a
+single-element slice to `from_members`. The broker path therefore pays a batch
+cost at per-member frequency.
+
+### The constants, read from the source
+
+| Constant | Value | Where |
+|---|---|---|
+| `ENTRY_STRIDE` | 64 bytes | `manifest.rs:167` |
+| `HEADER_LEN` | 32,768 bytes | `manifest.rs:180` |
+| `MAX_ENTRIES` | 2,097,152 | `manifest.rs:189` |
+| installs per window | 1 | `ingest.rs` `from_window` → `from_members` → one `install_locked` |
+
+### The scope, from the operator's stated plan
+
+Spot for 216 instruments over 79 months, plus every NIFTY option contract from
+2020 — 344 expiries at a measured mean of 223 contracts each, from the live
+Groww master.
+
+| Figure | Value |
+|---|---|
+| census entries at the end | 93,776 |
+| census file size at the end | **5.75 MB** |
+| mean image during the run | 2.89 MB |
+| installs (one per candle window) | ~150,000 |
+| **total bytes rewritten and `fsync`ed** | **~424 GB** |
+| the same work as positional appends | 9.16 MB |
+| amplification removed by the incremental path | **~47,400×** |
+
+An independent audit agent computed 725 GB against a 9.6 MB file using a larger
+contract count. Both are the same finding; neither is survivable. The figure
+above is the one this repository can reproduce from its own constants.
+
+### Why it is recorded rather than fixed here
+
+It is not reachable today. The broker route refuses every target but `Swept`
+(`server.rs`), and `HttpSpec` carries no request-parameter map, so no window
+returns at all — Dhan answers `DH-905`. The cost arrives with the work that
+makes the backfill runnable.
+
+The fix is already named in `ingest.rs`: `Manifest::record` returns an
+`Append { ordinal, offset, bytes: [u8; 64], commit }`, which is one positional
+write and one header commit. The primitive exists; only the installer that uses
+it does not.
+
+It is deliberately **not** written now. A positional installer changes the
+durability path of the counter every other guarantee rests on, and it cannot be
+exercised against 150,000 real windows until the pull works. Writing a
+crash-safety change nobody can watch fail is how the two-slot header earned its
+own argument in `docs/02-store-format.md` §5. This belongs with phase 5, beside
+the resumability work that will drive it.
+
+### What is NOT claimed here
+
+No wall-clock figure. The 424 GB is bytes written, and how long that takes
+depends on the device — unmeasured. `CLAUDE.md` §3 rule 6.

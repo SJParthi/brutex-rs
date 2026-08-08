@@ -12,6 +12,7 @@
 //! | [`header`] | the two-slot header and the single-write commit |
 //! | [`block`] | the per-block checksum, over the committed prefix |
 //! | [`path`] | the only way a store path is built |
+//! | [`mod@file`] | the bytes actually reaching the disk, and every refusal |
 //!
 //! # Six properties the types enforce rather than document
 //!
@@ -41,11 +42,18 @@
 //!    checked and case-canonical before a path exists. What that does *not*
 //!    cover — a symlink — is stated in [`path::StorePath::to_path_buf`]
 //!    rather than implied away.
+//! 7. **A writer cannot lose a byte quietly.** Every write is an ordinary
+//!    positional syscall, never a mapping — a mapping raises `SIGBUS` on a full
+//!    disk and a signal cannot be caught — and every host refusal becomes a
+//!    named [`file::StoreError`] carrying the path and the operation. A write
+//!    that accepts zero bytes is refused rather than retried forever. See
+//!    [`mod@file`].
 
 #![forbid(unsafe_code)]
 
 pub mod block;
 pub mod crc;
+pub mod file;
 pub mod format;
 pub mod header;
 pub mod layout;

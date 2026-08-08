@@ -79,6 +79,15 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 /// One instrument, after every vendor has had its say.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Entry {
+    /// The id each vendor uses for this instrument, indexed by
+    /// `Vendor as usize`, so a request can NAME it.
+    ///
+    /// This is the last link in the chain that `DH-905 securityId is required`
+    /// reports as broken: the master carries the id, the merge indexes it by
+    /// key, and `pull::vendor::ParamValue::InstrumentId` puts it on the wire.
+    /// `None` where that vendor does not list the instrument, which a caller
+    /// must refuse on rather than substitute another vendor's.
+    pub ids: [Option<brutex_core::vendor::VendorId>; brutex_core::vendor::Vendor::ALL.len()],
     /// Which vendors listed it. Seeing two here is the deduplication, on
     /// screen.
     pub vendors: VendorSet,
@@ -278,6 +287,14 @@ pub fn merge(sources: &[Source]) -> Merged {
             let e = out.by_key.entry(key).or_default();
             e.vendors = e.vendors.with(vendor);
             e.universe = universe::of_instrument(&key);
+            // THE VENDOR'S OWN ID, carried to the one index a request looks in.
+            // Slotted by vendor, never merged: `securityId 13` and
+            // `NSE-NIFTY` name the same instrument at two brokers and are not
+            // interchangeable — sending one to the other is how a request asks
+            // the wrong broker for the wrong thing.
+            if let Some(slot) = e.ids.get_mut(vendor as usize) {
+                *slot = Some(l.vendor_id);
+            }
             match (e.isin, l.isin) {
                 // Nothing on record yet: take what this vendor said, whether
                 // that is an ISIN or the honest absence of one.
@@ -377,6 +394,7 @@ mod tests {
 
     fn equity(sym: &str, isin: &str) -> Listing {
         Listing {
+            vendor_id: brutex_core::vendor::VendorId::new("1333").expect("a legal id"),
             key: key(sym, Kind::Equity),
             isin: Some(Isin::new(isin).expect("valid")),
             unsuffixed: None,
@@ -385,6 +403,7 @@ mod tests {
 
     fn index(sym: &str) -> Listing {
         Listing {
+            vendor_id: brutex_core::vendor::VendorId::new("1333").expect("a legal id"),
             key: key(sym, Kind::Index),
             isin: None,
             unsuffixed: None,
@@ -640,6 +659,7 @@ mod tests {
         // Groww says BLUECHIP-BE, Dhan says BLUECHIP, and the ISIN says they
         // are one instrument.
         let suffixed = Listing {
+            vendor_id: brutex_core::vendor::VendorId::new("1333").expect("a legal id"),
             key: key("BLUECHIP-BE", Kind::Equity),
             isin: Some(Isin::new("INE657B01025").expect("valid")),
             unsuffixed: Some(key("BLUECHIP", Kind::Equity)),
@@ -661,6 +681,7 @@ mod tests {
         // unmerged row is a visible duplicate; a wrongly merged one is two
         // instruments silently becoming one.
         let suffixed = Listing {
+            vendor_id: brutex_core::vendor::VendorId::new("1333").expect("a legal id"),
             key: key("BLUECHIP-BE", Kind::Equity),
             isin: Some(Isin::new("INE657B01025").expect("valid")),
             unsuffixed: Some(key("BLUECHIP", Kind::Equity)),
@@ -703,6 +724,7 @@ mod tests {
         // One vendor knows the ISIN, the other does not carry one. That is not
         // a disagreement, and the known value must survive it.
         let bare = Listing {
+            vendor_id: brutex_core::vendor::VendorId::new("1333").expect("a legal id"),
             key: key("RELIANCE", Kind::Equity),
             isin: None,
             unsuffixed: None,

@@ -9,7 +9,25 @@ resolver = "3"
 # The intended final graph is in docs/01-architecture.md §1, in the order the
 # crates are built:
 #   core → store → vocab → indicators → engine → pull → api → web → cli
-members = ["crates/core", "crates/store", "crates/api"]
+#
+# plus two leaves that are in no part of that chain, each with no arrow into it:
+#
+#   `costs`  — Indian F&O transaction costs. Depends on `core` only. D-0041.
+#   `greeks` — Black-Scholes-Merton. Depends on **nothing**, and is shared with
+#              the `tickvault` repository by git URL. D-0046.
+#
+# `CLAUDE.md` §5 lists neither; see D-0046, "One discrepancy an operator has to
+# settle". Both arrived here from branches that had each appended to this list
+# without seeing the other — the same shape as the D-0037 identifier collision
+# this merge also had to resolve. The union is correct; neither side was wrong.
+members = [
+    "crates/core",
+    "crates/greeks",
+    "crates/store",
+    "crates/pull",
+    "crates/api",
+    "crates/costs",
+]
 
 [workspace.package]
 version      = "0.1.0"
@@ -60,6 +78,10 @@ serde_json = "1"
 clap     = { version = "4", features = ["derive"] }
 hmac     = "0.12"
 sha1     = "0.10"
+# SHA-256, for the AWS SigV4 signature in `pull::ssm`. Pure Rust, RustCrypto,
+# with no `asm` feature — so no assembly and no C. That is the whole reason the
+# AWS SDK was refused in favour of signing the one request by hand. See D-0051.
+sha2     = { version = "0.10", default-features = false }
 governor = "0.7"
 aws-config  = "1"
 aws-sdk-ssm = "1"
