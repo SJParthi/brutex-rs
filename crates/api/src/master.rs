@@ -22,6 +22,7 @@
 //! segment and instrument-type alphabets they belong with — one place to look
 //! when a vendor renames a column, rather than one per reader.
 
+use brutex_core::instrument::InstrumentKey;
 use brutex_core::isin::Isin;
 use brutex_core::vendor::{Decoded, Listing, MasterRow, Skip, Vendor, decode_master_row};
 use std::collections::{BTreeMap, HashMap};
@@ -32,6 +33,28 @@ pub struct Loaded {
     /// Rows that decoded into an instrument this engine stores, each with the
     /// vendor's ISIN beside its key.
     pub kept: Vec<Listing>,
+    /// Where each key sits in [`Self::kept`], so resolving one is a probe.
+    ///
+    /// # Why this is not a nicety
+    ///
+    /// The only way to find a listing was to walk `kept`. On the real Dhan
+    /// master that is a scan of every kept row, on a request path, to answer a
+    /// question `InstrumentKey` was built to answer in one step — its own
+    /// documentation says equality and hashing are structural "which is what
+    /// makes duplicate rejection a single probe rather than a scan", and
+    /// nothing was probing.
+    ///
+    /// `CLAUDE.md` §3 rule 4 is a PER-OPERATION bound, so it does not soften
+    /// because the constant happens to be small on today's universe. The index
+    /// costs one `usize` per listing and is built once at startup.
+    ///
+    /// A duplicate key keeps the FIRST listing and is counted in
+    /// [`Self::duplicate_keys`] rather than silently overwriting: two rows that
+    /// reduce to one key is a fact about the vendor's file, and picking one in
+    /// silence is how the wrong `securityId` would reach a request.
+    by_key: HashMap<InstrumentKey, usize>,
+    /// How many rows reduced to a key another row already held.
+    pub duplicate_keys: usize,
     /// Rows declined, counted by reason.
     pub skipped: HashMap<&'static str, usize>,
     /// Every declined row that carried a parseable ISIN, and why it was
@@ -64,6 +87,29 @@ pub struct Loaded {
 }
 
 impl Loaded {
+    /// The listing under a key, in one probe.
+    ///
+    /// This is the whole point of [`Self::by_key`]. Before it existed the only
+    /// way to answer "what is this instrument's vendor id" was to walk
+    /// [`Self::kept`] — a scan on a request path for a question
+    /// `InstrumentKey` was designed to answer in one step.
+    #[must_use]
+    pub fn listing(&self, key: &InstrumentKey) -> Option<&Listing> {
+        self.by_key.get(key).and_then(|at| self.kept.get(*at))
+    }
+
+    /// The vendor's own id for an instrument, in one probe.
+    ///
+    /// What a request actually needs: `securityId` for Dhan, `groww_symbol`
+    /// for Groww. Returns `None` when this vendor does not list it, which a
+    /// caller must refuse on rather than substitute — filing one broker's bars
+    /// under another's prefix is what `Feed::store_vendor` calls destroying
+    /// D-0019 irreversibly.
+    #[must_use]
+    pub fn vendor_id(&self, key: &InstrumentKey) -> Option<&brutex_core::vendor::VendorId> {
+        self.listing(key).map(|l| &l.vendor_id)
+    }
+
     /// Total rows declined.
     #[must_use]
     pub fn skipped_total(&self) -> usize {
@@ -288,7 +334,18 @@ pub fn load(path: &std::path::Path, vendor: Vendor) -> Result<Loaded, String> {
             option_side: cols.option_side.map_or("", get),
         };
         match decode_master_row(vendor, row) {
-            Ok(Decoded::Keep(l)) => out.kept.push(l),
+            Ok(Decoded::Keep(l)) => {
+                // The index is built as rows arrive rather than in a second
+                // pass, so `kept` and `by_key` cannot disagree about what is
+                // present.
+                match out.by_key.entry(l.key) {
+                    std::collections::hash_map::Entry::Occupied(_) => out.duplicate_keys += 1,
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        slot.insert(out.kept.len());
+                        out.kept.push(l);
+                    }
+                }
+            }
             // The reason text belongs to the Skip variant, in the crate that
             // owns it. A `match` here would need a wildcard -- Skip is
             // `#[non_exhaustive]` -- and a wildcard silently files every
