@@ -85,6 +85,24 @@
 //! write per member and one commit — is what a per-member publish would use,
 //! and this deliberately does not publish per member.
 //!
+//! **"Once per run" is true of [`from_dir`] and false of [`from_window`].** A
+//! folder is one run over twelve thousand members and one install. A broker
+//! window is one run over ONE member — [`from_window`] hands a single-element
+//! slice to [`from_members`] — so the whole image is rewritten, `fsync`ed and
+//! renamed for every window fetched. The batch bargain above is being paid at
+//! per-member frequency, which is exactly the shape the last paragraph says
+//! this module does not do.
+//!
+//! It costs nothing today: the broker route refuses every target but `Swept`,
+//! and no window returns at all until `pull::vendor::HttpSpec` carries a
+//! request-parameter map. It is measured and recorded against the scope that
+//! makes it bite — `docs/06-limits.md` §34, **424 GB rewritten to maintain a
+//! 5.75 MB file** across the operator's stated NIFTY option backfill. The fix
+//! is the incremental path named two paragraphs up, and it belongs with the
+//! work that first makes that backfill runnable, because a positional
+//! installer that cannot be exercised under load is a durability change nobody
+//! has watched fail.
+//!
 //! A run that changed nothing installs nothing, so a re-run leaves the census
 //! byte for byte as it was. `CLAUDE.md` §3 rule 5 covers the counter as well as
 //! the bars.

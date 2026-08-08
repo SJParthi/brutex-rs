@@ -2230,3 +2230,71 @@ uncovered arms are three, all needing fault injection this build has no seam for
 
 `crates/api/src/census.rs` sits at 99.59%. These are stated rather than rounded
 up to a claim of 100%.
+
+## 34. The census is rewritten whole per broker window, and that does not scale to the requested backfill
+
+**Measured, not estimated for the constants; extrapolated for the scope, and
+the two are separated below.**
+
+`crates/pull/src/ingest.rs` installs the census by re-imaging every committed
+entry and renaming the result. That is a deliberate bargain, and the module
+says so: an `O(entries)` write bought in exchange for an install that is one
+`rename`, taken **once per run**.
+
+It is once per run for `from_dir` — one folder, twelve thousand members, one
+install. It is once per **window** for `from_window`, which hands a
+single-element slice to `from_members`. The broker path therefore pays a batch
+cost at per-member frequency.
+
+### The constants, read from the source
+
+| Constant | Value | Where |
+|---|---|---|
+| `ENTRY_STRIDE` | 64 bytes | `manifest.rs:167` |
+| `HEADER_LEN` | 32,768 bytes | `manifest.rs:180` |
+| `MAX_ENTRIES` | 2,097,152 | `manifest.rs:189` |
+| installs per window | 1 | `ingest.rs` `from_window` → `from_members` → one `install_locked` |
+
+### The scope, from the operator's stated plan
+
+Spot for 216 instruments over 79 months, plus every NIFTY option contract from
+2020 — 344 expiries at a measured mean of 223 contracts each, from the live
+Groww master.
+
+| Figure | Value |
+|---|---|
+| census entries at the end | 93,776 |
+| census file size at the end | **5.75 MB** |
+| mean image during the run | 2.89 MB |
+| installs (one per candle window) | ~150,000 |
+| **total bytes rewritten and `fsync`ed** | **~424 GB** |
+| the same work as positional appends | 9.16 MB |
+| amplification removed by the incremental path | **~47,400×** |
+
+An independent audit agent computed 725 GB against a 9.6 MB file using a larger
+contract count. Both are the same finding; neither is survivable. The figure
+above is the one this repository can reproduce from its own constants.
+
+### Why it is recorded rather than fixed here
+
+It is not reachable today. The broker route refuses every target but `Swept`
+(`server.rs`), and `HttpSpec` carries no request-parameter map, so no window
+returns at all — Dhan answers `DH-905`. The cost arrives with the work that
+makes the backfill runnable.
+
+The fix is already named in `ingest.rs`: `Manifest::record` returns an
+`Append { ordinal, offset, bytes: [u8; 64], commit }`, which is one positional
+write and one header commit. The primitive exists; only the installer that uses
+it does not.
+
+It is deliberately **not** written now. A positional installer changes the
+durability path of the counter every other guarantee rests on, and it cannot be
+exercised against 150,000 real windows until the pull works. Writing a
+crash-safety change nobody can watch fail is how the two-slot header earned its
+own argument in `docs/02-store-format.md` §5. This belongs with phase 5, beside
+the resumability work that will drive it.
+
+### What is NOT claimed here
+
+No wall-clock figure. The 424 GB is bytes written, and how long that takes
+depends on the device — unmeasured. `CLAUDE.md` §3 rule 6.
