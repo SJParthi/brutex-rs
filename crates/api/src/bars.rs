@@ -35,6 +35,7 @@
 use core::fmt::Write as _;
 
 use brutex_core::vendor::Vendor;
+use pull::session::Day;
 use store::file::BarFile;
 use store::format::{Bar, OI_NULL};
 use store::path::{FileKind, PathParts, StorePath, Timeframe, YearMonth};
@@ -101,6 +102,36 @@ pub fn ist_clock(ts_micros: i64) -> String {
     let day_secs = secs.rem_euclid(86_400);
     let (h, m) = (day_secs / 3600, (day_secs % 3600) / 60);
     format!("{h:02}:{m:02}")
+}
+
+/// The IST calendar day a stored timestamp falls on, `YYYY-MM-DD`.
+///
+/// # Why the clock alone was not enough
+///
+/// [`ist_clock`] computes the day and throws it away. A month of one-minute
+/// bars is 7,875 rows all reading `09:15` through `15:30`, so **two rows a day
+/// apart are identical on the page** and no row can be named: "the 11:50 bar"
+/// picks out twenty-one of them. Paging made it worse, because the row number
+/// restarts at 1 on every page.
+///
+/// The shift is the same one [`ist_clock`] applies, taken from the same
+/// expression, so the two cannot disagree about which side of midnight a bar
+/// falls on. The day count is handed to [`Day::from_days`], which owns the
+/// civil-calendar arithmetic and is round-tripped over all 2,932,897
+/// representable days — this file does not do calendar maths of its own.
+///
+/// A timestamp outside the representable range renders as `—`, which is the
+/// same thing the store would refuse to hold. It is not reachable from a bar
+/// file, and a formatter that lies about an input it cannot receive is still a
+/// formatter that lies.
+#[must_use]
+pub fn ist_day(ts_micros: i64) -> String {
+    let secs = ts_micros.div_euclid(1_000_000) + 5 * 3600 + 1800;
+    let days = secs.div_euclid(86_400);
+    u32::try_from(days)
+        .ok()
+        .and_then(|d| Day::from_days(d).ok())
+        .map_or_else(|| "—".to_owned(), |day| day.to_string())
 }
 
 /// One month of one instrument, opened for reading.
@@ -195,7 +226,7 @@ pub fn table(rows: &[Bar]) -> String {
     let mut out = String::with_capacity(512 + rows.len() * 220);
     out.push_str(
         "<div class=\"hscroll\"><table class=\"bars\"><thead><tr>\
-         <th>#</th><th>Time IST</th><th class=\"num\">Open</th><th class=\"num\">High</th>\
+         <th>#</th><th>Date IST</th><th>Time IST</th><th class=\"num\">Open</th><th class=\"num\">High</th>\
          <th class=\"num\">Low</th><th class=\"num\">Close</th><th class=\"num\">Change</th>\
          <th class=\"num\">Volume</th><th class=\"num\">Open interest</th>\
          </tr></thead><tbody>",
@@ -212,11 +243,13 @@ pub fn table(rows: &[Bar]) -> String {
         let sign = if delta > 0 { "+" } else { "" };
         let _ = write!(
             out,
-            "<tr class=\"{dir}\"><td class=\"idx\">{}</td><td class=\"clock\">{}</td>\
+            "<tr class=\"{dir}\"><td class=\"idx\">{}</td><td class=\"day\">{}</td>\
+             <td class=\"clock\">{}</td>\
              <td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td>\
              <td class=\"num close\">{}</td><td class=\"num delta\">{sign}{}</td>\
              <td class=\"num\">{}</td><td class=\"num oi\">{}</td></tr>",
             i + 1,
+            ist_day(bar.ts_micros),
             ist_clock(bar.ts_micros),
             rupees(bar.open),
             rupees(bar.high),
@@ -444,5 +477,61 @@ mod tests {
         for forbidden in ["<script", "javascript:", "onclick", "onload", "onerror"] {
             assert!(!html.contains(forbidden), "{forbidden} must never appear");
         }
+    }
+}
+
+#[cfg(test)]
+mod ist_day_tests {
+    use super::*;
+
+    /// **EVERY ROW ON THE PAGE SAYS WHICH DAY IT IS.**
+    ///
+    /// `ist_clock` computes the calendar day and discards it, so a month of
+    /// one-minute bars rendered 7,875 rows all reading `09:15`..`15:30` and two
+    /// rows a day apart were identical. "The 11:50 bar" picked out twenty-one
+    /// of them, and the row number restarts at 1 on every page, so nothing on
+    /// the page identified a row at all.
+    #[test]
+    fn a_stamp_renders_the_ist_day_it_falls_on() {
+        // 2025-07-01 09:15:00 IST — the session open of the fixture month.
+        assert_eq!(ist_day(1_751_341_500_000_000), "2025-07-01");
+        assert_eq!(ist_clock(1_751_341_500_000_000), "09:15");
+        // …and the close of the same day stays on it.
+        assert_eq!(ist_day(1_751_364_000_000_000), "2025-07-01");
+        assert_eq!(ist_clock(1_751_364_000_000_000), "15:30");
+    }
+
+    /// The day and the clock agree about midnight, because both derive it from
+    /// the same shifted seconds rather than each doing their own arithmetic.
+    #[test]
+    fn the_day_rolls_exactly_when_the_clock_does() {
+        // Walk a whole IST day in one-minute steps across a midnight boundary
+        // and require the day to change exactly once, at 00:00.
+        let start = 1_751_341_500_000_000_i64 - 9 * 3600 * 1_000_000 - 15 * 60 * 1_000_000;
+        let mut rolls = 0;
+        let mut previous = ist_day(start);
+        for step in 1..=1_440_i64 {
+            let at = start + step * 60 * 1_000_000;
+            let day = ist_day(at);
+            if day != previous {
+                rolls += 1;
+                assert_eq!(
+                    ist_clock(at),
+                    "00:00",
+                    "the day changed at {} — the two disagree about midnight",
+                    ist_clock(at)
+                );
+                previous = day;
+            }
+        }
+        assert_eq!(rolls, 1, "exactly one midnight in 1,440 minutes");
+    }
+
+    /// A stamp the store could not hold renders as an em dash rather than a
+    /// plausible wrong date. `CLAUDE.md` §4 — never a fallback that hides.
+    #[test]
+    fn an_unrepresentable_stamp_says_so_instead_of_inventing_a_day() {
+        assert_eq!(ist_day(i64::MIN), "—");
+        assert_eq!(ist_day(i64::MAX), "—");
     }
 }
